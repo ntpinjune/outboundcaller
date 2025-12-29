@@ -1,0 +1,11 @@
+{
+    "trunk": {
+        "name": "My Twilio Trunk",
+        "address": "canyoupleasework.pstn.twilio.com",
+        "numbers": [
+            "+16509004326"
+        ],
+        "auth_username": "thisbetterwork",
+        "auth_password": "Nolco0606!123"
+    }
+}
