@@ -1,4 +1,3 @@
-lk dispatch create --new-room --agent-name outbound-caller --metadata '{"phone_number": "+12095539289"}' 
+./venv/bin/python agent.py dev 
 
-
-python agent.py dev
+lk dispatch create --new-room --agent-name outbound-caller-dev --metadata '{"phone_number": "+12095539289"}'
