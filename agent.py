@@ -22,6 +22,7 @@ from livekit.agents import (
 from livekit.plugins import (
     deepgram,
     openai,
+    groq,
     cartesia,
     silero,
     noise_cancellation,  # noqa: F401
@@ -74,7 +75,7 @@ class OutboundCaller(Agent):
         )
 
     @function_tool()
-    async def transfer_call(self, ctx: RunContext):
+    async def transfer_call(self, ctx: RunContext, reason: str = ""):
         """Transfer the call to a human agent, called after confirming with the user"""
 
         transfer_to = self.dial_info["transfer_to"]
@@ -107,7 +108,7 @@ class OutboundCaller(Agent):
             await self.hangup()
 
     @function_tool()
-    async def end_call(self, ctx: RunContext):
+    async def end_call(self, ctx: RunContext, reason: str = ""):
         """Called when the user wants to end the call"""
         logger.info(f"ending the call for {self.participant.identity}")
 
@@ -157,10 +158,11 @@ class OutboundCaller(Agent):
         return "reservation confirmed"
 
     @function_tool()
-    async def detected_answering_machine(self, ctx: RunContext):
+    async def detected_answering_machine(self, ctx: RunContext, reason: str = ""):
         """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
         logger.info(f"detected answering machine for {self.participant.identity}")
         await self.hangup()
+        return "ending call due to voicemail"
 
 
 async def entrypoint(ctx: JobContext):
@@ -188,7 +190,7 @@ async def entrypoint(ctx: JobContext):
         stt=deepgram.STT(),
         # you can also use OpenAI's TTS with openai.TTS()
         tts=cartesia.TTS(),
-        llm=openai.LLM(model="gpt-4o"),
+        llm=groq.LLM(model="llama-3.1-8b-instant"),
         # you can also use a speech-to-speech model like OpenAI's Realtime API
         # llm=openai.realtime.RealtimeModel()
     )
@@ -239,6 +241,6 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller",
+            agent_name="outbound-caller-dev",
         )
     )
