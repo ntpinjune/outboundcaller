@@ -15,5 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Download required model files (if needed)
+# Uncomment if your agent needs to download models:
+# RUN python agent.py download-files
+
 # Run the agent
 CMD ["python", "agent.py", "start"]

@@ -1,4 +1,10 @@
 livekit>=1.0
-livekit-agents[openai,deepgram,cartesia,silero,turn_detector,groq]~=1.2.0
+livekit-agents[openai,deepgram,cartesia,elevenlabs,silero,turn_detector,groq]~=1.2.0
 livekit-plugins-noise-cancellation~=0.2
 python-dotenv~=1.0
+httpx>=0.24.0
+requests>=2.31.0
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.0.0
+twilio>=8.0.0
