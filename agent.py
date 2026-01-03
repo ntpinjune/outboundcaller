@@ -10,6 +10,15 @@ import datetime
 from datetime import timedelta
 import httpx
 from twilio.rest import Client as TwilioClient
+import uuid
+
+# Langfuse for observability
+try:
+    from langfuse import Langfuse
+    from langfuse.decorators import langfuse_context, observe
+    LANGFUSE_AVAILABLE = True
+except ImportError:
+    LANGFUSE_AVAILABLE = False
 
 from livekit import rtc, api
 from livekit.agents import (
@@ -44,6 +53,28 @@ logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.INFO)
 
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+
+# Initialize Langfuse if available
+langfuse = None
+if LANGFUSE_AVAILABLE:
+    langfuse_public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    langfuse_host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    
+    if langfuse_public_key and langfuse_secret_key:
+        try:
+            langfuse = Langfuse(
+                public_key=langfuse_public_key,
+                secret_key=langfuse_secret_key,
+                host=langfuse_host,
+            )
+            logger.info("✅ Langfuse initialized for observability")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Langfuse: {e}")
+    else:
+        logger.info("ℹ️  Langfuse keys not found. Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable observability")
+else:
+    logger.info("ℹ️  Langfuse not available. Install with: pip install langfuse")
 
 
 class OutboundCaller(Agent):
@@ -82,13 +113,75 @@ class OutboundCaller(Agent):
         self.transcript = []  # List of transcript entries
         self.call_start_time = None
         self.call_end_time = None
-        self.session: Optional[AgentSession] = None  # Store session reference for transcript extraction
+        self._agent_session: Optional[AgentSession] = None  # Store session reference for transcript extraction (using _agent_session to avoid conflict with Agent.session property)
         
         # Appointment tracking
         self.appointment_scheduled = False
         self.appointment_time_scheduled = None
         self.appointment_email = None
         self._auto_hangup_scheduled = False  # Flag to prevent multiple auto-hangups
+        
+        # Langfuse tracking
+        self.trace_id = str(uuid.uuid4())
+        self.langfuse_trace = None
+        self.langfuse_generation = None
+        self._init_langfuse_trace()
+    
+    def _init_langfuse_trace(self):
+        """Initialize Langfuse trace for this call."""
+        if not langfuse:
+            return
+        
+        try:
+            self.langfuse_trace = langfuse.trace(
+                name="outbound_call",
+                id=self.trace_id,
+                metadata={
+                    "customer_name": self.name,
+                    "phone_number": self.dial_info.get("phone_number", "unknown"),
+                    "appointment_time": self.appointment_time,
+                },
+                user_id=self.dial_info.get("phone_number", "unknown"),
+            )
+            logger.info(f"📊 Langfuse trace initialized: {self.trace_id}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Langfuse trace: {e}")
+            self.langfuse_trace = None
+    
+    def _log_to_langfuse(self, event_type: str, data: dict):
+        """Log events to Langfuse."""
+        if not self.langfuse_trace:
+            return
+        
+        try:
+            if event_type == "generation":
+                # Log LLM generation
+                self.langfuse_generation = self.langfuse_trace.generation(
+                    name="agent_response",
+                    model=os.getenv("OPENAI_MODEL", os.getenv("LLM_PROVIDER", "groq")),
+                    input=data.get("input", ""),
+                    output=data.get("output", ""),
+                    metadata={
+                        "function_calls": data.get("function_calls", []),
+                        "tokens": data.get("tokens", {}),
+                    },
+                )
+            elif event_type == "span":
+                # Log spans (function calls, operations)
+                self.langfuse_trace.span(
+                    name=data.get("name", "operation"),
+                    input=data.get("input", {}),
+                    output=data.get("output", {}),
+                    metadata=data.get("metadata", {}),
+                )
+            elif event_type == "event":
+                # Log events (call start, end, etc.)
+                self.langfuse_trace.event(
+                    name=data.get("name", "event"),
+                    metadata=data.get("metadata", {}),
+                )
+        except Exception as e:
+            logger.error(f"Failed to log to Langfuse: {e}")
 
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
@@ -111,6 +204,11 @@ class OutboundCaller(Agent):
         """
         try:
             # Get the conversation history from the session's chat context
+            # Note: chat_ctx might not exist on AgentSession with Realtime model
+            if not hasattr(session, 'chat_ctx'):
+                logger.debug("AgentSession does not have chat_ctx attribute (likely using Realtime model)")
+                return ""
+            
             chat_ctx = session.chat_ctx
             if not chat_ctx:
                 return ""
@@ -204,9 +302,9 @@ class OutboundCaller(Agent):
         
         # Get transcript from conversation history (preferred method)
         transcript_text = ""
-        if self.session:
+        if self._agent_session:
             try:
-                transcript_text = self.get_transcript_from_conversation(self.session)
+                transcript_text = self.get_transcript_from_conversation(self._agent_session)
                 logger.info(f"Extracted transcript from conversation history ({len(transcript_text)} characters)")
             except Exception as e:
                 logger.warning(f"Could not extract transcript from conversation: {e}, using fallback")
@@ -240,6 +338,38 @@ class OutboundCaller(Agent):
                 logger.warning(f"Failed to update Google Sheets with call results")
         except Exception as e:
             logger.error(f"Failed to update Google Sheets: {e}")
+        
+        # Update Langfuse trace with final call metadata
+        if self.langfuse_trace:
+            try:
+                duration = 0
+                if self.call_start_time and self.call_end_time:
+                    duration = (self.call_end_time - self.call_start_time).total_seconds()
+                elif self.call_start_time:
+                    duration = (datetime.datetime.now() - self.call_start_time).total_seconds()
+                
+                self.langfuse_trace.update(
+                    metadata={
+                        "call_status": call_status,
+                        "appointment_scheduled": self.appointment_scheduled,
+                        "appointment_time": str(self.appointment_time_scheduled) if self.appointment_time_scheduled else None,
+                        "appointment_email": self.appointment_email,
+                        "call_duration_seconds": int(duration),
+                        "transcript_length": len(transcript_text),
+                    },
+                )
+                
+                # Log call end event
+                self._log_to_langfuse("event", {
+                    "name": "call_completed",
+                    "metadata": {
+                        "status": call_status,
+                        "duration_seconds": int(duration),
+                        "appointment_scheduled": self.appointment_scheduled,
+                    },
+                })
+            except Exception as e:
+                logger.error(f"Failed to update Langfuse trace: {e}")
 
     async def hangup(self, call_status: str = "completed", send_results: bool = True):
         """Helper function to hang up the call by deleting the room
@@ -297,11 +427,18 @@ class OutboundCaller(Agent):
 
     @function_tool()
     async def end_call(self, ctx: RunContext, reason: str = ""):
-        """Called when the user wants to end the call
+        """Called when the user wants to end the call. Can be called with no arguments.
         
         Args:
-            reason: Optional reason for ending the call (can be empty string)
+            reason: Optional reason for ending the call. Can be omitted or empty string.
         """
+        # Log end_call to Langfuse
+        self._log_to_langfuse("span", {
+            "name": "end_call",
+            "input": {"reason": reason},
+            "metadata": {"function": "end_call", "status": "called"},
+        })
+        
         logger.info(f"ending the call for {self.participant.identity} (reason: {reason if reason else 'none provided'})")
 
         # let the agent finish speaking - use RunContext.wait_for_playout() to avoid circular wait
@@ -329,11 +466,65 @@ class OutboundCaller(Agent):
         Args:
             dateTime: The date and time to check (e.g., "Tuesday at 2pm", "2024-01-15 14:00:00", "tomorrow at 3pm")
         """
+        # Log function call start to Langfuse
+        self._log_to_langfuse("span", {
+            "name": "checkAvailability",
+            "input": {"dateTime": dateTime},
+            "metadata": {"function": "checkAvailability", "status": "started"},
+        })
+        
         logger.info(f"Checking availability for {dateTime}")
         
         # Parse the dateTime string - handle common formats
         now = datetime.datetime.now()
         time_lower = dateTime.lower().strip()
+        
+        # Handle vague time preferences (mornings, afternoons, evenings)
+        if "morning" in time_lower:
+            # Suggest morning times: 9am, 10am, 11am
+            result = {
+                "available": True,
+                "message": "Great! I have morning slots available. How about 9am, 10am, or 11am? Which works best for you?",
+                "suggested_times": ["9am", "10am", "11am"],
+                "time_preference": "morning"
+            }
+            self._log_to_langfuse("span", {
+                "name": "checkAvailability",
+                "input": {"dateTime": dateTime},
+                "output": result,
+                "metadata": {"function": "checkAvailability", "status": "vague_preference", "preference": "morning"},
+            })
+            return result
+        elif "afternoon" in time_lower:
+            # Suggest afternoon times: 1pm, 2pm, 3pm
+            result = {
+                "available": True,
+                "message": "Perfect! I have afternoon slots available. How about 1pm, 2pm, or 3pm? Which works best for you?",
+                "suggested_times": ["1pm", "2pm", "3pm"],
+                "time_preference": "afternoon"
+            }
+            self._log_to_langfuse("span", {
+                "name": "checkAvailability",
+                "input": {"dateTime": dateTime},
+                "output": result,
+                "metadata": {"function": "checkAvailability", "status": "vague_preference", "preference": "afternoon"},
+            })
+            return result
+        elif "evening" in time_lower:
+            # Suggest evening times: 4pm, 5pm, 6pm
+            result = {
+                "available": True,
+                "message": "Sure! I have evening slots available. How about 4pm, 5pm, or 6pm? Which works best for you?",
+                "suggested_times": ["4pm", "5pm", "6pm"],
+                "time_preference": "evening"
+            }
+            self._log_to_langfuse("span", {
+                "name": "checkAvailability",
+                "input": {"dateTime": dateTime},
+                "output": result,
+                "metadata": {"function": "checkAvailability", "status": "vague_preference", "preference": "evening"},
+            })
+            return result
         
         # Try to parse specific times
         import re
@@ -405,17 +596,44 @@ class OutboundCaller(Agent):
         
         is_available = await self._calendar.check_availability(dt, end_time)
         
-        if is_available:
-            return {"available": True, "message": "That time works perfectly."}
-        else:
-            # Get next available time
-            next_available = await self._calendar.get_next_available_time(dt)
-            next_available_str = next_available.strftime("%A at %I:%M %p")
-        return {
-                "available": False,
-                "next_available_time": next_available_str,
-                "message": f"Ah okay — sorry about that. Looks like the closest open time is {next_available_str}. Would that work?"
-            }
+        try:
+            if is_available:
+                result = {"available": True, "message": "That time works perfectly."}
+                # Log success to Langfuse
+                self._log_to_langfuse("span", {
+                    "name": "checkAvailability",
+                    "input": {"dateTime": dateTime},
+                    "output": result,
+                    "metadata": {"function": "checkAvailability", "status": "success", "available": True},
+                })
+                return result
+            else:
+                # Get next available time
+                next_available = await self._calendar.get_next_available_time(dt)
+                next_available_str = next_available.strftime("%A at %I:%M %p")
+                result = {
+                    "available": False,
+                    "next_available_time": next_available_str,
+                    "message": f"Ah okay — sorry about that. Looks like the closest open time is {next_available_str}. Would that work?"
+                }
+                # Log result to Langfuse
+                self._log_to_langfuse("span", {
+                    "name": "checkAvailability",
+                    "input": {"dateTime": dateTime},
+                    "output": result,
+                    "metadata": {"function": "checkAvailability", "status": "success", "available": False, "next_available": next_available_str},
+                })
+                return result
+        except Exception as e:
+            logger.error(f"Error in checkAvailability: {e}")
+            # Log error to Langfuse
+            self._log_to_langfuse("span", {
+                "name": "checkAvailability",
+                "input": {"dateTime": dateTime},
+                "output": {"error": str(e)},
+                "metadata": {"function": "checkAvailability", "status": "error"},
+            })
+            raise
 
     async def send_sms(self, phone_number: str, message_text: str) -> bool:
         """Send SMS text message using Twilio.
@@ -478,8 +696,22 @@ class OutboundCaller(Agent):
             email: The customer's email address to send the calendar invite to (required)
             dateTime: When to schedule the meeting (e.g., 'Tuesday at 2pm', '2024-01-15 14:00:00', 'tomorrow at 2pm') (required)
         """
+        # Log function call start to Langfuse
+        self._log_to_langfuse("span", {
+            "name": "schedule_meeting",
+            "input": {"email": email, "dateTime": dateTime},
+            "metadata": {"function": "schedule_meeting", "status": "started"},
+        })
+        
         if not email:
-            return "I need your email address to send the calendar invite. Could you provide it?"
+            error_msg = "I need your email address to send the calendar invite. Could you provide it?"
+            self._log_to_langfuse("span", {
+                "name": "schedule_meeting",
+                "input": {"email": email, "dateTime": dateTime},
+                "output": {"error": "Missing email"},
+                "metadata": {"function": "schedule_meeting", "status": "error", "error": "missing_email"},
+            })
+            return error_msg
         
         # Parse email - handle spelled-out formats like "i t z n t p at Gmail dot co"
         # Convert to proper email format: "itzntp@gmail.com"
@@ -639,19 +871,37 @@ class OutboundCaller(Agent):
             
             logger.info(f"Appointment scheduled: {time_str} for {email} (stored time: {start_time})")
             
-            # Schedule automatic hangup after a short delay to allow the agent to say goodbye
-            # This ensures the call ends even if the LLM doesn't call end_call()
-            if not self._auto_hangup_scheduled:
-                self._auto_hangup_scheduled = True
-                asyncio.create_task(self._auto_hangup_after_scheduling(ctx))
+            # Log success to Langfuse
+            self._log_to_langfuse("span", {
+                "name": "schedule_meeting",
+                "input": {"email": email, "dateTime": dateTime},
+                "output": {"success": True, "time_str": time_str, "meet_link": meet_link},
+                "metadata": {
+                    "function": "schedule_meeting",
+                    "status": "success",
+                    "appointment_scheduled": True,
+                    "appointment_time": str(start_time),
+                    "appointment_email": email,
+                },
+            })
             
-            if meet_link:
-                return f"Perfect! I've scheduled your meeting for {time_str} and sent a calendar invite to {email}. You'll receive the confirmation email shortly. See you then!"
-            else:
-                return f"Perfect! I've scheduled your meeting for {time_str} and sent a calendar invite to {email}. You'll receive the confirmation email shortly. See you then!"
+            # DO NOT auto-hangup here - let the agent complete the post-booking flow
+            # The agent will follow the post-booking instructions and call end_call() at the end
+            # Auto-hangup is disabled to allow for the full post-booking conversation
+            
+            # Return minimal success message - the agent will follow Step I post-booking flow instructions
+            success_msg = f"Calendar invite sent successfully for {time_str} to {email}."
+            return success_msg
                 
         except Exception as e:
             logger.error(f"Error creating Google Calendar event: {e}")
+            # Log error to Langfuse
+            self._log_to_langfuse("span", {
+                "name": "schedule_meeting",
+                "input": {"email": email, "dateTime": dateTime},
+                "output": {"error": str(e)},
+                "metadata": {"function": "schedule_meeting", "status": "error"},
+            })
             return f"I've noted your meeting request for {time_str} with {email}. Our system is processing it, and you'll receive a confirmation email shortly."
 
     @function_tool()
@@ -712,10 +962,12 @@ CRITICAL TOOL USAGE - YOU MUST USE THESE TOOLS:
 You have THREE tools available. You MUST call them - do not just talk about using them:
 
 1. **checkAvailability(dateTime)** 
-   - WHEN TO CALL: Immediately when customer suggests ANY time (e.g., "Tuesday at 2pm", "tomorrow at 3pm", "next week")
+   - WHEN TO CALL: Immediately when customer suggests ANY time (e.g., "Tuesday at 2pm", "tomorrow at 3pm", "next week", "mornings", "afternoons")
    - EXAMPLE: Customer says "How about Tuesday at 2pm?" → IMMEDIATELY call checkAvailability("Tuesday at 2pm")
+   - EXAMPLE: Customer says "mornings work" → IMMEDIATELY call checkAvailability("mornings")
    - DO NOT say "let me check" - just call the tool silently
    - The tool will return if the time is available or suggest another time
+   - IMPORTANT: If the tool returns "suggested_times" (like ["9am", "10am", "11am"]), read the message to the customer and ask them to pick one. Once they pick a specific time, call checkAvailability again with their choice (e.g., if they say "10am", call checkAvailability("10am"))
 
 2. **schedule_meeting(email, dateTime)**
    - WHEN TO CALL: After you have BOTH the customer's email AND the agreed time
@@ -729,6 +981,7 @@ MANDATORY RULES:
 - When customer suggests a time, IMMEDIATELY call checkAvailability - do not ask questions first
 - When you have email + time, IMMEDIATELY call schedule_meeting - do not delay
 - These tools work automatically - you don't need to explain what you're doing, just call them
+- After completing the post-booking flow and saying "I'll talk to you soon", IMMEDIATELY call end_call() - do NOT wait for a response
 
 Interaction Rules:
 
@@ -739,6 +992,8 @@ Confirmation: When asking "Hey.. {customer_name}?", stop speaking immediately.
 Never say words in brackets.
 
 After any question, stop speaking and allow the other person to respond naturally.
+
+
 
 Current Context:
 Today is {today_date}
@@ -813,41 +1068,47 @@ After they give a time, ask: "What day would you be most free?"
 
 Wait for their response. They might say "Tuesday", "tomorrow", "next week", "Monday", etc.
 
-Step D: Combine and Check Calendar Availability
-**CRITICAL: IMMEDIATELY after they provide the day, combine their answers (day + time) and call the checkAvailability tool.**
-Example: If they said "mornings", "10am", and "Tuesday", call checkAvailability("Tuesday at 10am") RIGHT NOW. Do not say "let me check" - just call the tool silently.
-
-After the tool returns:
-- If tool says available: "That time works perfectly."
-- If tool says busy and gives next_available_time: "Ah okay — sorry about that. Looks like the closest open time is [next_available_time]. Would that work?"
-
-Step E: Confirm the Time Works
-Make sure the time works for both of you.
-"That time works perfectly. Does that work for you?"
-OR if they suggested an alternative: "Would that work?"
+Step D: Confirm the Time and Date
+**CRITICAL: After they provide the day, simply confirm the time and date they mentioned. DO NOT check availability yet.**
+Example: If they said "10am" and "Tuesday", say: "Does Tuesday at 10am work?"
 
 Wait for their confirmation (they'll say "yes", "sure", "that works", etc.).
+
+**HANDLING VAGUE TIME PREFERENCES (mornings/afternoons/evenings):**
+- If customer says "mornings", "afternoons", or "evenings" → IMMEDIATELY call checkAvailability with that preference (e.g., checkAvailability("mornings"))
+- The tool will return suggested_times (like ["9am", "10am", "11am"]) and a message
+- Read the message to the customer and ask them to pick one of the suggested times
+- Once they pick a specific time, continue to ask for the day, then confirm as above
+
+Step E: Check Calendar Availability
+**ONLY AFTER they confirm the time works, then check availability.**
+After they confirm (say "yes", "sure", etc.), IMMEDIATELY combine their answers (day + time) and call the checkAvailability tool.
+Example: If they confirmed "Tuesday at 10am", call checkAvailability("Tuesday at 10am") RIGHT NOW. Do not say "let me check" - just call the tool silently.
+
+After the tool returns:
+- If tool says available: "Perfect, that time works for me too."
+- If tool says busy and gives next_available_time: "Ah okay — sorry about that. Looks like the closest open time is [next_available_time]. Would that work?"
 
 Step F: Email Collection
 "Okay, to lock that in... what's the best email to send the calendar invite to?"
 
 Wait for them to provide their email. They might spell it out letter by letter like "i t z n t p at Gmail dot co".
 
-Step G: Verify Email Letter by Letter
-After they provide the email, you MUST verify it by spelling out ONLY the username part (before @) and domain name (like gmail) letter by letter.
+Step G: Verify Email Phonetically
+After they provide the email, you MUST verify it by saying it phonetically (as words, not letter by letter).
 
 CRITICAL RULES FOR EMAIL VERIFICATION:
-- Spell out the username part (before @) letter by letter: "j... o... h... n"
-- Say "at" as a word (not spelled out)
-- Spell out the domain name (like gmail) letter by letter: "g... m... a... i... l"
-- Say "dot" as a word (not spelled out)
+- Say the username part (before @) phonetically as a word: "john" (NOT "j-o-h-n")
+- Say "at" as a word
+- Say the domain name (like gmail) phonetically as a word: "gmail" (NOT "g-m-a-i-l")
+- Say "dot" as a word
 - Say the extension (like com) as a word: "com" (not spelled out)
 
 Examples:
-- If they said "john@gmail.com", you say: "Just to make sure I got that right... that was j... o... h... n... at... g... m... a... i... l... dot... com. Is that correct?"
-- If they said "i t z n t p at Gmail dot co", you say: "Just to make sure I got that right... that was i... t... z... n... t... p... at... g... m... a... i... l... dot... co. Is that correct?"
+- If they said "john@gmail.com", you say: "Just to make sure I got that right... that was john at gmail dot com. Is that correct?"
+- If they said "i t z n t p at Gmail dot co", you say: "Just to make sure I got that right... that was itzntp at gmail dot co. Is that correct?"
 
-MANDATORY: Spell out ONLY the username and domain name letter by letter. Say "at", "dot", and the extension (com, co, etc.) as words.
+MANDATORY: Say the email phonetically as words. Do NOT spell it out letter by letter. Say it naturally like you would read an email address out loud.
 
 Wait for their confirmation (they'll say "yes", "correct", "that's right", etc.).
 
@@ -857,9 +1118,32 @@ Example: If email is "john@gmail.com" and time is "Tuesday at 10am" (from combin
 
 Do not say "let me schedule that" or "I'll create the event" - just call the tool immediately.
 
-After the tool completes, say: "Perfect! I've sent the calendar invite to your email. See you then, {customer_name}!"
+Step I: POST-BOOKING FLOW (After schedule_meeting completes successfully)
 
-**CRITICAL: IMMEDIATELY after saying "See you then", you MUST call the end_call() tool to hang up the phone. Do not wait for a response - just call end_call() right away.**
+The Confirmation:
+After the schedule_meeting tool completes, say: "Okay, perfect... I just sent that invite over. Let me know when you see it pop up?"
+
+(Pause and wait for their response)
+
+If they say yes / got it / I see it:
+Say: "Perfect."
+
+The Google Glitch:
+Say: "Okay, cool. Could you do me one quick favor and add it to your calendar right now?"
+Say: "Google's been a little weird lately... and sometimes the meeting doesn't sync unless you hit accept."
+
+(Pause)
+
+The Commitment Check:
+Say: "Alright, so I've got you down for [the time they agreed to, e.g., 'Tuesday at 10am']. Is there any reason at all you wouldn't be able to make that time?"
+
+(Pause — expect 'no' or 'no reason' or similar)
+
+UPDATED EXIT (more conversational, natural):
+Say: "Alright, you should be all set then."
+Say: "Thanks {customer_name}... I'll talk to you soon."
+
+**CRITICAL: IMMEDIATELY after saying "I'll talk to you soon", you MUST call the end_call() tool to hang up the phone. Do NOT wait for their reply - just call end_call() right away.**
 
 OBJECTION HANDLING (unchanged except where noted)
 
@@ -893,17 +1177,58 @@ Trigger endCall."""
         # Using gpt-4o-mini for cost efficiency, but gpt-4o has better tool calling
         # If tools aren't being called, try switching to "gpt-4o" for better function calling
         llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        llm_instance = openai.LLM(model=llm_model)
+        openai_api_key = os.getenv("OPENAI_API_KEY", "").strip().strip('"').strip("'")
+        if openai_api_key:
+            # Pass API key explicitly if available
+            llm_instance = openai.LLM(model=llm_model, api_key=openai_api_key)
+        else:
+            llm_instance = openai.LLM(model=llm_model)
     elif llm_provider == "openai-realtime":
         # Use the specified realtime model
         realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview-2024-12-17")
-        openai_api_key = os.getenv("OPENAI_API_KEY")
+        openai_api_key = os.getenv("OPENAI_API_KEY", "").strip().strip('"').strip("'")
         if not openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required for OpenAI Realtime model")
-        llm_instance = openai.realtime.RealtimeModel(
-            model=realtime_model,
-            api_key=openai_api_key
-        )  # Speech-to-speech, no TTS needed
+            logger.error("❌ OPENAI_API_KEY is required for OpenAI Realtime model but not found")
+            logger.error("   Please set OPENAI_API_KEY in your .env.local file")
+            logger.error("   Get your API key from: https://platform.openai.com/api-keys")
+            logger.warning("Falling back to regular OpenAI LLM")
+            llm_provider = "openai"
+            llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            llm_instance = openai.LLM(model=llm_model)
+        else:
+            # Validate API key format (should start with sk-)
+            if not openai_api_key.startswith("sk-"):
+                logger.warning(f"⚠️  OPENAI_API_KEY doesn't look valid (should start with 'sk-')")
+                logger.warning(f"   Current key starts with: {openai_api_key[:5]}...")
+            
+            try:
+                # Log API key info for debugging (first 10 and last 5 chars only)
+                key_preview = f"{openai_api_key[:10]}...{openai_api_key[-5:]}" if len(openai_api_key) > 15 else "***"
+                logger.info(f"Initializing OpenAI Realtime model: {realtime_model}")
+                logger.info(f"API key preview: {key_preview} (length: {len(openai_api_key)})")
+                
+                llm_instance = openai.realtime.RealtimeModel(
+                    model=realtime_model,
+                    api_key=openai_api_key
+                )  # Speech-to-speech, no TTS needed
+                logger.info(f"✅ RealtimeModel initialized successfully")
+                logger.info(f"⚠️  Note: WebSocket connection will be established when session starts")
+                logger.info(f"⚠️  If you see 401 errors, ensure:")
+                logger.info(f"   1. API key has access to Realtime API (preview feature)")
+                logger.info(f"   2. Agent process was restarted after updating .env.local")
+                logger.info(f"   3. API key is valid and has sufficient credits")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize OpenAI Realtime model: {e}")
+                logger.error("   This could be due to:")
+                logger.error("   1. Invalid or expired API key")
+                logger.error("   2. Insufficient API credits/quota")
+                logger.error("   3. Network connectivity issues")
+                logger.error("   4. API key doesn't have access to Realtime API (preview)")
+                logger.error("   Get your API key from: https://platform.openai.com/api-keys")
+                logger.warning("Falling back to regular OpenAI LLM")
+                llm_provider = "openai"
+                llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+                llm_instance = openai.LLM(model=llm_model)
     else:
         # Default to Groq
         llm_instance = groq.LLM(model="llama-3.1-8b-instant")
@@ -923,12 +1248,38 @@ Trigger endCall."""
     # The plugin automatically checks ELEVEN_API_KEY env var if not passed
     ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
     
+    # TTS Speed configuration (0.7 to 1.2, default 1.0 = normal speed)
+    # 0.7 = slower, 1.2 = faster
+    # You can set TTS_SPEED in .env.local to adjust speaking speed
+    TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
+    if TTS_SPEED < 0.7 or TTS_SPEED > 1.2:
+        logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.7-1.2). Clamping to valid range.")
+        TTS_SPEED = max(0.7, min(1.2, TTS_SPEED))
+    
     # Check ElevenLabs quota before using it
     USE_ELEVENLABS = False
+    voice_default_settings = None  # Store voice default settings for later use
     if ELEVEN_API_KEY:
         try:
             import requests
             headers = {"xi-api-key": ELEVEN_API_KEY}
+            
+            # First, verify the voice ID exists and is accessible
+            voice_response = requests.get(f"https://api.elevenlabs.io/v1/voices/{ELEVENLABS_VOICE_ID}", headers=headers, timeout=5)
+            if voice_response.status_code == 200:
+                voice_data = voice_response.json()
+                voice_name = voice_data.get('name', 'Unknown')
+                # Get default voice settings to preserve stability and similarity_boost
+                voice_default_settings = voice_data.get('settings', {})
+                logger.info(f"✅ Verified ElevenLabs voice: {voice_name} (ID: {ELEVENLABS_VOICE_ID})")
+            elif voice_response.status_code == 404:
+                logger.error(f"❌ Voice ID {ELEVENLABS_VOICE_ID} not found in your ElevenLabs account!")
+                logger.error("   Make sure the voice exists in your account at: https://elevenlabs.io/app/voices")
+                logger.error("   ElevenLabs TTS is required - agent will not start without this voice")
+            else:
+                logger.warning(f"⚠️  Could not verify voice ID (status {voice_response.status_code}): {voice_response.text}")
+            
+            # Check user quota
             response = requests.get("https://api.elevenlabs.io/v1/user", headers=headers, timeout=5)
             if response.status_code == 200:
                 user_data = response.json()
@@ -938,30 +1289,69 @@ Trigger endCall."""
                 
                 if remaining > 100:  # Only use if more than 100 characters remaining
                     USE_ELEVENLABS = True
-                    logger.info(f"Using ElevenLabs TTS with voice ID: {ELEVENLABS_VOICE_ID} ({remaining} chars remaining)")
+                    logger.info(f"✅ Using ElevenLabs TTS with voice ID: {ELEVENLABS_VOICE_ID} ({remaining} chars remaining)")
                 else:
-                    logger.warning(f"ElevenLabs quota low ({remaining} chars remaining). Using OpenAI TTS instead.")
-                    logger.warning("To use ElevenLabs: Upgrade your plan or wait for quota reset at https://elevenlabs.io/")
+                    logger.error(f"❌ ElevenLabs quota low ({remaining} chars remaining). ElevenLabs TTS is required!")
+                    logger.error("   To use ElevenLabs: Upgrade your plan or wait for quota reset at https://elevenlabs.io/")
+                    logger.error("   Agent will not start without ElevenLabs TTS")
             else:
-                logger.warning(f"Could not verify ElevenLabs quota (status {response.status_code}). Using OpenAI TTS.")
+                logger.error(f"❌ Could not verify ElevenLabs quota (status {response.status_code}). ElevenLabs TTS is required!")
         except Exception as e:
-            logger.warning(f"Error checking ElevenLabs quota: {e}. Using OpenAI TTS as fallback.")
+            logger.error(f"❌ Error checking ElevenLabs quota: {e}. ElevenLabs TTS is required!")
     
-    # Use ElevenLabs if quota is available, otherwise fallback to OpenAI
-    if USE_ELEVENLABS:
-        tts_instance = elevenlabs.TTS(voice_id=ELEVENLABS_VOICE_ID, api_key=ELEVEN_API_KEY)
+    # Configure STT and TTS based on LLM provider
+    # OpenAI Realtime model handles both STT and TTS internally (speech-to-speech)
+    # Regular models need separate STT and TTS
+    if llm_provider == "openai-realtime":
+        # Realtime model handles STT and TTS internally - no need for separate services
+        stt_instance = None
+        tts_instance = None
+        logger.info("Using OpenAI Realtime model - STT and TTS handled internally")
     else:
-        if not ELEVEN_API_KEY:
-            logger.warning("ELEVEN_API_KEY not found - Using OpenAI TTS")
-        tts_instance = openai.TTS(voice="alloy")  # Options: alloy, echo, fable, onyx, nova, shimmer
+        # Regular models need separate STT and TTS
+        stt_instance = deepgram.STT()
+        
+        # Use ElevenLabs TTS only - no fallback to OpenAI
+        if USE_ELEVENLABS:
+            # Configure voice settings with speed
+            from livekit.plugins.elevenlabs import VoiceSettings
+            # Use voice default settings if available, otherwise use reasonable defaults
+            if voice_default_settings:
+                stability = voice_default_settings.get('stability', 0.5)
+                similarity_boost = voice_default_settings.get('similarity_boost', 0.75)
+            else:
+                stability = 0.5
+                similarity_boost = 0.75
+            
+            voice_settings = VoiceSettings(
+                stability=stability,
+                similarity_boost=similarity_boost,
+                speed=TTS_SPEED  # Configured speaking speed (0.7-1.2)
+            )
+            tts_instance = elevenlabs.TTS(
+                voice_id=ELEVENLABS_VOICE_ID,
+                api_key=ELEVEN_API_KEY,
+                voice_settings=voice_settings
+            )
+            logger.info(f"✅ ElevenLabs TTS instance created with voice ID: {ELEVENLABS_VOICE_ID}, speed: {TTS_SPEED}")
+        else:
+            # Fail if ElevenLabs is not available - no fallback
+            if not ELEVEN_API_KEY:
+                logger.error("❌ ELEVEN_API_KEY not found - ElevenLabs TTS is required!")
+                logger.error("   Please set ELEVEN_API_KEY in your .env.local file")
+                raise ValueError("ELEVEN_API_KEY is required for ElevenLabs TTS")
+            else:
+                logger.error(f"❌ ElevenLabs TTS not available (quota check failed or quota low)")
+                logger.error(f"   Required voice ID: {ELEVENLABS_VOICE_ID}")
+                logger.error("   Please check your ElevenLabs quota at: https://elevenlabs.io/")
+                logger.error("   ElevenLabs TTS is required - no fallback available")
+                logger.error("   Agent will not start without the specified ElevenLabs voice")
+                raise ValueError(f"ElevenLabs TTS is required but not available. Voice ID: {ELEVENLABS_VOICE_ID}")
     
     session = AgentSession(
         vad=silero.VAD.load(),
-        stt=deepgram.STT(),
-        # Use ElevenLabs TTS with the specified voice and API key
-        # Explicitly pass API key to ensure it's used correctly
-        # You can also use OpenAI's TTS with openai.TTS() or Cartesia with cartesia.TTS()
-        tts=tts_instance,
+        stt=stt_instance,  # None for Realtime, deepgram.STT() for regular models
+        tts=tts_instance,  # None for Realtime, TTS instance for regular models
         llm=llm_instance,
         # Configure endpointing delays (when to consider user finished speaking)
         min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # Lower = faster response, but may cut off user
@@ -1002,10 +1392,24 @@ Trigger endCall."""
         agent.set_participant(participant)
         
         # Store session reference for transcript extraction
-        agent.session = session
+        agent._agent_session = session
         
         # Track call start time
         agent.call_start_time = datetime.datetime.now()
+        
+        # Log call start to Langfuse
+        if agent.langfuse_trace:
+            try:
+                agent._log_to_langfuse("event", {
+                    "name": "call_started",
+                    "metadata": {
+                        "phone_number": participant.identity,
+                        "customer_name": customer_name,
+                        "room_name": ctx.room.name,
+                    },
+                })
+            except Exception as e:
+                logger.debug(f"Failed to log call start to Langfuse: {e}")
         
         # Note: Transcripts are now captured from the conversation history
         # This provides both user and agent messages in chronological order
@@ -1018,9 +1422,25 @@ Trigger endCall."""
         
         # Generate initial greeting - Lia's script opening
         # CRITICAL: Only say "Hey, {name}?" and then STOP - wait for their response
-        await session.generate_reply(
-            instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
-        )
+        # Check if session is still active before trying to generate reply
+        try:
+            await session.generate_reply(
+                instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
+            )
+        except RuntimeError as e:
+            if "AgentSession is closing" in str(e) or "cannot use generate_reply" in str(e):
+                logger.error(f"❌ Session is closing, cannot generate reply: {e}")
+                logger.error("   This usually happens when the LLM connection failed.")
+                logger.error("   Common causes:")
+                logger.error("   1. Invalid or missing OPENAI_API_KEY")
+                logger.error("   2. Expired API key or insufficient credits")
+                logger.error("   3. Network connectivity issues")
+                logger.error("   Check your .env.local file and verify your API key at: https://platform.openai.com/api-keys")
+                return
+            raise
+        except Exception as e:
+            logger.error(f"Error generating initial greeting: {e}")
+            raise
 
     except api.TwirpError as e:
         logger.error(

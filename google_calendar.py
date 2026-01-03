@@ -72,7 +72,7 @@ class GoogleCalendar:
             try:
                 with open("token.json", "w") as token:
                     token.write(self.creds.to_json())
-                logger.info("Credentials saved to token.json")
+                    logger.info("Credentials saved to token.json")
             except Exception as e:
                 logger.warning(f"Failed to save token.json: {e}")
         
