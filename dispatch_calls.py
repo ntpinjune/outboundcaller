@@ -58,9 +58,8 @@ MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "300"))  # Max call durat
 WAIT_FOR_CALL_COMPLETION = os.getenv("WAIT_FOR_CALL_COMPLETION", "true").lower() == "true"  # Wait for each call to finish before next
 CALL_COMPLETION_CHECK_INTERVAL = int(os.getenv("CALL_COMPLETION_CHECK_INTERVAL", "10"))  # Check every 10 seconds if call is done
 MAX_WAIT_TIME = int(os.getenv("MAX_WAIT_TIME", "600"))  # Max 10 minutes per call
-WAIT_FOR_CALL_COMPLETION = os.getenv("WAIT_FOR_CALL_COMPLETION", "true").lower() == "true"  # Wait for each call to finish before next
-CALL_COMPLETION_CHECK_INTERVAL = int(os.getenv("CALL_COMPLETION_CHECK_INTERVAL", "10"))  # Check every 10 seconds if call is done
-MAX_WAIT_TIME = int(os.getenv("MAX_WAIT_TIME", "600"))  # Max 10 minutes per call
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # Maximum number of retry attempts for "No Answer" calls
+RETRY_NO_ANSWER = os.getenv("RETRY_NO_ANSWER", "true").lower() == "true"  # Whether to retry "No Answer" calls on next run
 
 logging.basicConfig(
     level=logging.INFO,  # INFO level - shows important messages
@@ -120,7 +119,11 @@ def get_column_index(headers: List[str], column_name: str) -> Optional[int]:
 
 
 def read_pending_rows(service) -> List[Dict[str, Any]]:
-    """Read rows from Google Sheets with Status = 'Pending'."""
+    """Read rows from Google Sheets with Status = 'Pending' or 'No Answer' (for retries).
+    
+    If RETRY_NO_ANSWER is enabled, will also include rows with "No Answer" status
+    that haven't exceeded MAX_RETRIES.
+    """
     try:
         # Read all rows
         range_name = f"{SHEET_NAME}!A1:Z1000"
@@ -156,32 +159,85 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
         if appointment_idx is None:
             appointment_idx = get_column_index(headers, "AppointmentTime")
         
+        # Find Retry Count column (optional)
+        retry_count_idx = get_column_index(headers, "Retry Count")
+        
         if status_idx is None or phone_idx is None:
             logger.error(f"Missing required columns. Found: {headers}")
             logger.error(f"Status index: {status_idx}, Phone index: {phone_idx}")
             logger.error(f"Looking for 'Status' and 'Phone Number' (or 'Phone_number' or 'PhoneNumber')")
             return []
         
-        # Filter for pending rows
+        # Filter for pending rows and "No Answer" rows (if retry enabled)
         pending_rows = []
         for i, row in enumerate(values[1:], start=2):  # Start from row 2 (skip header)
             # Pad row to match header length
             while len(row) < len(headers):
                 row.append("")
             
-            if len(row) > status_idx and row[status_idx].strip().lower() == "pending":
+            status = row[status_idx].strip().lower() if len(row) > status_idx else ""
+            phone_number = row[phone_idx].strip() if len(row) > phone_idx else ""
+            
+            # Skip if no phone number
+            if not phone_number:
+                continue
+            
+            # Check if status is "Pending" (first attempt)
+            is_pending = status == "pending"
+            
+            # Check if status is "No Answer" and retry is enabled
+            is_no_answer_retry = False
+            if RETRY_NO_ANSWER and status == "no answer":
+                # Check retry count if column exists
+                if retry_count_idx is not None and len(row) > retry_count_idx:
+                    try:
+                        retry_count = int(row[retry_count_idx].strip() or "0")
+                        if retry_count < MAX_RETRIES:
+                            is_no_answer_retry = True
+                            logger.info(f"Row {i}: Found 'No Answer' with retry count {retry_count}/{MAX_RETRIES} - will retry")
+                        else:
+                            logger.debug(f"Row {i}: 'No Answer' but exceeded max retries ({retry_count}/{MAX_RETRIES}) - skipping")
+                    except (ValueError, TypeError):
+                        # If retry count is invalid, treat as 0 and allow retry
+                        is_no_answer_retry = True
+                        logger.info(f"Row {i}: Found 'No Answer' with invalid retry count - will retry")
+                else:
+                    # No retry count column, allow retry if enabled
+                    is_no_answer_retry = True
+                    logger.info(f"Row {i}: Found 'No Answer' (no retry count column) - will retry")
+            
+            if is_pending or is_no_answer_retry:
                 # Ensure phone number exists
-                if len(row) > phone_idx and row[phone_idx].strip():
+                if phone_number:
+                    name = row[name_idx].strip() if name_idx and len(row) > name_idx and row[name_idx].strip() else "Customer"
+                    appointment_time = row[appointment_idx].strip() if appointment_idx and len(row) > appointment_idx and row[appointment_idx].strip() else ""
+                    
+                    # Get current retry count
+                    current_retry_count = 0
+                    if retry_count_idx is not None and len(row) > retry_count_idx:
+                        try:
+                            current_retry_count = int(row[retry_count_idx].strip() or "0")
+                        except (ValueError, TypeError):
+                            current_retry_count = 0
+                    
+                    # Increment retry count if this is a retry
+                    if is_no_answer_retry:
+                        current_retry_count += 1
+                    
                     row_data = {
                         "row_number": i,
-                        "phone_number": row[phone_idx].strip(),
-                        "name": row[name_idx].strip() if name_idx and len(row) > name_idx and row[name_idx].strip() else "Customer",
-                        "appointment_time": row[appointment_idx].strip() if appointment_idx and len(row) > appointment_idx and row[appointment_idx].strip() else "",
-                        "status": row[status_idx].strip()
+                        "phone_number": phone_number,
+                        "name": name,
+                        "appointment_time": appointment_time,
+                        "status": row[status_idx].strip(),
+                        "retry_count": current_retry_count,
+                        "is_retry": is_no_answer_retry
                     }
                     pending_rows.append(row_data)
         
-        logger.info(f"Found {len(pending_rows)} pending rows")
+        pending_count = sum(1 for r in pending_rows if not r.get("is_retry", False))
+        retry_count = sum(1 for r in pending_rows if r.get("is_retry", False))
+        logger.info(f"Found {len(pending_rows)} rows to call: {pending_count} new (Pending) + {retry_count} retries (No Answer)")
         return pending_rows
     
     except HttpError as error:
@@ -547,8 +603,10 @@ def wait_for_call_completion(service, row_number: int, phone_number: str) -> boo
         if status:
             status_lower = status.lower()
             # Call is complete if status changed from "Dispatched"
-            if status_lower in ["completed", "voicemail", "failed", "no answer"]:
+            if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up"]:
                 logger.info(f"✅ Call to {phone_number} completed with status: {status} (waited {int(elapsed)}s)")
+                if status_lower == "voicemail":
+                    logger.info(f"📞 Voicemail detected - moving to next call in list")
                 return True
             elif status_lower == "dispatched":
                 # Still in progress
@@ -575,11 +633,18 @@ def process_calls(service, pending_rows: List[Dict[str, Any]]):
         phone_number = row_data["phone_number"]
         row_number = row_data["row_number"]
         
-        logger.info(f"\n[{idx}/{total}] Processing call to {phone_number} (Row {row_number})...")
+        is_retry = row_data.get("is_retry", False)
+        retry_count = row_data.get("retry_count", 0)
+        retry_label = f" (Retry #{retry_count})" if is_retry else ""
+        logger.info(f"\n[{idx}/{total}] Processing call to {phone_number} (Row {row_number}){retry_label}...")
         
         # Update status to "Dispatched"
         update_sheet_cell(service, row_number, "Status", "Dispatched")
         update_sheet_cell(service, row_number, "Last Called", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        
+        # Update retry count if this is a retry
+        if is_retry and retry_count > 0:
+            update_sheet_cell(service, row_number, "Retry Count", str(retry_count))
         
         # Dispatch to LiveKit (try CLI first, fallback to HTTP)
         job_id = dispatch_to_livekit_cli(row_data)

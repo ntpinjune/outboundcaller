@@ -117,7 +117,8 @@ def update_call_results(service, call_data: Dict[str, Any]):
             "completed": "Completed",
             "voicemail": "Voicemail",
             "failed": "Failed",
-            "no_answer": "No Answer"
+            "no_answer": "No Answer",
+            "hung_up": "Hung Up"
         }
         updates["Status"] = status_map.get(call_status.lower(), call_status.capitalize())
         
@@ -148,14 +149,48 @@ def update_call_results(service, call_data: Dict[str, Any]):
             if "Appointment Email" in headers and call_data.get("appointment_email"):
                 updates["Appointment Email"] = call_data["appointment_email"]
         
-        # Update call duration
+        # Update call duration (format as MM:SS or HH:MM:SS)
         if "Call Duration" in headers and call_data.get("call_duration_seconds"):
-            duration = call_data["call_duration_seconds"]
-            updates["Call Duration"] = f"{duration} seconds"
+            duration = int(call_data["call_duration_seconds"])
+            if duration < 60:
+                updates["Call Duration"] = f"{duration}s"
+            elif duration < 3600:
+                minutes = duration // 60
+                seconds = duration % 60
+                updates["Call Duration"] = f"{minutes}m {seconds}s"
+            else:
+                hours = duration // 3600
+                minutes = (duration % 3600) // 60
+                seconds = duration % 60
+                updates["Call Duration"] = f"{hours}h {minutes}m {seconds}s"
         
         # Update last called timestamp
         if "Last Called" in headers:
             updates["Last Called"] = call_data.get("timestamp", datetime.now().isoformat())
+        
+        # Update call start time (if available)
+        if "Call Start Time" in headers and call_data.get("call_start_time"):
+            updates["Call Start Time"] = call_data["call_start_time"]
+        
+        # Update call end time (if available)
+        if "Call End Time" in headers and call_data.get("call_end_time"):
+            updates["Call End Time"] = call_data["call_end_time"]
+        
+        # Update outcome details (more specific than status)
+        if "Outcome Details" in headers and call_data.get("outcome_details"):
+            updates["Outcome Details"] = call_data["outcome_details"]
+        
+        # Update notes (if any)
+        if "Notes" in headers and call_data.get("notes"):
+            updates["Notes"] = call_data["notes"]
+        
+        # Update retry count (if tracking)
+        if "Retry Count" in headers and call_data.get("retry_count") is not None:
+            updates["Retry Count"] = str(call_data["retry_count"])
+        
+        # Update follow-up date (if callback requested)
+        if "Follow-up Date" in headers and call_data.get("follow_up_date"):
+            updates["Follow-up Date"] = call_data["follow_up_date"]
         
         # Batch update
         if updates:

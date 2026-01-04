@@ -176,94 +176,25 @@ class OutboundCaller(Agent):
         return intercepted_events()
     
     async def llm_node(self, chat_ctx, tools, model_settings):
-        """Official LiveKit hook to intercept LLM output - captures agent speech."""
+        """Official LiveKit hook to intercept LLM output.
+        
+        Note: We don't capture transcripts here to avoid duplicates.
+        Transcripts are captured in tts_node which captures what will actually be spoken.
+        """
         from livekit.agents import ModelSettings, llm, FunctionTool
-        from typing import AsyncIterable
         
-        # Get the default LLM chunks
-        chunks = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
-        
-        async def intercepted_chunks():
-            accumulated_text = ""  # Accumulate text across chunks
-            async for chunk in chunks:
-                # LLM chunks can be strings or ChatChunk objects
-                text_to_capture = None
-                
-                # Try multiple ways to extract text
-                if isinstance(chunk, str):
-                    text_to_capture = chunk
-                elif hasattr(chunk, 'text_content'):
-                    # ChatChunk might have text_content() method
-                    try:
-                        text_to_capture = chunk.text_content()
-                    except:
-                        pass
-                elif hasattr(chunk, 'text'):
-                    text_to_capture = chunk.text
-                elif hasattr(chunk, 'delta'):
-                    # Some chunks have delta property
-                    delta = chunk.delta
-                    if isinstance(delta, str):
-                        text_to_capture = delta
-                    elif hasattr(delta, 'content'):
-                        text_to_capture = delta.content
-                elif hasattr(chunk, 'content'):
-                    if isinstance(chunk.content, str):
-                        text_to_capture = chunk.content
-                    elif isinstance(chunk.content, list):
-                        # Extract text from content list
-                        text_parts = []
-                        for part in chunk.content:
-                            if isinstance(part, str):
-                                text_parts.append(part)
-                            elif isinstance(part, dict) and 'text' in part:
-                                text_parts.append(part['text'])
-                            elif hasattr(part, 'text'):
-                                text_parts.append(part.text)
-                        text_to_capture = ' '.join(text_parts)
-                
-                # Accumulate text (LLM outputs in chunks, we want full sentences)
-                if text_to_capture and isinstance(text_to_capture, str) and text_to_capture.strip():
-                    accumulated_text += text_to_capture
-                    
-                    # Check if we have a complete sentence (ends with punctuation or is substantial)
-                    if len(accumulated_text.strip()) > 10 and (
-                        accumulated_text.strip().endswith('.') or 
-                        accumulated_text.strip().endswith('!') or 
-                        accumulated_text.strip().endswith('?') or
-                        len(accumulated_text.strip()) > 50  # Or if it's a long chunk
-                    ):
-                        # Capture the accumulated text
-                        self.transcript.append({
-                            "speaker": "Lia",
-                            "text": accumulated_text.strip(),
-                            "timestamp": datetime.datetime.now().isoformat(),
-                            "is_final": True
-                        })
-                        logger.info(f"📝 [LLM_NODE] Captured agent transcript: {accumulated_text.strip()[:100]}...")
-                        accumulated_text = ""  # Reset for next sentence
-                
-                yield chunk
-            
-            # Capture any remaining accumulated text when stream ends
-            if accumulated_text.strip() and len(accumulated_text.strip()) > 3:
-                self.transcript.append({
-                    "speaker": "Lia",
-                    "text": accumulated_text.strip(),
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "is_final": True
-                })
-                logger.info(f"📝 [LLM_NODE] Captured agent transcript (final): {accumulated_text.strip()[:100]}...")
-        
-        return intercepted_chunks()
+        # Just pass through to default - no transcript capture here
+        # Transcripts are captured in tts_node instead to avoid duplicates
+        return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
     
     async def tts_node(self, text, model_settings):
-        """Official LiveKit hook to intercept TTS input - captures agent speech that will be spoken."""
+        """Official LiveKit hook to intercept TTS input - captures agent speech that will be spoken.
+        
+        This is the primary method for capturing agent transcripts since it captures
+        the exact text that will be spoken to the user.
+        """
         from livekit.agents import ModelSettings
         from typing import AsyncIterable
-        
-        # Get the default TTS audio frames
-        audio_frames = Agent.default.tts_node(self, text, model_settings)
         
         # Accumulate text that will be spoken
         accumulated_text = ""
@@ -281,32 +212,29 @@ class OutboundCaller(Agent):
                         accumulated_text.strip().endswith('?') or
                         len(accumulated_text.strip()) > 50
                     ):
-                        # Check if we haven't already captured this (avoid duplicates with LLM node)
-                        # Only add if it's not already in transcript
+                        # Add to transcript (no duplicate check needed since we only capture here)
                         text_to_add = accumulated_text.strip()
-                        if not any(entry.get("text", "").strip() == text_to_add for entry in self.transcript if entry.get("speaker") == "Lia"):
-                            self.transcript.append({
-                                "speaker": "Lia",
-                                "text": text_to_add,
-                                "timestamp": datetime.datetime.now().isoformat(),
-                                "is_final": True
-                            })
-                            logger.info(f"📝 [TTS_NODE] Captured agent transcript: {text_to_add[:100]}...")
+                        self.transcript.append({
+                            "speaker": "Lia",
+                            "text": text_to_add,
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "is_final": True
+                        })
+                        logger.info(f"📝 [TTS_NODE] Captured agent transcript: {text_to_add[:100]}...")
                         accumulated_text = ""
                 
                 yield text_chunk
             
-            # Capture any remaining text
+            # Capture any remaining text when stream ends
             if accumulated_text.strip() and len(accumulated_text.strip()) > 3:
                 text_to_add = accumulated_text.strip()
-                if not any(entry.get("text", "").strip() == text_to_add for entry in self.transcript if entry.get("speaker") == "Lia"):
-                    self.transcript.append({
-                        "speaker": "Lia",
-                        "text": text_to_add,
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "is_final": True
-                    })
-                    logger.info(f"📝 [TTS_NODE] Captured agent transcript (final): {text_to_add[:100]}...")
+                self.transcript.append({
+                    "speaker": "Lia",
+                    "text": text_to_add,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 [TTS_NODE] Captured agent transcript (final): {text_to_add[:100]}...")
         
         # Process text and get audio
         processed_text = intercepted_text()
@@ -659,11 +587,37 @@ class OutboundCaller(Agent):
         # Log what we're sending to Google Sheets for debugging
         logger.info(f"Sending to Google Sheets - appointment_scheduled: {self.appointment_scheduled}, appointment_time: {appointment_time_str}, appointment_email: {self.appointment_email}")
         
+        # Format call start/end times for Google Sheets
+        call_start_time_str = None
+        call_end_time_str = None
+        if self.call_start_time:
+            call_start_time_str = self.call_start_time.strftime("%Y-%m-%d %H:%M:%S")
+        if self.call_end_time:
+            call_end_time_str = self.call_end_time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Determine outcome details based on call status
+        outcome_details = None
+        if call_status == "completed" and self.appointment_scheduled:
+            outcome_details = "Appointment Scheduled"
+        elif call_status == "completed" and not self.appointment_scheduled:
+            outcome_details = "Call Completed - No Appointment"
+        elif call_status == "voicemail":
+            outcome_details = "Voicemail - Left Message"
+        elif call_status == "hung_up":
+            outcome_details = "Customer Hung Up"
+        elif call_status == "no_answer":
+            outcome_details = "No Answer - No Pickup"
+        elif call_status == "failed":
+            outcome_details = "Call Failed"
+        
         data = {
             "phone_number": self.participant.identity if self.participant else "",
             "name": self.name,
             "call_status": call_status,
             "call_duration_seconds": int(duration),
+            "call_start_time": call_start_time_str,
+            "call_end_time": call_end_time_str,
+            "outcome_details": outcome_details,
             "transcript": transcript_text,  # Use conversation history transcript
             "appointment_scheduled": self.appointment_scheduled,
             "appointment_time": appointment_time_str,  # Now in readable format
@@ -1249,12 +1203,23 @@ class OutboundCaller(Agent):
 
     @function_tool()
     async def detected_answering_machine(self, ctx: RunContext, reason: str = ""):
-        """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
-        logger.info(f"detected answering machine for {self.participant.identity}")
-        # Mark call end time and send results with voicemail status, then hangup
+        """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting.
+        
+        This will immediately hang up the call, mark it as voicemail in Google Sheets,
+        and allow the dispatch script to move to the next call in the list.
+        """
+        logger.info(f"📞 Voicemail detected for {self.participant.identity} - hanging up immediately")
+        
+        # Mark call end time
         self.call_end_time = datetime.datetime.now()
+        
+        # Send results to Google Sheets with voicemail status (this updates the Status column)
         await self.send_call_results_to_sheets("voicemail")
-        await self.hangup("voicemail", send_results=False)  # Already sent results above
+        logger.info("✅ Voicemail status sent to Google Sheets - dispatch script will move to next call")
+        
+        # Hang up immediately (don't send results again, already sent above)
+        await self.hangup("voicemail", send_results=False)
+        
         return "ending call due to voicemail"
 
 
@@ -1582,6 +1547,7 @@ Trigger endCall."""
     INITIAL_GREETING_DELAY = float(os.getenv("INITIAL_GREETING_DELAY", "1.0"))  # seconds to wait before first greeting
     MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.5"))  # min delay before considering user done speaking
     MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "15.0"))  # max delay before forcing turn end (increased for email collection - people spell emails very slowly letter by letter like "i t z n t p at Gmail dot co")
+    NO_RESPONSE_TIMEOUT = float(os.getenv("NO_RESPONSE_TIMEOUT", "10.0"))  # seconds to wait after greeting for user to speak before hanging up (default 10 seconds)
     
     # TTS Configuration - ElevenLabs voice with quota check
     # Get voice ID from environment variable, or use the specified default
@@ -2391,7 +2357,13 @@ Trigger endCall."""
                     logger.info(f"📝 Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
                     
                     # Send results (send_call_results_to_sheets will combine both sources)
-                    call_status = "completed" if agent.appointment_scheduled else "no_answer"
+                    if agent.appointment_scheduled:
+                        call_status = "completed"
+                    elif len(agent.transcript) > 0:
+                        call_status = "hung_up"
+                    else:
+                        call_status = "no_answer"
+                    
                     await agent.send_call_results_to_sheets(call_status)
                     agent.call_end_time = datetime.datetime.now()
                     logger.info(f"✅ Transcript sent to Google Sheets (status: {call_status})")
@@ -2421,7 +2393,13 @@ Trigger endCall."""
                     logger.info(f"📝 Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
                     
                     # Send results
-                    call_status = "completed" if agent.appointment_scheduled else "no_answer"
+                    if agent.appointment_scheduled:
+                        call_status = "completed"
+                    elif len(agent.transcript) > 0:
+                        call_status = "hung_up"
+                    else:
+                        call_status = "no_answer"
+                    
                     await agent.send_call_results_to_sheets(call_status)
                     agent.call_end_time = datetime.datetime.now()
                     logger.info(f"✅ Transcript sent to Google Sheets (status: {call_status})")
@@ -2452,10 +2430,13 @@ Trigger endCall."""
             await asyncio.sleep(INITIAL_GREETING_DELAY)
         
         # Generate initial greeting
+        greeting_sent_time = None
         try:
             await session.generate_reply(
                 instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
             )
+            greeting_sent_time = datetime.datetime.now()
+            logger.info(f"📞 Initial greeting sent, waiting up to {NO_RESPONSE_TIMEOUT} seconds for user response...")
         except RuntimeError as e:
             if "AgentSession is closing" in str(e) or "cannot use generate_reply" in str(e):
                 logger.error(f"❌ Session is closing, cannot generate reply: {e}")
@@ -2469,11 +2450,61 @@ Trigger endCall."""
             await send_transcript_on_end()
             raise
         
+        # Monitor for user response after greeting (silence timeout)
+        async def monitor_silence_timeout():
+            """Monitor if user responds after greeting, hang up if no response within timeout."""
+            if greeting_sent_time is None:
+                return
+            
+            try:
+                # Wait for the timeout period
+                await asyncio.sleep(NO_RESPONSE_TIMEOUT)
+                
+                # Check if user has spoken (transcript has customer entries)
+                user_has_spoken = any(
+                    entry.get("speaker") == "Customer" 
+                    for entry in agent.transcript
+                )
+                
+                # Check if call already ended
+                if agent.call_end_time:
+                    return
+                
+                # Check if participant is still connected
+                if participant not in ctx.room.remote_participants.values():
+                    return
+                
+                # If no user speech detected, hang up
+                if not user_has_spoken:
+                    logger.warning(f"⚠️  No user response detected after {NO_RESPONSE_TIMEOUT} seconds - hanging up")
+                    try:
+                        await agent.hangup("no_answer", send_results=True)
+                    except Exception as e:
+                        logger.error(f"Error hanging up due to silence: {e}")
+                else:
+                    logger.info("✅ User responded - silence timeout cancelled")
+                    
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Silence monitor error: {e}")
+        
+        # Start silence timeout monitor
+        silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
+        
         # Wait for monitor to complete (will finish when participant disconnects)
         try:
             await monitor_task
         except asyncio.CancelledError:
             pass
+        finally:
+            # Cancel silence timeout if still running
+            if not silence_timeout_task.done():
+                silence_timeout_task.cancel()
+                try:
+                    await silence_timeout_task
+                except asyncio.CancelledError:
+                    pass
 
     except api.TwirpError as e:
         logger.error(
