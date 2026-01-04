@@ -127,6 +127,191 @@ class OutboundCaller(Agent):
         self.langfuse_generation = None
         self._init_langfuse_trace()
     
+    async def stt_node(self, audio, model_settings):
+        """Official LiveKit hook to intercept STT output - captures user speech."""
+        from livekit.agents import ModelSettings, stt
+        from typing import AsyncIterable, Optional
+        
+        # Get the default STT events
+        events = Agent.default.stt_node(self, audio, model_settings)
+        if events is None:
+            return None
+        
+        async def intercepted_events():
+            async for event in events:
+                # Extract transcript from STT event
+                transcript_text = None
+                if hasattr(event, 'alternatives') and event.alternatives and len(event.alternatives) > 0:
+                    alt = event.alternatives[0]
+                    if isinstance(alt, dict):
+                        transcript_text = alt.get('transcript', '')
+                    elif hasattr(alt, 'transcript'):
+                        transcript_text = alt.transcript
+                    elif hasattr(alt, 'text'):
+                        transcript_text = alt.text
+                elif hasattr(event, 'text'):
+                    transcript_text = event.text
+                elif hasattr(event, 'transcript'):
+                    transcript_text = event.transcript
+                elif isinstance(event, dict):
+                    transcript_text = event.get('text') or event.get('transcript') or (event.get('alternatives', [{}])[0].get('transcript') if event.get('alternatives') else None)
+                
+                # Only capture final transcripts (not interim)
+                is_final = getattr(event, 'is_final', True)
+                if not hasattr(event, 'is_final'):
+                    # Try to determine if it's final from other attributes
+                    is_final = not getattr(event, 'is_interim', False)
+                
+                if transcript_text and isinstance(transcript_text, str) and transcript_text.strip() and is_final:
+                    self.transcript.append({
+                        "speaker": "Customer",
+                        "text": transcript_text.strip(),
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "is_final": True
+                    })
+                    logger.info(f"📝 [STT_NODE] Captured user transcript: {transcript_text.strip()}")
+                
+                yield event
+        
+        return intercepted_events()
+    
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """Official LiveKit hook to intercept LLM output - captures agent speech."""
+        from livekit.agents import ModelSettings, llm, FunctionTool
+        from typing import AsyncIterable
+        
+        # Get the default LLM chunks
+        chunks = Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+        
+        async def intercepted_chunks():
+            accumulated_text = ""  # Accumulate text across chunks
+            async for chunk in chunks:
+                # LLM chunks can be strings or ChatChunk objects
+                text_to_capture = None
+                
+                # Try multiple ways to extract text
+                if isinstance(chunk, str):
+                    text_to_capture = chunk
+                elif hasattr(chunk, 'text_content'):
+                    # ChatChunk might have text_content() method
+                    try:
+                        text_to_capture = chunk.text_content()
+                    except:
+                        pass
+                elif hasattr(chunk, 'text'):
+                    text_to_capture = chunk.text
+                elif hasattr(chunk, 'delta'):
+                    # Some chunks have delta property
+                    delta = chunk.delta
+                    if isinstance(delta, str):
+                        text_to_capture = delta
+                    elif hasattr(delta, 'content'):
+                        text_to_capture = delta.content
+                elif hasattr(chunk, 'content'):
+                    if isinstance(chunk.content, str):
+                        text_to_capture = chunk.content
+                    elif isinstance(chunk.content, list):
+                        # Extract text from content list
+                        text_parts = []
+                        for part in chunk.content:
+                            if isinstance(part, str):
+                                text_parts.append(part)
+                            elif isinstance(part, dict) and 'text' in part:
+                                text_parts.append(part['text'])
+                            elif hasattr(part, 'text'):
+                                text_parts.append(part.text)
+                        text_to_capture = ' '.join(text_parts)
+                
+                # Accumulate text (LLM outputs in chunks, we want full sentences)
+                if text_to_capture and isinstance(text_to_capture, str) and text_to_capture.strip():
+                    accumulated_text += text_to_capture
+                    
+                    # Check if we have a complete sentence (ends with punctuation or is substantial)
+                    if len(accumulated_text.strip()) > 10 and (
+                        accumulated_text.strip().endswith('.') or 
+                        accumulated_text.strip().endswith('!') or 
+                        accumulated_text.strip().endswith('?') or
+                        len(accumulated_text.strip()) > 50  # Or if it's a long chunk
+                    ):
+                        # Capture the accumulated text
+                        self.transcript.append({
+                            "speaker": "Lia",
+                            "text": accumulated_text.strip(),
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "is_final": True
+                        })
+                        logger.info(f"📝 [LLM_NODE] Captured agent transcript: {accumulated_text.strip()[:100]}...")
+                        accumulated_text = ""  # Reset for next sentence
+                
+                yield chunk
+            
+            # Capture any remaining accumulated text when stream ends
+            if accumulated_text.strip() and len(accumulated_text.strip()) > 3:
+                self.transcript.append({
+                    "speaker": "Lia",
+                    "text": accumulated_text.strip(),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 [LLM_NODE] Captured agent transcript (final): {accumulated_text.strip()[:100]}...")
+        
+        return intercepted_chunks()
+    
+    async def tts_node(self, text, model_settings):
+        """Official LiveKit hook to intercept TTS input - captures agent speech that will be spoken."""
+        from livekit.agents import ModelSettings
+        from typing import AsyncIterable
+        
+        # Get the default TTS audio frames
+        audio_frames = Agent.default.tts_node(self, text, model_settings)
+        
+        # Accumulate text that will be spoken
+        accumulated_text = ""
+        
+        async def intercepted_text():
+            nonlocal accumulated_text
+            async for text_chunk in text:
+                if isinstance(text_chunk, str) and text_chunk.strip():
+                    accumulated_text += text_chunk
+                    
+                    # Capture when we have a complete sentence or substantial text
+                    if len(accumulated_text.strip()) > 10 and (
+                        accumulated_text.strip().endswith('.') or 
+                        accumulated_text.strip().endswith('!') or 
+                        accumulated_text.strip().endswith('?') or
+                        len(accumulated_text.strip()) > 50
+                    ):
+                        # Check if we haven't already captured this (avoid duplicates with LLM node)
+                        # Only add if it's not already in transcript
+                        text_to_add = accumulated_text.strip()
+                        if not any(entry.get("text", "").strip() == text_to_add for entry in self.transcript if entry.get("speaker") == "Lia"):
+                            self.transcript.append({
+                                "speaker": "Lia",
+                                "text": text_to_add,
+                                "timestamp": datetime.datetime.now().isoformat(),
+                                "is_final": True
+                            })
+                            logger.info(f"📝 [TTS_NODE] Captured agent transcript: {text_to_add[:100]}...")
+                        accumulated_text = ""
+                
+                yield text_chunk
+            
+            # Capture any remaining text
+            if accumulated_text.strip() and len(accumulated_text.strip()) > 3:
+                text_to_add = accumulated_text.strip()
+                if not any(entry.get("text", "").strip() == text_to_add for entry in self.transcript if entry.get("speaker") == "Lia"):
+                    self.transcript.append({
+                        "speaker": "Lia",
+                        "text": text_to_add,
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "is_final": True
+                    })
+                    logger.info(f"📝 [TTS_NODE] Captured agent transcript (final): {text_to_add[:100]}...")
+        
+        # Process text and get audio
+        processed_text = intercepted_text()
+        return Agent.default.tts_node(self, processed_text, model_settings)
+    
     def _init_langfuse_trace(self):
         """Initialize Langfuse trace for this call."""
         if not langfuse:
@@ -197,55 +382,189 @@ class OutboundCaller(Agent):
                 lines.append(f"{speaker}: {text}")
         return "\n".join(lines)
     
-    def get_transcript_from_conversation(self, session: AgentSession) -> str:
+    def get_transcript_from_conversation(self, session: AgentSession = None) -> str:
         """Extract full transcript from the conversation history.
         
         This gets both user and agent messages from the LLM conversation context.
+        Returns a formatted transcript with both Customer and Agent (Lia) messages.
         """
+        transcript_lines = []
+        
         try:
-            # Get the conversation history from the session's chat context
-            # Note: chat_ctx might not exist on AgentSession with Realtime model
-            if not hasattr(session, 'chat_ctx'):
-                logger.debug("AgentSession does not have chat_ctx attribute (likely using Realtime model)")
-                return ""
+            if session is None:
+                session = getattr(self, '_agent_session', None)
             
-            chat_ctx = session.chat_ctx
-            if not chat_ctx:
-                return ""
+            if session is None:
+                logger.warning("📝 No session available for transcript extraction")
+                if self.transcript:
+                    return self.format_transcript()
+                return "No transcript available"
             
-            transcript_lines = []
-            for item in chat_ctx.items:
-                if isinstance(item, llm.ChatMessage):
-                    role = item.role
-                    # Get the text content from the message
-                    content_text = ""
-                    if isinstance(item.content, str):
-                        content_text = item.content
-                    elif isinstance(item.content, list):
-                        # Handle list of content blocks (text, images, etc.)
-                        for block in item.content:
-                            if isinstance(block, str):
-                                content_text += block
-                            elif hasattr(block, 'text'):
-                                content_text += block.text
+            # Method 1: Try session.history (official LiveKit method - most reliable)
+            if hasattr(session, 'history') and session.history:
+                logger.debug(f"📝 Found session.history: {type(session.history)}")
+                try:
+                    history_items = session.history
+                    if isinstance(history_items, list) and len(history_items) > 0:
+                        logger.debug(f"📝 Found {len(history_items)} items in session.history")
+                        for idx, item in enumerate(history_items):
+                            # Extract role and content
+                            role = None
+                            content = None
+                            
+                            if hasattr(item, 'role'):
+                                role = item.role
+                            elif hasattr(item, 'message') and hasattr(item.message, 'role'):
+                                role = item.message.role
+                            elif isinstance(item, dict):
+                                role = item.get('role')
+                            
+                            if hasattr(item, 'content'):
+                                content = item.content
+                            elif hasattr(item, 'message') and hasattr(item.message, 'content'):
+                                content = item.message.content
+                            elif isinstance(item, dict):
+                                content = item.get('content')
+                            
+                            if not role or not content:
+                                continue
+                            
+                            # Convert content to string
+                            if isinstance(content, str):
+                                content_text = content
+                            elif hasattr(content, 'text'):
+                                content_text = content.text
+                            elif isinstance(content, list):
+                                content_text = ' '.join([str(part) for part in content])
+                            else:
+                                content_text = str(content)
+                            
+                            # Determine speaker
+                            if role.lower() == "user":
+                                speaker = "Customer"
+                            elif role.lower() in ["assistant", "agent"]:
+                                speaker = "Lia"
+                            elif role.lower() == "system":
+                                continue
+                            else:
+                                speaker = role.title()
+                            
+                            if content_text.strip():
+                                transcript_lines.append(f"{speaker}: {content_text.strip()}")
+                                logger.debug(f"📝 Added from history {idx+1}: {speaker} - {content_text.strip()[:50]}...")
+                        
+                        if transcript_lines:
+                            logger.info(f"✅ Extracted transcript from session.history ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
+                            return "\n".join(transcript_lines)
+                except Exception as e:
+                    logger.debug(f"📝 Error accessing session.history: {e}")
+            
+            # Method 2: Try to get from chat_ctx (LLM conversation history)
+            if hasattr(session, 'chat_ctx') and session.chat_ctx:
+                chat_ctx = session.chat_ctx
+                logger.info(f"📝 chat_ctx available, type: {type(chat_ctx)}")
+                if hasattr(chat_ctx, 'items'):
+                    items_count = len(chat_ctx.items) if hasattr(chat_ctx.items, '__len__') else 'unknown'
+                    logger.info(f"📝 chat_ctx.items available, count: {items_count}")
+                    for idx, item in enumerate(chat_ctx.items):
+                        if isinstance(item, llm.ChatMessage):
+                            role = item.role
+                            # Get the text content from the message
+                            content_text = ""
+                            if isinstance(item.content, str):
+                                content_text = item.content
+                            elif isinstance(item.content, list):
+                                # Handle list of content blocks (text, images, etc.)
+                                for block in item.content:
+                                    if isinstance(block, str):
+                                        content_text += block
+                                    elif hasattr(block, 'text'):
+                                        content_text += block.text
+                            
+                            # Map roles to readable names
+                            if role == "user":
+                                speaker = "Customer"
+                            elif role == "assistant":
+                                speaker = "Lia"
+                            elif role == "system":
+                                continue  # Skip system messages
+                            else:
+                                speaker = role.title()
+                            
+                            if content_text.strip():
+                                transcript_lines.append(f"{speaker}: {content_text.strip()}")
+                                logger.info(f"📝 Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
                     
-                    # Map roles to readable names
-                    if role == "user":
-                        speaker = "Customer"
-                    elif role == "assistant":
-                        speaker = "Lia"
-                    elif role == "system":
-                        continue  # Skip system messages
-                    else:
-                        speaker = role.title()
-                    
-                    if content_text.strip():
-                        transcript_lines.append(f"{speaker}: {content_text.strip()}")
+                    if transcript_lines:
+                        logger.info(f"✅ Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
+                        return "\n".join(transcript_lines)
+                else:
+                    logger.warning("📝 chat_ctx.items not available")
+            else:
+                logger.warning("📝 chat_ctx not available or empty")
             
-            return "\n".join(transcript_lines)
+            # Method 2: Try to get from session.messages if available
+            if hasattr(session, 'messages') and session.messages:
+                for msg in session.messages:
+                    if hasattr(msg, 'role') and hasattr(msg, 'content'):
+                        role = msg.role
+                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                        
+                        if role == "user":
+                            speaker = "Customer"
+                        elif role == "assistant":
+                            speaker = "Lia"
+                        elif role == "system":
+                            continue
+                        else:
+                            speaker = role.title()
+                        
+                        if content.strip():
+                            transcript_lines.append(f"{speaker}: {content.strip()}")
+                
+                if transcript_lines:
+                    logger.info(f"✅ Extracted transcript from session.messages ({len(transcript_lines)} messages)")
+                    return "\n".join(transcript_lines)
+            
+            # Method 3: Try to get from session.conversation if available
+            if hasattr(session, 'conversation') and session.conversation:
+                for msg in session.conversation:
+                    if hasattr(msg, 'role') and hasattr(msg, 'content'):
+                        role = msg.role
+                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                        
+                        if role == "user":
+                            speaker = "Customer"
+                        elif role == "assistant":
+                            speaker = "Lia"
+                        elif role == "system":
+                            continue
+                        else:
+                            speaker = role.title()
+                        
+                        if content.strip():
+                            transcript_lines.append(f"{speaker}: {content.strip()}")
+                
+                if transcript_lines:
+                    logger.info(f"✅ Extracted transcript from session.conversation ({len(transcript_lines)} messages)")
+                    return "\n".join(transcript_lines)
+            
+            # Fallback: Use real-time transcriptions if available
+            if self.transcript:
+                logger.info(f"✅ Using manual transcript entries ({len(self.transcript)} entries)")
+                return self.format_transcript()
+            
+            logger.warning("⚠️  Could not extract transcript from conversation history")
+            return "No transcript available"
+            
         except Exception as e:
-            logger.error(f"Error extracting transcript from conversation: {e}")
-            return self.format_transcript()  # Fallback to old method
+            logger.error(f"❌ Error extracting transcript from conversation: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Fallback to real-time transcriptions
+            if self.transcript:
+                return self.format_transcript()
+            return "Error extracting transcript"
 
     async def _auto_hangup_after_scheduling(self, ctx: RunContext):
         """Automatically hang up the call after scheduling a meeting.
@@ -300,18 +619,42 @@ class OutboundCaller(Agent):
                 logger.warning(f"Error formatting appointment time: {e}, using ISO format")
                 appointment_time_str = self.appointment_time_scheduled.isoformat()
         
-        # Get transcript from conversation history (preferred method)
+        # Get transcript from multiple sources and combine them
+        # 1. Real-time transcriptions captured during the call (self.transcript)
+        # 2. Conversation history from LLM chat context (more complete)
         transcript_text = ""
+        
+        # First, try to get transcript from real-time tracking (most accurate)
+        realtime_transcript = self.format_transcript()
+        logger.info(f"📝 Real-time transcript entries: {len(self.transcript)}, formatted: {len(realtime_transcript)} chars")
+        
+        # Then, try to get from conversation history (more complete, includes context)
+        conversation_transcript = ""
         if self._agent_session:
             try:
-                transcript_text = self.get_transcript_from_conversation(self._agent_session)
-                logger.info(f"Extracted transcript from conversation history ({len(transcript_text)} characters)")
+                conversation_transcript = self.get_transcript_from_conversation(self._agent_session)
+                logger.info(f"📝 Extracted transcript from conversation history ({len(conversation_transcript)} characters)")
             except Exception as e:
-                logger.warning(f"Could not extract transcript from conversation: {e}, using fallback")
-                transcript_text = self.format_transcript()
+                logger.debug(f"Could not extract transcript from conversation: {e}")
+        
+        # Combine both sources - prefer real-time if it has substantial content
+        # Otherwise use conversation history
+        if realtime_transcript and len(realtime_transcript) > 10:
+            transcript_text = realtime_transcript
+            logger.info(f"📝 Using real-time transcript ({len(transcript_text)} characters)")
+        elif conversation_transcript and len(conversation_transcript) > 50:
+            transcript_text = conversation_transcript
+            logger.info(f"📝 Using conversation history transcript ({len(transcript_text)} characters)")
         else:
-            # Fallback to old method if session not available
-            transcript_text = self.format_transcript()
+            # Fallback: combine both if available
+            if realtime_transcript:
+                transcript_text = realtime_transcript
+            elif conversation_transcript:
+                transcript_text = conversation_transcript
+            else:
+                transcript_text = "No transcript available"
+                logger.warning("⚠️  No transcript data available from any source")
+                logger.warning(f"   Real-time entries: {len(self.transcript)}, Real-time formatted: {len(realtime_transcript)}, Conversation: {len(conversation_transcript)}")
         
         # Log what we're sending to Google Sheets for debugging
         logger.info(f"Sending to Google Sheets - appointment_scheduled: {self.appointment_scheduled}, appointment_time: {appointment_time_str}, appointment_email: {self.appointment_email}")
@@ -1142,8 +1485,9 @@ Say: "Alright, so I've got you down for [the time they agreed to, e.g., 'Tuesday
 UPDATED EXIT (more conversational, natural):
 Say: "Alright, you should be all set then."
 Say: "Thanks {customer_name}... I'll talk to you soon."
+Say: "Bye! See you then!"
 
-**CRITICAL: IMMEDIATELY after saying "I'll talk to you soon", you MUST call the end_call() tool to hang up the phone. Do NOT wait for their reply - just call end_call() right away.**
+**CRITICAL: IMMEDIATELY after saying "See you then!", you MUST call the end_call() tool to hang up the phone. Do NOT wait for their reply - just call end_call() right away.**
 
 OBJECTION HANDLING (unchanged except where noted)
 
@@ -1309,44 +1653,354 @@ Trigger endCall."""
         logger.info("Using OpenAI Realtime model - STT and TTS handled internally")
     else:
         # Regular models need separate STT and TTS
-        stt_instance = deepgram.STT()
-        
-        # Use ElevenLabs TTS only - no fallback to OpenAI
-        if USE_ELEVENLABS:
-            # Configure voice settings with speed
-            from livekit.plugins.elevenlabs import VoiceSettings
-            # Use voice default settings if available, otherwise use reasonable defaults
-            if voice_default_settings:
-                stability = voice_default_settings.get('stability', 0.5)
-                similarity_boost = voice_default_settings.get('similarity_boost', 0.75)
-            else:
-                stability = 0.5
-                similarity_boost = 0.75
+        # Create a wrapper STT class that captures transcriptions
+        class TranscriptingSTT(deepgram.STT):
+            """STT wrapper that captures transcriptions."""
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._transcript_callback = None
             
-            voice_settings = VoiceSettings(
-                stability=stability,
-                similarity_boost=similarity_boost,
-                speed=TTS_SPEED  # Configured speaking speed (0.7-1.2)
-            )
-            tts_instance = elevenlabs.TTS(
-                voice_id=ELEVENLABS_VOICE_ID,
-                api_key=ELEVEN_API_KEY,
-                voice_settings=voice_settings
-            )
-            logger.info(f"✅ ElevenLabs TTS instance created with voice ID: {ELEVENLABS_VOICE_ID}, speed: {TTS_SPEED}")
+            def set_transcript_callback(self, callback):
+                """Set callback function to receive transcriptions."""
+                self._transcript_callback = callback
+            
+            async def transcribe(self, *args, **kwargs):
+                """Wrap transcribe to capture transcriptions."""
+                logger.debug(f"[STT WRAPPER] transcribe called with args: {len(args)}, kwargs: {list(kwargs.keys())}")
+                result = await super().transcribe(*args, **kwargs)
+                logger.debug(f"[STT WRAPPER] transcribe returned: {type(result)}, has __aiter__: {hasattr(result, '__aiter__')}")
+                
+                # Deepgram returns async iterator of SpeechEvent objects
+                if hasattr(result, '__aiter__'):
+                    async def transcript_iterator():
+                        event_count = 0
+                        async for event in result:
+                            event_count += 1
+                            logger.debug(f"[STT WRAPPER] Processing event #{event_count}: {type(event)}")
+                            
+                            # Extract transcript from event
+                            transcript_text = None
+                            
+                            # Try different ways to extract transcript
+                            if hasattr(event, 'alternatives') and event.alternatives and len(event.alternatives) > 0:
+                                alt = event.alternatives[0]
+                                if isinstance(alt, dict):
+                                    transcript_text = alt.get('transcript', '')
+                                elif hasattr(alt, 'transcript'):
+                                    transcript_text = alt.transcript
+                                elif hasattr(alt, 'text'):
+                                    transcript_text = alt.text
+                            elif hasattr(event, 'text'):
+                                transcript_text = event.text
+                            elif hasattr(event, 'transcript'):
+                                transcript_text = event.transcript
+                            elif isinstance(event, dict):
+                                transcript_text = event.get('text') or event.get('transcript') or (event.get('alternatives', [{}])[0].get('transcript') if event.get('alternatives') else None)
+                            
+                            logger.debug(f"[STT WRAPPER] Extracted transcript: {transcript_text}")
+                            
+                            if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
+                                if self._transcript_callback:
+                                    self._transcript_callback(transcript_text.strip())
+                                    logger.info(f"📝 [STT WRAPPER] Captured: {transcript_text.strip()}")
+                                else:
+                                    logger.warning(f"[STT WRAPPER] No callback set! Transcript: {transcript_text.strip()}")
+                            
+                            yield event
+                        
+                        logger.debug(f"[STT WRAPPER] Processed {event_count} events total")
+                    return transcript_iterator()
+                else:
+                    # Not an iterator - try to extract directly
+                    logger.debug(f"[STT WRAPPER] Result is not an iterator, trying direct extraction")
+                    if hasattr(result, 'alternatives') and len(result.alternatives) > 0:
+                        transcript_text = result.alternatives[0].get('transcript', '')
+                        if transcript_text and self._transcript_callback:
+                            self._transcript_callback(transcript_text.strip())
+                            logger.info(f"📝 [STT WRAPPER] Captured (direct): {transcript_text.strip()}")
+                
+                return result
+        
+        # Create STT instance with wrapper
+        stt_instance = TranscriptingSTT()
+        
+        # Set up transcript capture using conversation_item_added event
+        # This is the official LiveKit way to track all conversation items
+        def track_conversation_item(item):
+            """Capture conversation items (both user and agent) via conversation_item_added event."""
+            try:
+                # Extract role and content from the item
+                role = None
+                content = None
+                
+                if hasattr(item, 'role'):
+                    role = item.role
+                elif hasattr(item, 'message') and hasattr(item.message, 'role'):
+                    role = item.message.role
+                elif isinstance(item, dict):
+                    role = item.get('role')
+                
+                if hasattr(item, 'content'):
+                    content = item.content
+                elif hasattr(item, 'message') and hasattr(item.message, 'content'):
+                    content = item.message.content
+                elif isinstance(item, dict):
+                    content = item.get('content')
+                
+                if not role or not content:
+                    return
+                
+                # Convert content to string if needed
+                if isinstance(content, str):
+                    text = content
+                elif hasattr(content, 'text'):
+                    text = content.text
+                elif isinstance(content, list):
+                    # Handle list of content parts (e.g., OpenAI format)
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, str):
+                            text_parts.append(part)
+                        elif isinstance(part, dict) and 'text' in part:
+                            text_parts.append(part['text'])
+                        elif hasattr(part, 'text'):
+                            text_parts.append(part.text)
+                    text = ' '.join(text_parts)
+                else:
+                    text = str(content)
+                
+                if not text or not text.strip():
+                    return
+                
+                # Determine speaker
+                if role.lower() == "user":
+                    speaker = "Customer"
+                elif role.lower() in ["assistant", "agent"]:
+                    speaker = "Lia"
+                elif role.lower() == "system":
+                    return  # Skip system messages
+                else:
+                    speaker = role.title()
+                
+                # Add to transcript
+                agent.transcript.append({
+                    "speaker": speaker,
+                    "text": text.strip(),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 [{speaker}] transcript captured: {text.strip()[:100]}")
+                
+            except Exception as e:
+                logger.debug(f"Error tracking conversation item: {e}")
+        
+        # Legacy functions for backward compatibility (if needed)
+        def track_user_transcript(text: str):
+            """Capture user speech transcriptions from STT (legacy method)."""
+            if text and text.strip():
+                agent.transcript.append({
+                    "speaker": "Customer",
+                    "text": text.strip(),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 User transcript captured (legacy): {text.strip()}")
+        
+        def track_agent_transcript(text: str):
+            """Capture agent speech transcriptions (legacy method)."""
+            if text and text.strip():
+                agent.transcript.append({
+                    "speaker": "Lia",
+                    "text": text.strip(),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 Agent transcript captured (legacy): {text.strip()}")
+        
+        # Wrap STT instance to capture transcriptions DIRECTLY
+        # This is the most reliable method - intercept at the source
+        try:
+            if hasattr(stt_instance, 'transcribe'):
+                original_transcribe = stt_instance.transcribe
+                
+                async def wrapped_transcribe(*args, **kwargs):
+                    """Wrap transcribe to capture transcriptions at the source."""
+                    result = await original_transcribe(*args, **kwargs)
+                    # Extract transcript from result
+                    transcript_text = None
+                    if hasattr(result, 'text'):
+                        transcript_text = result.text
+                    elif isinstance(result, str):
+                        transcript_text = result
+                    elif isinstance(result, dict):
+                        transcript_text = result.get('text') or result.get('transcript') or result.get('alternatives', [{}])[0].get('transcript')
+                    elif hasattr(result, 'alternatives') and len(result.alternatives) > 0:
+                        transcript_text = result.alternatives[0].get('transcript')
+                    
+                    if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
+                        track_user_transcript(transcript_text.strip())
+                        logger.info(f"📝 [STT DIRECT] Captured transcript: {transcript_text.strip()}")
+                    
+                    return result
+                
+                stt_instance.transcribe = wrapped_transcribe
+                logger.info("✅ Wrapped STT transcribe method BEFORE session creation")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not wrap STT transcribe method: {e}")
+        
+        # Set up transcript capture handler EARLY (before session starts)
+        # This ensures we capture all logs from the beginning
+        
+        # Attach log handler EARLY to capture Deepgram transcripts
+        # Use both handler AND filter for maximum coverage
+        try:
+            livekit_logger = logging.getLogger("livekit.agents")
+            root_logger = logging.getLogger()
+            
+            class TranscriptCaptureHandler(logging.Handler):
+                """Handler to capture transcripts from LiveKit logs - PRIMARY METHOD."""
+                def __init__(self, track_func):
+                    super().__init__()
+                    self.track_func = track_func
+                    self.setLevel(logging.DEBUG)
+                    self.call_count = 0
+                
+                def emit(self, record):
+                    try:
+                        self.call_count += 1
+                        msg = record.getMessage()
+                        
+                        # Look for "received user transcript" pattern (case insensitive)
+                        if "received user transcript" in msg.lower():
+                            import json
+                            import re
+                            
+                            # The log format is: "received user transcript {"user_transcript": "...", "language": "..."}"
+                            # Try to extract JSON from the log message
+                            json_start = msg.find('{')
+                            if json_start != -1:
+                                json_str = msg[json_start:]
+                                
+                                # Try to parse as complete JSON first
+                                try:
+                                    data = json.loads(json_str)
+                                    transcript_text = data.get("user_transcript")
+                                    if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
+                                        self.track_func(transcript_text.strip())
+                                        # Use print to avoid recursion with logger
+                                        print(f"📝 [LOG HANDLER] Captured: {transcript_text.strip()}", flush=True)
+                                        return
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
+                            
+                            # Fallback: Use regex to extract just the transcript value
+                            match = re.search(r'"user_transcript"\s*:\s*"((?:[^"\\]|\\.)*)"', msg)
+                            if match:
+                                transcript_text = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                                if transcript_text and transcript_text.strip():
+                                    self.track_func(transcript_text.strip())
+                                    print(f"📝 [LOG HANDLER] Captured (regex): {transcript_text.strip()}", flush=True)
+                    except Exception:
+                        pass
+            
+            # Also create a filter that processes ALL log records
+            class TranscriptCaptureFilter(logging.Filter):
+                """Filter to capture transcripts from ALL log records."""
+                def __init__(self, track_func):
+                    super().__init__()
+                    self.track_func = track_func
+                
+                def filter(self, record):
+                    try:
+                        msg = record.getMessage()
+                        if "received user transcript" in msg.lower():
+                            import json
+                            import re
+                            
+                            json_start = msg.find('{')
+                            if json_start != -1:
+                                json_str = msg[json_start:]
+                                try:
+                                    data = json.loads(json_str)
+                                    transcript_text = data.get("user_transcript")
+                                    if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
+                                        self.track_func(transcript_text.strip())
+                                        print(f"📝 [LOG FILTER] Captured: {transcript_text.strip()}", flush=True)
+                                except (json.JSONDecodeError, ValueError):
+                                    match = re.search(r'"user_transcript"\s*:\s*"((?:[^"\\]|\\.)*)"', msg)
+                                    if match:
+                                        transcript_text = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                                        if transcript_text and transcript_text.strip():
+                                            self.track_func(transcript_text.strip())
+                                            print(f"📝 [LOG FILTER] Captured (regex): {transcript_text.strip()}", flush=True)
+                    except Exception:
+                        pass
+                    return True  # Don't filter out any records
+            
+            transcript_handler = TranscriptCaptureHandler(track_user_transcript)
+            transcript_handler.setLevel(logging.DEBUG)
+            transcript_filter = TranscriptCaptureFilter(track_user_transcript)
+            
+            # Make sure loggers accept DEBUG level messages
+            livekit_logger.setLevel(logging.DEBUG)
+            root_logger.setLevel(logging.DEBUG)
+            
+            # Add handler AND filter to both loggers
+            livekit_logger.addHandler(transcript_handler)
+            livekit_logger.addFilter(transcript_filter)
+            root_logger.addHandler(transcript_handler)
+            root_logger.addFilter(transcript_filter)
+            
+            logger.info("✅ Added transcript capture handler AND filter EARLY (before session start)")
+            logger.info(f"   Logger level: {livekit_logger.level}, Handler level: {transcript_handler.level}")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not add early transcript capture handler: {e}")
+    
+    # Set transcript callback on STT wrapper (BEFORE session creation)
+    # This is the most reliable method - captures at the source
+    if stt_instance is not None and hasattr(stt_instance, 'set_transcript_callback'):
+        try:
+            stt_instance.set_transcript_callback(track_user_transcript)
+            logger.info("✅ Set transcript callback on STT wrapper")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not set STT transcript callback: {e}")
+    
+    # Use ElevenLabs TTS only - no fallback to OpenAI
+    if USE_ELEVENLABS:
+        # Configure voice settings with speed
+        from livekit.plugins.elevenlabs import VoiceSettings
+        # Use voice default settings if available, otherwise use reasonable defaults
+        if voice_default_settings:
+            stability = voice_default_settings.get('stability', 0.5)
+            similarity_boost = voice_default_settings.get('similarity_boost', 0.75)
         else:
-            # Fail if ElevenLabs is not available - no fallback
-            if not ELEVEN_API_KEY:
-                logger.error("❌ ELEVEN_API_KEY not found - ElevenLabs TTS is required!")
-                logger.error("   Please set ELEVEN_API_KEY in your .env.local file")
-                raise ValueError("ELEVEN_API_KEY is required for ElevenLabs TTS")
-            else:
-                logger.error(f"❌ ElevenLabs TTS not available (quota check failed or quota low)")
-                logger.error(f"   Required voice ID: {ELEVENLABS_VOICE_ID}")
-                logger.error("   Please check your ElevenLabs quota at: https://elevenlabs.io/")
-                logger.error("   ElevenLabs TTS is required - no fallback available")
-                logger.error("   Agent will not start without the specified ElevenLabs voice")
-                raise ValueError(f"ElevenLabs TTS is required but not available. Voice ID: {ELEVENLABS_VOICE_ID}")
+            stability = 0.5
+            similarity_boost = 0.75
+        
+        voice_settings = VoiceSettings(
+            stability=stability,
+            similarity_boost=similarity_boost,
+            speed=TTS_SPEED  # Configured speaking speed (0.7-1.2)
+        )
+        tts_instance = elevenlabs.TTS(
+            voice_id=ELEVENLABS_VOICE_ID,
+            api_key=ELEVEN_API_KEY,
+            voice_settings=voice_settings
+        )
+        logger.info(f"✅ ElevenLabs TTS instance created with voice ID: {ELEVENLABS_VOICE_ID}, speed: {TTS_SPEED}")
+    else:
+        # Fail if ElevenLabs is not available - no fallback
+        if not ELEVEN_API_KEY:
+            logger.error("❌ ELEVEN_API_KEY not found - ElevenLabs TTS is required!")
+            logger.error("   Please set ELEVEN_API_KEY in your .env.local file")
+            raise ValueError("ELEVEN_API_KEY is required for ElevenLabs TTS")
+        else:
+            logger.error(f"❌ ElevenLabs TTS not available (quota check failed or quota low)")
+            logger.error(f"   Required voice ID: {ELEVENLABS_VOICE_ID}")
+            logger.error("   Please check your ElevenLabs quota at: https://elevenlabs.io/")
+            logger.error("   ElevenLabs TTS is required - no fallback available")
+            logger.error("   Agent will not start without the specified ElevenLabs voice")
+            raise ValueError(f"ElevenLabs TTS is required but not available. Voice ID: {ELEVENLABS_VOICE_ID}")
     
     session = AgentSession(
         vad=silero.VAD.load(),
@@ -1397,6 +2051,271 @@ Trigger endCall."""
         # Track call start time
         agent.call_start_time = datetime.datetime.now()
         
+        # OFFICIAL METHOD: Subscribe to conversation_item_added event
+        # This is the recommended way to track all conversation items (user and agent)
+        @session.on("conversation_item_added")
+        def on_conversation_item_added(item):
+            """Official LiveKit method to capture conversation items."""
+            track_conversation_item(item)
+        
+        logger.info("✅ Subscribed to conversation_item_added events (official method)")
+        
+        # DIRECT STT ACCESS - Access the STT stream directly (most reliable method)
+        # The session's STT instance processes audio and we can intercept transcriptions
+        def track_user_transcript(text: str):
+            """Capture user speech transcriptions from STT."""
+            if text and text.strip():
+                agent.transcript.append({
+                    "speaker": "Customer",
+                    "text": text.strip(),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 User transcript captured: {text.strip()}")
+        
+        def track_agent_transcript(text: str):
+            """Capture agent speech transcriptions."""
+            if text and text.strip():
+                agent.transcript.append({
+                    "speaker": "Lia",
+                    "text": text.strip(),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"📝 Agent transcript captured: {text.strip()}")
+        
+        # Method 1: Access STT instance directly from session
+        if hasattr(session, 'stt') and session.stt is not None:
+            try:
+                stt_instance = session.stt
+                logger.info(f"✅ STT instance available: {type(stt_instance)}")
+                
+                # Deepgram STT should have a way to access transcriptions
+                # Try to wrap the transcribe method or access the stream
+                if hasattr(stt_instance, 'transcribe'):
+                    original_transcribe = stt_instance.transcribe
+                    
+                    async def wrapped_transcribe(*args, **kwargs):
+                        """Wrap transcribe to capture transcriptions."""
+                        result = await original_transcribe(*args, **kwargs)
+                        # Extract transcript from result
+                        if hasattr(result, 'text'):
+                            track_user_transcript(result.text)
+                        elif isinstance(result, str):
+                            track_user_transcript(result)
+                        elif isinstance(result, dict):
+                            text = result.get('text') or result.get('transcript')
+                            if text:
+                                track_user_transcript(text)
+                        return result
+                    
+                    stt_instance.transcribe = wrapped_transcribe
+                    logger.info("✅ Wrapped STT transcribe method to capture transcriptions")
+            except Exception as e:
+                logger.debug(f"Could not wrap STT transcribe method: {e}")
+        
+        # Method 2: Access session's input/output streams which contain transcriptions
+        # The AgentSession processes audio through STT and publishes transcriptions
+        if hasattr(session, 'input') and hasattr(session.input, 'on'):
+            try:
+                def on_input_transcript(event):
+                    """Handle transcriptions from session input stream."""
+                    try:
+                        transcript_text = None
+                        if hasattr(event, 'text'):
+                            transcript_text = event.text
+                        elif hasattr(event, 'transcript'):
+                            transcript_text = event.transcript
+                        elif isinstance(event, dict):
+                            transcript_text = event.get('text') or event.get('transcript')
+                        elif isinstance(event, str):
+                            transcript_text = event
+                        
+                        if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
+                            track_user_transcript(transcript_text.strip())
+                            logger.info(f"📝 [INPUT STREAM] Captured user transcript: {transcript_text.strip()}")
+                    except Exception as e:
+                        logger.debug(f"Error in input stream handler: {e}")
+                
+                # Try different event names
+                for event_name in ["transcript", "transcription", "stt_result", "speech"]:
+                    try:
+                        session.input.on(event_name, on_input_transcript)
+                        logger.info(f"✅ Subscribed to session input '{event_name}' events")
+                        break
+                    except:
+                        continue
+            except Exception as e:
+                logger.debug(f"Could not subscribe to input stream: {e}")
+        
+        # Additional transcript capture methods (backup methods)
+        
+        # Method 1: Listen to conversation_item_added events (official API)
+        # This captures both user and agent messages when they're added to chat history
+        if hasattr(session, 'on'):
+            def on_conversation_item_added(item):
+                """Capture transcripts when items are added to conversation."""
+                try:
+                    # Extract text and role from the conversation item
+                    text = None
+                    role = None
+                    
+                    if hasattr(item, 'text'):
+                        text = item.text
+                    elif hasattr(item, 'content'):
+                        text = item.content
+                    elif isinstance(item, dict):
+                        text = item.get('text') or item.get('content')
+                        role = item.get('role')
+                    elif hasattr(item, 'role'):
+                        role = item.role
+                        if hasattr(item, 'content'):
+                            if isinstance(item.content, str):
+                                text = item.content
+                            elif isinstance(item.content, list):
+                                # Handle list of content blocks
+                                text = " ".join(str(block) for block in item.content if block)
+                    
+                    if text and isinstance(text, str) and text.strip():
+                        # Determine if it's user or agent based on role
+                        if role == 'user' or (hasattr(item, 'role') and item.role == 'user'):
+                            track_user_transcript(text.strip())
+                            logger.info(f"📝 Captured user transcript from conversation: {text.strip()}")
+                        elif role == 'assistant' or (hasattr(item, 'role') and item.role == 'assistant'):
+                            track_agent_transcript(text.strip())
+                            logger.info(f"📝 Captured agent transcript from conversation: {text.strip()}")
+                        else:
+                            # Default to user if we can't determine
+                            track_user_transcript(text.strip())
+                            logger.info(f"📝 Captured transcript (unknown role) from conversation: {text.strip()}")
+                except Exception as e:
+                    logger.debug(f"Error in conversation_item_added handler: {e}")
+            
+            try:
+                session.on("conversation_item_added", on_conversation_item_added)
+                logger.info("✅ Subscribed to conversation_item_added events")
+            except Exception as e:
+                logger.debug(f"Could not subscribe to conversation_item_added: {e}")
+        
+        # Method 2: Subscribe to room text stream events for lk.transcription topic (official API)
+        # This captures transcriptions published to text streams in real-time
+        def on_text_stream_received(data):
+            """Handle text stream events including transcriptions."""
+            try:
+                # Extract topic, message, and attributes
+                topic = None
+                message = None
+                attributes = {}
+                sender_identity = None
+                
+                # Try different ways to access the data
+                if hasattr(data, 'topic'):
+                    topic = data.topic
+                elif hasattr(data, 'info') and hasattr(data.info, 'topic'):
+                    topic = data.info.topic
+                    attributes = getattr(data.info, 'attributes', {})
+                    sender_identity = getattr(data.info, 'sender_identity', None)
+                elif isinstance(data, dict):
+                    topic = data.get('topic')
+                    message = data.get('message')
+                    attributes = data.get('attributes', {})
+                    sender_identity = data.get('sender_identity')
+                
+                # Check if this is a transcription
+                if topic == 'lk.transcription' or (isinstance(topic, str) and 'transcription' in topic.lower()):
+                    # Extract text from message
+                    text = None
+                    if message:
+                        if isinstance(message, str):
+                            text = message
+                        elif hasattr(message, 'text'):
+                            text = message.text
+                        elif hasattr(message, 'value'):
+                            text = message.value
+                        elif isinstance(message, dict):
+                            text = message.get('text') or message.get('value') or str(message)
+                    elif hasattr(data, 'message'):
+                        msg = data.message
+                        if isinstance(msg, str):
+                            text = msg
+                        elif hasattr(msg, 'text'):
+                            text = msg.text
+                        elif hasattr(msg, 'value'):
+                            text = msg.value
+                    
+                    # Get attributes if not already extracted
+                    if not attributes:
+                        if hasattr(data, 'attributes'):
+                            attributes = data.attributes
+                        elif hasattr(data, 'info') and hasattr(data.info, 'attributes'):
+                            attributes = data.info.attributes
+                    
+                    # Get sender if not already extracted
+                    if not sender_identity:
+                        if hasattr(data, 'sender_identity'):
+                            sender_identity = data.sender_identity
+                        elif hasattr(data, 'sender'):
+                            sender_identity = data.sender
+                        elif hasattr(data, 'info') and hasattr(data.info, 'sender_identity'):
+                            sender_identity = data.info.sender_identity
+                    
+                    # Check if this is a final transcription (not interim)
+                    is_final = attributes.get('lk.transcription_final', 'false') == 'true'
+                    has_track_id = attributes.get('lk.transcribed_track_id') is not None
+                    
+                    if text and text.strip() and is_final:
+                        # Determine speaker from sender identity or transcribed_track_id
+                        if sender_identity == participant.identity or sender_identity == phone_number:
+                            track_user_transcript(text.strip())
+                            logger.info(f"📝 Captured user transcription from text stream: {text.strip()}")
+                        elif "agent" in str(sender_identity).lower() or sender_identity == "agent":
+                            track_agent_transcript(text.strip())
+                            logger.info(f"📝 Captured agent transcription from text stream: {text.strip()}")
+                        elif has_track_id:
+                            # Has transcribed_track_id means it's user audio being transcribed
+                            track_user_transcript(text.strip())
+                            logger.info(f"📝 Captured user transcription (via track_id): {text.strip()}")
+                        else:
+                            # Default to agent if no track_id (likely agent speech)
+                            track_agent_transcript(text.strip())
+                            logger.info(f"📝 Captured agent transcription (default): {text.strip()}")
+            except Exception as e:
+                logger.debug(f"Error handling text stream: {e}")
+        
+        # Subscribe to room text stream events
+        try:
+            # Try the official room event subscription
+            if hasattr(ctx.room, 'on'):
+                ctx.room.on("text_stream_received", on_text_stream_received)
+                logger.info("✅ Subscribed to room text_stream_received events")
+            else:
+                raise AttributeError("Room does not have 'on' method")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not subscribe to text stream events: {e}")
+            # Try alternative method if available
+            try:
+                if hasattr(ctx.room, 'register_text_stream_handler'):
+                    ctx.room.register_text_stream_handler("lk.transcription", on_text_stream_received)
+                    logger.info("✅ Registered text stream handler for lk.transcription (alternative method)")
+            except Exception as e2:
+                logger.warning(f"⚠️  Alternative text stream registration also failed: {e2}")
+        
+        # Also track transcriptions from participant tracks if available
+        # When STT processes audio, it may emit events we can capture
+        async def track_participant_transcriptions():
+            """Monitor participant tracks for transcription data."""
+            try:
+                for track in participant.track_publications.values():
+                    if track.kind == rtc.TrackKind.KIND_AUDIO:
+                        # Audio tracks from participants are transcribed by STT
+                        # The transcription will come through text streams above
+                        pass
+            except Exception as e:
+                logger.debug(f"Error tracking participant transcriptions: {e}")
+        
+        # Start background task to monitor transcriptions
+        asyncio.create_task(track_participant_transcriptions())
+        
         # Log call start to Langfuse
         if agent.langfuse_trace:
             try:
@@ -1411,18 +2330,128 @@ Trigger endCall."""
             except Exception as e:
                 logger.debug(f"Failed to log call start to Langfuse: {e}")
         
-        # Note: Transcripts are now captured from the conversation history
+        # Note: Transcripts are captured from:
+        # 1. LiveKit STT transcription events (real-time audio transcription)
+        # 2. Conversation history (LLM chat context) as fallback
         # This provides both user and agent messages in chronological order
         
+        # Background task to monitor session and send transcript when it closes
+        async def monitor_and_send_transcript():
+            """Monitor session and send transcript when participant disconnects."""
+            try:
+                # Wait for participant to disconnect or session to close
+                max_wait = 600  # Max 10 minutes
+                waited = 0
+                while waited < max_wait:
+                    await asyncio.sleep(1)  # Check every second
+                    waited += 1
+                    
+                    # Check if participant is disconnected
+                    try:
+                        if participant:
+                            # Check if participant is still in room
+                            if participant not in ctx.room.remote_participants.values():
+                                logger.info("📝 Participant no longer in room - sending transcript...")
+                                break
+                    except Exception:
+                        # Participant might be None or invalid
+                        pass
+                    
+                    # Check if session is closed
+                    try:
+                        if hasattr(session, 'closed') and session.closed:
+                            logger.info("📝 Session closed - sending transcript...")
+                            break
+                        if hasattr(session, '_closed') and session._closed:
+                            logger.info("📝 Session _closed - sending transcript...")
+                            break
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                logger.info("📝 Monitor cancelled - sending transcript...")
+            except Exception as e:
+                logger.debug(f"Monitor error: {e}")
+            
+            # Send transcript
+            if not agent.call_end_time:
+                logger.info("📝 Sending transcript to Google Sheets...")
+                try:
+                    # Extract transcript from conversation history
+                    transcript_from_history = ""
+                    if agent._agent_session:
+                        try:
+                            transcript_from_history = agent.get_transcript_from_conversation(agent._agent_session)
+                            if transcript_from_history and len(transcript_from_history) > 0:
+                                logger.info(f"📝 Extracted {len(transcript_from_history)} characters from conversation history")
+                        except Exception as e:
+                            logger.warning(f"⚠️  Could not extract transcript from conversation: {e}")
+                    
+                    # Also check real-time transcriptions
+                    realtime_transcript = agent.format_transcript()
+                    logger.info(f"📝 Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
+                    
+                    # Send results (send_call_results_to_sheets will combine both sources)
+                    call_status = "completed" if agent.appointment_scheduled else "no_answer"
+                    await agent.send_call_results_to_sheets(call_status)
+                    agent.call_end_time = datetime.datetime.now()
+                    logger.info(f"✅ Transcript sent to Google Sheets (status: {call_status})")
+                except Exception as e:
+                    logger.error(f"❌ Error sending transcript: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+        
+        # Function to send transcript (shared by all handlers)
+        async def send_transcript_on_end():
+            """Send transcript when call ends."""
+            if not agent.call_end_time:
+                logger.info("📝 Call ended - extracting and sending transcript...")
+                try:
+                    # Extract transcript from conversation history
+                    transcript_from_history = ""
+                    if agent._agent_session:
+                        try:
+                            transcript_from_history = agent.get_transcript_from_conversation(agent._agent_session)
+                            if transcript_from_history and len(transcript_from_history) > 0:
+                                logger.info(f"📝 Extracted {len(transcript_from_history)} characters from conversation history")
+                        except Exception as e:
+                            logger.warning(f"⚠️  Could not extract transcript from conversation: {e}")
+                    
+                    # Also check real-time transcriptions
+                    realtime_transcript = agent.format_transcript()
+                    logger.info(f"📝 Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
+                    
+                    # Send results
+                    call_status = "completed" if agent.appointment_scheduled else "no_answer"
+                    await agent.send_call_results_to_sheets(call_status)
+                    agent.call_end_time = datetime.datetime.now()
+                    logger.info(f"✅ Transcript sent to Google Sheets (status: {call_status})")
+                except Exception as e:
+                    logger.error(f"❌ Error sending transcript: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+        
+        # Subscribe to participant disconnect event (most reliable)
+        def on_participant_disconnected_event(participant_disconnected: rtc.RemoteParticipant):
+            """Handle participant disconnect."""
+            if participant_disconnected.identity == phone_number:
+                logger.info(f"📝 Participant {participant_disconnected.identity} disconnected - sending transcript...")
+                asyncio.create_task(send_transcript_on_end())
+        
+        try:
+            ctx.room.on(rtc.RoomEvent.PARTICIPANT_DISCONNECTED, on_participant_disconnected_event)
+            logger.info("✅ Subscribed to participant disconnect event")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not subscribe to participant disconnect: {e}")
+        
+        # Start monitoring as backup
+        monitor_task = asyncio.create_task(monitor_and_send_transcript())
+        
         # Wait before initial greeting (adjustable delay)
-        # This gives the user time to say "hello" first, or ensures connection is stable
         if INITIAL_GREETING_DELAY > 0:
             logger.info(f"Waiting {INITIAL_GREETING_DELAY} seconds before initial greeting...")
             await asyncio.sleep(INITIAL_GREETING_DELAY)
         
-        # Generate initial greeting - Lia's script opening
-        # CRITICAL: Only say "Hey, {name}?" and then STOP - wait for their response
-        # Check if session is still active before trying to generate reply
+        # Generate initial greeting
         try:
             await session.generate_reply(
                 instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
@@ -1430,17 +2459,21 @@ Trigger endCall."""
         except RuntimeError as e:
             if "AgentSession is closing" in str(e) or "cannot use generate_reply" in str(e):
                 logger.error(f"❌ Session is closing, cannot generate reply: {e}")
-                logger.error("   This usually happens when the LLM connection failed.")
-                logger.error("   Common causes:")
-                logger.error("   1. Invalid or missing OPENAI_API_KEY")
-                logger.error("   2. Expired API key or insufficient credits")
-                logger.error("   3. Network connectivity issues")
-                logger.error("   Check your .env.local file and verify your API key at: https://platform.openai.com/api-keys")
+                monitor_task.cancel()
+                await send_transcript_on_end()
                 return
             raise
         except Exception as e:
             logger.error(f"Error generating initial greeting: {e}")
+            monitor_task.cancel()
+            await send_transcript_on_end()
             raise
+        
+        # Wait for monitor to complete (will finish when participant disconnects)
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
 
     except api.TwirpError as e:
         logger.error(

@@ -121,9 +121,23 @@ def update_call_results(service, call_data: Dict[str, Any]):
         }
         updates["Status"] = status_map.get(call_status.lower(), call_status.capitalize())
         
-        # Update transcript if column exists
-        if "Transcript" in headers and call_data.get("transcript"):
-            updates["Transcript"] = call_data["transcript"]
+        # Update transcript if column exists (handle variations like "Transcript", "Transcript ", etc.)
+        transcript_value = call_data.get("transcript", "")
+        transcript_column = None
+        # Try to find transcript column (case-insensitive, handle trailing spaces)
+        for header in headers:
+            if header.strip().lower() == "transcript":
+                transcript_column = header  # Use the actual header name (with spaces if any)
+                break
+        
+        if transcript_column:
+            if transcript_value and transcript_value.strip() and transcript_value != "No transcript available":
+                updates[transcript_column] = transcript_value  # Use the actual column name
+                logger.info(f"📝 Adding transcript to '{transcript_column}' column ({len(transcript_value)} characters)")
+            else:
+                logger.warning(f"⚠️  Transcript column exists but transcript is empty or unavailable (length: {len(transcript_value) if transcript_value else 0})")
+        else:
+            logger.warning("⚠️  'Transcript' column not found in Google Sheet headers. Available columns: " + ", ".join(headers[:10]))
         
         # Update appointment info
         if call_data.get("appointment_scheduled"):
