@@ -59,7 +59,8 @@ langfuse = None
 if LANGFUSE_AVAILABLE:
     langfuse_public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key = os.getenv("LANGFUSE_SECRET_KEY")
-    langfuse_host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    # Support both LANGFUSE_HOST and LANGFUSE_BASE_URL
+    langfuse_host = os.getenv("LANGFUSE_HOST") or os.getenv("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com"
     
     if langfuse_public_key and langfuse_secret_key:
         try:
@@ -75,6 +76,47 @@ if LANGFUSE_AVAILABLE:
         logger.info("ℹ️  Langfuse keys not found. Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable observability")
 else:
     logger.info("ℹ️  Langfuse not available. Install with: pip install langfuse")
+
+
+def setup_langfuse_telemetry():
+    """Setup Langfuse OpenTelemetry tracing for LiveKit Agents.
+    
+    This uses LiveKit's built-in OpenTelemetry support to automatically
+    capture all agent activities (sessions, turns, LLM calls, function tools, etc.)
+    and send them to Langfuse via the OpenTelemetry endpoint.
+    """
+    try:
+        from livekit.agents.telemetry import set_tracer_provider
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        import base64
+    except ImportError as e:
+        logger.warning(f"OpenTelemetry packages not available: {e}. Langfuse OpenTelemetry tracing disabled.")
+        return
+    
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    host = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST") or "https://cloud.langfuse.com"
+    
+    if not public_key or not secret_key:
+        logger.warning("Langfuse keys not found. OpenTelemetry tracing disabled.")
+        return
+    
+    try:
+        # Setup authentication
+        langfuse_auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = f"{host.rstrip('/')}/api/public/otel"
+        os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"Authorization=Basic {langfuse_auth}"
+        
+        # Create and configure tracer provider
+        trace_provider = TracerProvider()
+        trace_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        set_tracer_provider(trace_provider)
+        
+        logger.info("✅ Langfuse OpenTelemetry tracing enabled for LiveKit Agents")
+    except Exception as e:
+        logger.warning(f"Failed to setup Langfuse OpenTelemetry tracing: {e}")
 
 
 class OutboundCaller(Agent):
@@ -422,60 +464,15 @@ class OutboundCaller(Agent):
                             if content_text.strip():
                                 transcript_lines.append(f"{speaker}: {content_text.strip()}")
                                 logger.info(f"📝 Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
+            
+                    
+
                     
                     if transcript_lines:
                         logger.info(f"✅ Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
                         return "\n".join(transcript_lines)
                 else:
                     logger.warning("📝 chat_ctx.items not available")
-            else:
-                logger.warning("📝 chat_ctx not available or empty")
-            
-            # Method 2: Try to get from session.messages if available
-            if hasattr(session, 'messages') and session.messages:
-                for msg in session.messages:
-                    if hasattr(msg, 'role') and hasattr(msg, 'content'):
-                        role = msg.role
-                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                        
-                        if role == "user":
-                            speaker = "Customer"
-                        elif role == "assistant":
-                            speaker = "Lia"
-                        elif role == "system":
-                            continue
-                        else:
-                            speaker = role.title()
-                        
-                        if content.strip():
-                            transcript_lines.append(f"{speaker}: {content.strip()}")
-                
-                if transcript_lines:
-                    logger.info(f"✅ Extracted transcript from session.messages ({len(transcript_lines)} messages)")
-                    return "\n".join(transcript_lines)
-            
-            # Method 3: Try to get from session.conversation if available
-            if hasattr(session, 'conversation') and session.conversation:
-                for msg in session.conversation:
-                    if hasattr(msg, 'role') and hasattr(msg, 'content'):
-                        role = msg.role
-                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                        
-                        if role == "user":
-                            speaker = "Customer"
-                        elif role == "assistant":
-                            speaker = "Lia"
-                        elif role == "system":
-                            continue
-                        else:
-                            speaker = role.title()
-                        
-                        if content.strip():
-                            transcript_lines.append(f"{speaker}: {content.strip()}")
-                
-                if transcript_lines:
-                    logger.info(f"✅ Extracted transcript from session.conversation ({len(transcript_lines)} messages)")
-                    return "\n".join(transcript_lines)
             
             # Fallback: Use real-time transcriptions if available
             if self.transcript:
@@ -1224,6 +1221,9 @@ class OutboundCaller(Agent):
 
 
 async def entrypoint(ctx: JobContext):
+    # Setup Langfuse OpenTelemetry tracing (if available)
+    setup_langfuse_telemetry()
+    
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect()
 
@@ -2296,6 +2296,53 @@ Trigger endCall."""
             except Exception as e:
                 logger.debug(f"Failed to log call start to Langfuse: {e}")
         
+        # Wrap session.generate_reply to capture LLM interactions for Langfuse
+        original_generate_reply = session.generate_reply
+        
+        async def wrapped_generate_reply(*args, **kwargs):
+            """Wrap generate_reply to log LLM interactions to Langfuse."""
+            if agent.langfuse_trace:
+                try:
+                    # Capture input (user message or context)
+                    input_text = ""
+                    if args and len(args) > 0:
+                        input_text = str(args[0]) if args[0] else ""
+                    elif 'message' in kwargs:
+                        input_text = str(kwargs['message'])
+                    
+                    # Call original generate_reply
+                    response = await original_generate_reply(*args, **kwargs)
+                    
+                    # Capture output (agent response)
+                    output_text = ""
+                    if hasattr(response, 'text'):
+                        output_text = response.text
+                    elif isinstance(response, str):
+                        output_text = response
+                    elif hasattr(response, 'content'):
+                        output_text = response.content
+                    
+                    # Log to Langfuse as generation
+                    agent._log_to_langfuse("generation", {
+                        "input": input_text[:1000] if input_text else "No input captured",  # Limit length
+                        "output": output_text[:1000] if output_text else "No output captured",
+                        "function_calls": [],
+                        "tokens": {}
+                    })
+                    
+                    return response
+                except Exception as e:
+                    logger.debug(f"Failed to log LLM generation to Langfuse: {e}")
+                    # Still return the response even if logging fails
+                    return await original_generate_reply(*args, **kwargs)
+            else:
+                # No Langfuse trace, just call original
+                return await original_generate_reply(*args, **kwargs)
+        
+        # Replace the method
+        session.generate_reply = wrapped_generate_reply
+        logger.info("✅ Wrapped session.generate_reply for Langfuse LLM tracking")
+        
         # Note: Transcripts are captured from:
         # 1. LiveKit STT transcription events (real-time audio transcription)
         # 2. Conversation history (LLM chat context) as fallback
@@ -2433,8 +2480,8 @@ Trigger endCall."""
         greeting_sent_time = None
         try:
             await session.generate_reply(
-                instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
-            )
+            instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
+        )
             greeting_sent_time = datetime.datetime.now()
             logger.info(f"📞 Initial greeting sent, waiting up to {NO_RESPONSE_TIMEOUT} seconds for user response...")
         except RuntimeError as e:
