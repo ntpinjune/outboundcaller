@@ -1237,7 +1237,7 @@ async def entrypoint(ctx: JobContext):
     participant_identity = phone_number = dial_info["phone_number"]
     
     # Get customer info from metadata (can come from Google Sheets via n8n)
-    customer_name = dial_info.get("name", "Customer")
+    customer_name = dial_info.get("name", "").strip()  # Empty string if no name provided
     appointment_time = dial_info.get("appointment_time", "")
 
     # look up the user's phone number and appointment details
@@ -1295,7 +1295,7 @@ Interaction Rules:
 
 Pacing: Never rush. Use ellipses (...) as cues to take a breath.
 
-Confirmation: When asking "Hey.. {customer_name}?", stop speaking immediately.
+Confirmation: When asking the initial greeting, stop speaking immediately.
 
 Never say words in brackets.
 
@@ -1312,15 +1312,15 @@ When creating a date-time string for tools, use the offset -08:00.
 THE SCRIPT
 
 First Message: 
-Hey, {customer_name}?   
+{f'Hey, {customer_name}?' if customer_name else 'Hello?'}   
 (Pause and let them respond)
 
 THE HOOK
-"Yeah hey {customer_name} uhh its just Lia... I'm just over here by San Jose and I uhm have some.. good news and bad news..."
+{f'Yeah hey {customer_name} uhh its just Lia...' if customer_name else 'Yeah hey, uhh its just Lia...'} I'm just over here by San Jose and I uhm have some.. good news and bad news..."
 
 THE REVEAL
 "okay... soo uhm  the good news is this.... is a well-researched cold call... but uhh the bad news is... it's uhm a cold call... 
-"But I'm just wondering... can you give me like, 30 seconds {customer_name}?"
+{f"But I'm just wondering... can you give me like, 30 seconds {customer_name}?" if customer_name else "But I'm just wondering... can you give me like, 30 seconds?"}
 
 CRITICAL: After asking for 30 seconds, wait for their response:
 - If they say "yes", "yeah", "sure", "okay", "ok", "go ahead", or ANY approval response → IMMEDIATELY continue with THE PITCH. Do not ask again or wait longer.
@@ -1330,7 +1330,7 @@ If they say "come again?", "what?", "huh?", or sound confused, Lia responds:
 
 "Oh — sorry about that… i'll say it again"
 "Basically… uh this is a cold call… but it's uhm a really well-researched one."
-"Would it be okay if I took like, 30 seconds {customer_name}?"
+{f"Would it be okay if I took like, 30 seconds {customer_name}?" if customer_name else "Would it be okay if I took like, 30 seconds?"}
 
 After they give ANY approval (yes, sure, okay, etc.), IMMEDIATELY continue with THE PITCH.
 
@@ -1340,7 +1340,7 @@ THE PITCH ( SLOW DOWN HERE)
 but um the first thing we do is we optimize your Google profile to hit that number one spot..."
 "Then we optimize your site to get high-ticket buyers... people looking for hardscaping, retaining walls... the big projects."
 
-"uh I know I just said a lot..... but would you be interested in this {customer_name}?"
+{f"uh I know I just said a lot..... but would you be interested in this {customer_name}?" if customer_name else "uh I know I just said a lot..... but would you be interested in this?"}
 
 CRITICAL RESPONSE HANDLING:
 - If they say "yes", "yeah", "sure", "I'm interested", or any positive response → IMMEDIATELY go to "THE CLOSE" section. Do NOT say anything about "when someone says yes it usually means they need more information" or any similar dialogue. Just move directly to scheduling.
@@ -2479,9 +2479,15 @@ Trigger endCall."""
         # Generate initial greeting
         greeting_sent_time = None
         try:
+            # Use "Hello?" if no name, otherwise "Hey, {name}?"
+            if customer_name:
+                greeting_text = f"Hey, {customer_name}?"
+            else:
+                greeting_text = "Hello?"
+            
             await session.generate_reply(
-            instructions=f"Say ONLY this: 'Hey, {customer_name}?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
-        )
+                instructions=f"Say ONLY this: '{greeting_text}' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
+            )
             greeting_sent_time = datetime.datetime.now()
             logger.info(f"📞 Initial greeting sent, waiting up to {NO_RESPONSE_TIMEOUT} seconds for user response...")
         except RuntimeError as e:
@@ -2554,11 +2560,41 @@ Trigger endCall."""
                     pass
 
     except api.TwirpError as e:
+        sip_status_code = e.metadata.get('sip_status_code')
+        sip_status = e.metadata.get('sip_status', '')
+        
         logger.error(
             f"error creating SIP participant: {e.message}, "
-            f"SIP status: {e.metadata.get('sip_status_code')} "
-            f"{e.metadata.get('sip_status')}"
+            f"SIP status: {sip_status_code} {sip_status}"
         )
+        
+        # Determine call status based on SIP error code
+        if sip_status_code == 603:
+            call_status = "declined"
+            logger.info(f"📞 Call declined (603) for {phone_number} - marking as 'Declined' in Google Sheets")
+        elif sip_status_code == 486:
+            call_status = "busy"
+            logger.info(f"📞 Call busy (486) for {phone_number} - marking as 'Busy' in Google Sheets")
+        elif sip_status_code == 480:
+            call_status = "no_answer"
+            logger.info(f"📞 Call no answer (480) for {phone_number} - marking as 'No Answer' in Google Sheets")
+        else:
+            call_status = "failed"
+            logger.info(f"📞 Call failed (SIP {sip_status_code}) for {phone_number} - marking as 'Failed' in Google Sheets")
+        
+        # Update Google Sheets with the status before shutting down
+        try:
+            # Mark call end time
+            agent.call_end_time = datetime.datetime.now()
+            
+            # Send results to Google Sheets
+            await agent.send_call_results_to_sheets(call_status)
+            logger.info(f"✅ SIP error status ({call_status}) sent to Google Sheets - dispatch script will move to next call")
+        except Exception as sheet_error:
+            logger.error(f"❌ Failed to update Google Sheets with SIP error status: {sheet_error}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
         ctx.shutdown()
 
 

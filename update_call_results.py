@@ -118,7 +118,9 @@ def update_call_results(service, call_data: Dict[str, Any]):
             "voicemail": "Voicemail",
             "failed": "Failed",
             "no_answer": "No Answer",
-            "hung_up": "Hung Up"
+            "hung_up": "Hung Up",
+            "declined": "Declined",
+            "busy": "Busy"
         }
         updates["Status"] = status_map.get(call_status.lower(), call_status.capitalize())
         
