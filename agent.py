@@ -437,32 +437,32 @@ class OutboundCaller(Agent):
                     items_count = len(chat_ctx.items) if hasattr(chat_ctx.items, '__len__') else 'unknown'
                     logger.info(f"📝 chat_ctx.items available, count: {items_count}")
                     for idx, item in enumerate(chat_ctx.items):
-                        if isinstance(item, llm.ChatMessage):
-                            role = item.role
-                            # Get the text content from the message
-                            content_text = ""
-                            if isinstance(item.content, str):
-                                content_text = item.content
-                            elif isinstance(item.content, list):
-                                # Handle list of content blocks (text, images, etc.)
-                                for block in item.content:
-                                    if isinstance(block, str):
-                                        content_text += block
-                                    elif hasattr(block, 'text'):
-                                        content_text += block.text
-                            
-                            # Map roles to readable names
-                            if role == "user":
-                                speaker = "Customer"
-                            elif role == "assistant":
-                                speaker = "Lia"
-                            elif role == "system":
-                                continue  # Skip system messages
-                            else:
-                                speaker = role.title()
-                            
-                            if content_text.strip():
-                                transcript_lines.append(f"{speaker}: {content_text.strip()}")
+                if isinstance(item, llm.ChatMessage):
+                    role = item.role
+                    # Get the text content from the message
+                    content_text = ""
+                    if isinstance(item.content, str):
+                        content_text = item.content
+                    elif isinstance(item.content, list):
+                        # Handle list of content blocks (text, images, etc.)
+                        for block in item.content:
+                            if isinstance(block, str):
+                                content_text += block
+                            elif hasattr(block, 'text'):
+                                content_text += block.text
+                    
+                    # Map roles to readable names
+                    if role == "user":
+                        speaker = "Customer"
+                    elif role == "assistant":
+                        speaker = "Lia"
+                    elif role == "system":
+                        continue  # Skip system messages
+                    else:
+                        speaker = role.title()
+                    
+                    if content_text.strip():
+                        transcript_lines.append(f"{speaker}: {content_text.strip()}")
                                 logger.info(f"📝 Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
             
                     
@@ -470,7 +470,7 @@ class OutboundCaller(Agent):
                     
                     if transcript_lines:
                         logger.info(f"✅ Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
-                        return "\n".join(transcript_lines)
+            return "\n".join(transcript_lines)
                 else:
                     logger.warning("📝 chat_ctx.items not available")
             
@@ -1939,7 +1939,7 @@ Trigger endCall."""
         if voice_default_settings:
             stability = voice_default_settings.get('stability', 0.5)
             similarity_boost = voice_default_settings.get('similarity_boost', 0.75)
-        else:
+    else:
             stability = 0.5
             similarity_boost = 0.75
         
@@ -2485,9 +2485,9 @@ Trigger endCall."""
             else:
                 greeting_text = "Hello?"
             
-            await session.generate_reply(
+        await session.generate_reply(
                 instructions=f"Say ONLY this: '{greeting_text}' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
-            )
+        )
             greeting_sent_time = datetime.datetime.now()
             logger.info(f"📞 Initial greeting sent, waiting up to {NO_RESPONSE_TIMEOUT} seconds for user response...")
         except RuntimeError as e:

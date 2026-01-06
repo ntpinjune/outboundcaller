@@ -29,6 +29,21 @@ This example demonstrates the following features:
 - Detecting intent to end the call
 - Uses Krisp background voice cancellation to handle noisy environments
 
+## Quick Start
+
+**New to this project?** See the complete setup guide:
+- 📖 **[SETUP.md](SETUP.md)** - Complete setup instructions for new computers
+- ⚡ **[QUICK_SETUP.md](QUICK_SETUP.md)** - Quick reference for essential commands
+
+**Automated Setup:**
+```bash
+# macOS/Linux
+chmod +x setup.sh && ./setup.sh
+
+# Windows (PowerShell)
+.\setup.ps1
+```
+
 ## Dev Setup
 
 Clone the repository and install dependencies to a virtual environment:
@@ -42,15 +57,20 @@ pip install -r requirements.txt
 python agent.py download-files
 ```
 
-Set up the environment by copying `.env.example` to `.env.local` and filling in the required values:
+Set up the environment by creating `.env.local` and filling in the required values:
 
 - `LIVEKIT_URL`
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
-- `OPENAI_API_KEY`
+- `OPENAI_API_KEY` (or `GROQ_API_KEY` with `LLM_PROVIDER=groq`)
 - `SIP_OUTBOUND_TRUNK_ID`
+- `ELEVEN_API_KEY` (for TTS)
+- `GOOGLE_SHEET_ID` (for Google Sheets integration)
+- `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` (for observability)
 - `DEEPGRAM_API_KEY` - optional, only needed when using pipelined models
 - `CARTESIA_API_KEY` - optional, only needed when using pipelined models
+
+**See [SETUP.md](SETUP.md) for the complete list of environment variables and setup instructions.**
 
 Run the agent:
 

@@ -137,3 +137,4 @@ print('✅ Base URL:', os.getenv('LANGFUSE_BASE_URL', 'NOT SET'))
 "
 ```
 
+

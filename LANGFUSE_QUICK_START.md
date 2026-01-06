@@ -63,3 +63,4 @@ LANGFUSE_BASE_URL="https://cloud.langfuse.com"
 
 Once you add the keys and restart, Langfuse will automatically start tracking all your calls! 🚀
 
+

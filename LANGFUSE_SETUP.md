@@ -182,3 +182,4 @@ traces = langfuse.fetch_traces(limit=100)
 - Langfuse Discord: https://discord.gg/langfuse
 - Your agent logs will show Langfuse status on startup
 
+
