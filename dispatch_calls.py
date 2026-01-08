@@ -75,13 +75,43 @@ def get_google_sheets_service():
     # Check for existing token
     token_file = "google_sheets_token.json"
     if os.path.exists(token_file):
-        creds = Credentials.from_authorized_user_file(token_file, GOOGLE_SHEETS_SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(token_file, GOOGLE_SHEETS_SCOPES)
+        except Exception as e:
+            logger.warning(f"Failed to load token file: {e}. Will re-authenticate.")
+            # Delete corrupted/expired token file
+            try:
+                os.remove(token_file)
+                logger.info("Deleted expired/corrupted token file")
+            except Exception:
+                pass
+            creds = None
     
     # If no valid credentials, get new ones
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                logger.info("Refreshing expired credentials...")
+                creds.refresh(Request())
+                logger.info("Credentials refreshed successfully")
+            except Exception as e:
+                error_str = str(e).lower()
+                if "invalid_grant" in error_str or "expired" in error_str or "revoked" in error_str:
+                    logger.warning(f"Token refresh failed (token expired/revoked): {e}")
+                    logger.info("Deleting expired token file and re-authenticating...")
+                    # Delete expired token file
+                    try:
+                        if os.path.exists(token_file):
+                            os.remove(token_file)
+                            logger.info("Deleted expired token file")
+                    except Exception:
+                        pass
+                    creds = None  # Force re-authentication
+                else:
+                    raise  # Re-raise other errors
+        
+        # If still no valid credentials, start OAuth flow
+        if not creds or not creds.valid:
             credentials_file = "credentials.json"
             if not os.path.exists(credentials_file):
                 raise FileNotFoundError(
@@ -90,15 +120,20 @@ def get_google_sheets_service():
                     "2. Create OAuth 2.0 Client ID (Desktop app)\n"
                     "3. Download and save as credentials.json"
                 )
+            logger.info("Starting OAuth flow. A browser window will open for authentication...")
             flow = InstalledAppFlow.from_client_secrets_file(
                 credentials_file, GOOGLE_SHEETS_SCOPES
             )
             creds = flow.run_local_server(port=0)
         
         # Save credentials for next run
-        with open(token_file, "w") as token:
-            token.write(creds.to_json())
-        logger.info("Google Sheets authentication successful")
+        try:
+            with open(token_file, "w") as token:
+                token.write(creds.to_json())
+            logger.info("✅ Google Sheets authentication successful - token saved")
+        except Exception as e:
+            logger.error(f"Failed to save token file: {e}")
+            raise
     
     return build("sheets", "v4", credentials=creds)
 
@@ -159,6 +194,17 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
         if appointment_idx is None:
             appointment_idx = get_column_index(headers, "AppointmentTime")
         
+        # Find Business Name column (optional)
+        business_name_idx = get_column_index(headers, "Business Name")
+        if business_name_idx is None:
+            business_name_idx = get_column_index(headers, "BusinessName")
+        if business_name_idx is None:
+            business_name_idx = get_column_index(headers, "Business")
+        if business_name_idx is None:
+            business_name_idx = get_column_index(headers, "Company")
+        if business_name_idx is None:
+            business_name_idx = get_column_index(headers, "Company Name")
+        
         # Find Retry Count column (optional)
         retry_count_idx = get_column_index(headers, "Retry Count")
         
@@ -211,6 +257,7 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
                 if phone_number:
                     name = row[name_idx].strip() if name_idx and len(row) > name_idx and row[name_idx].strip() else "Customer"
                     appointment_time = row[appointment_idx].strip() if appointment_idx and len(row) > appointment_idx and row[appointment_idx].strip() else ""
+                    business_name = row[business_name_idx].strip() if business_name_idx is not None and len(row) > business_name_idx and row[business_name_idx].strip() else ""
                     
                     # Get current retry count
                     current_retry_count = 0
@@ -313,6 +360,7 @@ def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
             "phone_number": phone_number,
             "name": row_data["name"],
             "appointment_time": row_data.get("appointment_time", ""),
+            "business_name": row_data.get("business_name", ""),
             "row_id": str(row_data["row_number"])
         }
         

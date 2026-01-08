@@ -119,6 +119,185 @@ def setup_langfuse_telemetry():
         logger.warning(f"Failed to setup Langfuse OpenTelemetry tracing: {e}")
 
 
+class VoicemailDetector:
+    """Automatic voicemail detection based on transcript patterns.
+    
+    Monitors user transcripts in real-time and detects common voicemail greetings
+    to automatically hang up and mark the call as voicemail.
+    """
+    
+    def __init__(self, agent_instance):
+        self.agent = agent_instance
+        self.detected = False
+        self.recent_transcripts = []  # Keep last few transcripts for pattern matching
+        self.max_recent = 5  # Keep last 5 transcripts
+        
+        # Voicemail detection patterns (case-insensitive)
+        # These patterns are matched against individual transcript segments
+        self.voicemail_patterns = [
+            # Standard voicemail greetings
+            r"your call has been forwarded",
+            r"forwarded to voicemail",
+            r"forwarded to voice mail",
+            r"please leave your message",
+            r"please leave a message",
+            r"leave your name and number",
+            r"leave your name, number",
+            r"leave your name.*number",
+            r"at the tone",
+            r"after the tone",
+            r"record your message",
+            r"person you're trying to reach",
+            r"person you are trying to reach",
+            r"not available",
+            r"unable to take your call",
+            r"not able to answer",
+            r"mailbox is full",
+            r"mailbox cannot accept",
+            r"finished recording",
+            r"you may hang up",
+            
+            # "You've reached" patterns (very common)
+            r"you've reached",
+            r"you have reached",
+            r"you reached",
+            
+            # Business voicemail patterns
+            r"thank you for calling",
+            r"thanks for calling",
+            r"please leave your name",
+            r"we'll get back to you",
+            r"we will get back to you",
+            r"return your call",
+            r"i'll return your call",
+            r"i will return your call",
+            r"as soon as possible",
+            r"as soon as we can",
+            r"brief message",
+            r"helping other clients",
+            r"currently helping",
+            
+            # Personal voicemail patterns
+            r"this is.*please leave",
+            r"hi.*this is.*please leave",
+            r"i'm unable to take",
+            r"i'll get back to you",
+            r"i will get back to you",
+            r"call you back",
+            r"i'll call you back",
+            r"i will call you back",
+            r"call you back as soon",
+            
+            # Receptionist/auto-attendant patterns
+            r"see if this person is available",
+            r"see if.*is available",
+            r"record your name and reason",
+            r"record your name.*reason",
+            
+            # Automated system messages
+            r"automatic voice message",
+            r"voice message system",
+            r"dial.*for assistance",
+            r"press.*for",
+            
+            # Number patterns (voicemail often reads numbers)
+            r"message for.*\d+",
+            r"six.*five.*zero",  # Common pattern in voicemail
+            r"have reached.*\d+",  # "have reached 650..."
+        ]
+        
+        # Compile patterns for faster matching
+        import re
+        self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.voicemail_patterns]
+        
+        logger.info("✅ Voicemail detector initialized with pattern matching")
+    
+    def check_transcript(self, transcript_text: str) -> bool:
+        """Check if a transcript segment indicates voicemail.
+        
+        Returns True if voicemail is detected, False otherwise.
+        """
+        if self.detected:
+            return True  # Already detected, don't check again
+        
+        if not transcript_text or not transcript_text.strip():
+            return False
+        
+        # Add to recent transcripts
+        self.recent_transcripts.append(transcript_text.strip().lower())
+        if len(self.recent_transcripts) > self.max_recent:
+            self.recent_transcripts.pop(0)
+        
+        # Check individual transcript
+        transcript_lower = transcript_text.lower()
+        for pattern in self.compiled_patterns:
+            if pattern.search(transcript_lower):
+                logger.warning(f"🎯 Voicemail pattern detected: '{pattern.pattern}' in transcript: '{transcript_text[:100]}'")
+                self.detected = True
+                return True
+        
+        # Check combined recent transcripts (voicemail messages are often split across multiple segments)
+        # Use a longer window for combined text to catch multi-sentence voicemail greetings
+        combined_text = " ".join(self.recent_transcripts)
+        for pattern in self.compiled_patterns:
+            if pattern.search(combined_text):
+                logger.warning(f"🎯 Voicemail pattern detected in combined transcripts: '{pattern.pattern}' in: '{combined_text[:150]}'")
+                self.detected = True
+                return True
+        
+        # Additional check: if we see multiple voicemail indicators in recent transcripts, trigger detection
+        # This helps catch cases where patterns are split across many segments
+        voicemail_indicators = [
+            "leave", "message", "tone", "voicemail", "mailbox", 
+            "not available", "unable", "reach", "brief", "return your call",
+            "get back to you", "call you back"
+        ]
+        indicator_count = sum(1 for indicator in voicemail_indicators if indicator in combined_text)
+        if indicator_count >= 3 and len(combined_text) > 20:  # At least 3 indicators and meaningful text
+            logger.warning(f"🎯 Multiple voicemail indicators detected ({indicator_count}): '{combined_text[:150]}'")
+            self.detected = True
+            return True
+        
+        return False
+    
+    async def handle_voicemail_detection(self):
+        """Handle voicemail detection by hanging up and updating status."""
+        if not self.detected:
+            logger.warning("⚠️  handle_voicemail_detection called but detected=False")
+            return
+        
+        # Prevent duplicate hangup attempts
+        if self.hangup_task and not self.hangup_task.done():
+            logger.warning("⚠️  Hangup already in progress, skipping duplicate detection")
+            return
+        
+        logger.info(f"📞 Automatic voicemail detection triggered for {self.agent.participant.identity if self.agent.participant else 'unknown'}")
+        
+        async def do_hangup():
+            try:
+                # Mark call end time
+                self.agent.call_end_time = datetime.datetime.now()
+                
+                # Send results to Google Sheets with voicemail status
+                await self.agent.send_call_results_to_sheets("voicemail")
+                logger.info("✅ Voicemail status sent to Google Sheets - dispatch script will move to next call")
+                
+                # Hang up immediately
+                await self.agent.hangup("voicemail", send_results=False)
+                logger.info("✅ Call hung up due to voicemail detection")
+            except Exception as e:
+                logger.error(f"❌ Error handling voicemail detection: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Try to hang up anyway
+                try:
+                    await self.agent.hangup("voicemail", send_results=False)
+                except Exception as e2:
+                    logger.error(f"❌ Failed to hang up after error: {e2}")
+        
+        self.hangup_task = asyncio.create_task(do_hangup())
+
+
 class OutboundCaller(Agent):
     def __init__(
         self,
@@ -140,7 +319,7 @@ class OutboundCaller(Agent):
         # Brief instructions for the Agent framework
         # The full detailed prompt is in the entrypoint function as a system message
         super().__init__(
-            instructions=f"""You are "Lia," a local employee for a landscaping marketing firm in San Jose. Be conversational, authentic, and real. Follow the detailed script provided in the system message. Customer name: {name}. Today is {today_date}, time is {current_time} PST."""
+            instructions=f"""You are "Lia," a local employee for a landscaping marketing firm in San Jose. Be conversational, authentic, and real. Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like). Follow the detailed script provided in the system message. Customer name: {name}. Today is {today_date}, time is {current_time} PST."""
         )
         # keep reference to the participant for transfers
         self.participant: rtc.RemoteParticipant | None = None
@@ -162,6 +341,9 @@ class OutboundCaller(Agent):
         self.appointment_time_scheduled = None
         self.appointment_email = None
         self._auto_hangup_scheduled = False  # Flag to prevent multiple auto-hangups
+        
+        # Voicemail detection
+        self.voicemail_detector = None  # Will be initialized in entrypoint
         
         # Langfuse tracking
         self.trace_id = str(uuid.uuid4())
@@ -224,10 +406,41 @@ class OutboundCaller(Agent):
         Transcripts are captured in tts_node which captures what will actually be spoken.
         """
         from livekit.agents import ModelSettings, llm, FunctionTool
+        from livekit.agents._exceptions import APIStatusError, APIConnectionError
         
-        # Just pass through to default - no transcript capture here
-        # Transcripts are captured in tts_node instead to avoid duplicates
-        return Agent.default.llm_node(self, chat_ctx, tools, model_settings)
+        try:
+            # Just pass through to default - no transcript capture here
+            # Transcripts are captured in tts_node instead to avoid duplicates
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                yield chunk
+        except (APIStatusError, APIConnectionError) as e:
+            # Handle API errors (quota exceeded, rate limits, etc.)
+            error_code = getattr(e, 'status_code', None)
+            error_body = getattr(e, 'body', {})
+            error_type = error_body.get('error', {}).get('type', '') if isinstance(error_body, dict) else ''
+            
+            # Check if it's a quota/rate limit error
+            if error_code == 429 or 'quota' in str(e).lower() or 'insufficient_quota' in error_type:
+                logger.error(f"❌ OpenAI API quota exceeded or rate limited: {e}")
+                logger.error("   The agent cannot generate responses. Please:")
+                logger.error("   1. Check your OpenAI billing at: https://platform.openai.com/account/billing")
+                logger.error("   2. Upgrade your plan or add payment method")
+                logger.error("   3. Wait for quota reset or reduce concurrent calls")
+                
+                # Try to hang up gracefully if we have a session
+                try:
+                    if hasattr(self, '_agent_session') and self._agent_session:
+                        logger.warning("⚠️  Hanging up call due to API quota error")
+                        await self.hangup("failed", send_results=True)
+                except Exception as hangup_error:
+                    logger.error(f"Failed to hang up gracefully: {hangup_error}")
+                
+                # Re-raise to let LiveKit handle it
+                raise
+            else:
+                # Other API errors - log and re-raise
+                logger.error(f"❌ LLM API error: {e}")
+                raise
     
     async def tts_node(self, text, model_settings):
         """Official LiveKit hook to intercept TTS input - captures agent speech that will be spoken.
@@ -465,9 +678,6 @@ class OutboundCaller(Agent):
                         transcript_lines.append(f"{speaker}: {content_text.strip()}")
                                 logger.info(f"📝 Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
             
-                    
-
-                    
                     if transcript_lines:
                         logger.info(f"✅ Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
             return "\n".join(transcript_lines)
@@ -1239,6 +1449,7 @@ async def entrypoint(ctx: JobContext):
     # Get customer info from metadata (can come from Google Sheets via n8n)
     customer_name = dial_info.get("name", "").strip()  # Empty string if no name provided
     appointment_time = dial_info.get("appointment_time", "")
+    business_name = dial_info.get("business_name", "").strip()  # Business name from Google Sheets
 
     # look up the user's phone number and appointment details
     agent = OutboundCaller(
@@ -1246,6 +1457,10 @@ async def entrypoint(ctx: JobContext):
         appointment_time=appointment_time,
         dial_info=dial_info,
     )
+    
+    # Store business name in agent for later use
+    business_name = dial_info.get("business_name", "").strip()
+    agent.business_name = business_name
 
     # Get current date and tomorrow's date for the system message (like the example)
     today = datetime.datetime.now()
@@ -1257,13 +1472,18 @@ async def entrypoint(ctx: JobContext):
     # Get current time in PST
     now_pst = datetime.datetime.now() - timedelta(hours=8)  # Approximate PST offset
     current_time = now_pst.strftime("%I:%M %p")
+    
+    # Get business name for system prompt
+    business_name = dial_info.get("business_name", "").strip()
 
     chat_ctx = llm.ChatContext(
         items=[
             llm.ChatMessage(
                 role="system",
                 content=[
-                    f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You sound confident but slightly casual.
+                    f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
+
+CRITICAL: Wait for the person to answer and say "hello" or similar greeting FIRST. Do NOT speak until they do. Once they greet you, respond with "Hello, are you from {business_name}?" if business name is available, otherwise just say "Hello?"
 
 CRITICAL TOOL USAGE - YOU MUST USE THESE TOOLS:
 
@@ -1293,7 +1513,13 @@ MANDATORY RULES:
 
 Interaction Rules:
 
-Pacing: Never rush. Use ellipses (...) as cues to take a breath.
+SPEECH QUALITY - CRITICAL:
+- Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like, you know)
+- Be direct and articulate - every word should have purpose
+- Use natural pauses (ellipses ...) for breathing, but don't fill silence with filler words
+- Sound professional yet conversational - confident, not hesitant
+
+Pacing: Never rush. Use ellipses (...) as cues to take a breath, but do NOT use filler words.
 
 Confirmation: When asking the initial greeting, stop speaking immediately.
 
@@ -1312,15 +1538,17 @@ When creating a date-time string for tools, use the offset -08:00.
 THE SCRIPT
 
 First Message: 
-{f'Hey, {customer_name}?' if customer_name else 'Hello?'}   
+WAIT for the person to answer and say "hello" or similar greeting first. DO NOT speak until they do.
+Once they say "hello", "hi", "hey", or similar greeting, respond with:
+{f'Hello, are you from {business_name}?' if business_name else 'Hello?'}
 (Pause and let them respond)
 
 THE HOOK
-{f'Yeah hey {customer_name} uhh its just Lia...' if customer_name else 'Yeah hey, uhh its just Lia...'} I'm just over here by San Jose and I uhm have some.. good news and bad news..."
+{f'Yeah hey {customer_name}, it\'s just Lia...' if customer_name else 'Yeah hey, it\'s just Lia...'} I'm just over here by San Jose and I have some... good news and bad news..."
 
 THE REVEAL
-"okay... soo uhm  the good news is this.... is a well-researched cold call... but uhh the bad news is... it's uhm a cold call... 
-{f"But I'm just wondering... can you give me like, 30 seconds {customer_name}?" if customer_name else "But I'm just wondering... can you give me like, 30 seconds?"}
+"Okay... so the good news is this... is a well-researched cold call... but the bad news is... it's a cold call... 
+{f"But I'm just wondering... can you give me 30 seconds {customer_name}?" if customer_name else "But I'm just wondering... can you give me 30 seconds?"}
 
 CRITICAL: After asking for 30 seconds, wait for their response:
 - If they say "yes", "yeah", "sure", "okay", "ok", "go ahead", or ANY approval response → IMMEDIATELY continue with THE PITCH. Do not ask again or wait longer.
@@ -1328,19 +1556,19 @@ CRITICAL: After asking for 30 seconds, wait for their response:
 
 If they say "come again?", "what?", "huh?", or sound confused, Lia responds:
 
-"Oh — sorry about that… i'll say it again"
-"Basically… uh this is a cold call… but it's uhm a really well-researched one."
-{f"Would it be okay if I took like, 30 seconds {customer_name}?" if customer_name else "Would it be okay if I took like, 30 seconds?"}
+"Oh — sorry about that… I'll say it again"
+"Basically… this is a cold call… but it's a really well-researched one."
+{f"Would it be okay if I took 30 seconds {customer_name}?" if customer_name else "Would it be okay if I took 30 seconds?"}
 
 After they give ANY approval (yes, sure, okay, etc.), IMMEDIATELY continue with THE PITCH.
 
 THE PITCH ( SLOW DOWN HERE)
-"uhh Okay, so basically... I was doing some research on your business... and I uh noticed you're sitting on the 2nd page of Google... and um honestly... that's where you're losing money.... thats because people only see the top 3... and uh.. your no where near that"
-"but um The way we actually  fix this—and uh just to throw something out there um we've generated over a million dollars for landscapers all over the bay area... 
-but um the first thing we do is we optimize your Google profile to hit that number one spot..."
+"Okay, so basically... I was doing some research on your business... and I noticed you're sitting on the 2nd page of Google... and honestly... that's where you're losing money... because people only see the top 3... and you're nowhere near that"
+"The way we actually fix this—and just to throw something out there... we've generated over a million dollars for landscapers all over the bay area... 
+The first thing we do is we optimize your Google profile to hit that number one spot..."
 "Then we optimize your site to get high-ticket buyers... people looking for hardscaping, retaining walls... the big projects."
 
-{f"uh I know I just said a lot..... but would you be interested in this {customer_name}?" if customer_name else "uh I know I just said a lot..... but would you be interested in this?"}
+{f"I know I just said a lot... but would you be interested in this {customer_name}?" if customer_name else "I know I just said a lot... but would you be interested in this?"}
 
 CRITICAL RESPONSE HANDLING:
 - If they say "yes", "yeah", "sure", "I'm interested", or any positive response → IMMEDIATELY go to "THE CLOSE" section. Do NOT say anything about "when someone says yes it usually means they need more information" or any similar dialogue. Just move directly to scheduling.
@@ -1348,9 +1576,9 @@ CRITICAL RESPONSE HANDLING:
 - If they say "no" or "not interested" → go to "OBJECTION HANDLING" section.
 
 ADDED RESPONSE FOR "MAYBE" (no other wording changed):
-"Yeah... uhm ... totally fair."
+"Yeah... totally fair."
 "When someone says maybe... it usually just means they'd need to see if it's actually worth it."
-"Real quick... uh what would you have to see for this to be a yes? More calls, uhh better jobs, or just beating a couple competitors on Google?"
+"Real quick... what would you have to see for this to be a yes? More calls, better jobs, or just beating a couple competitors on Google?"
 "If I could show you exactly where you're getting beat and what we'd fix first... would you be open to a quick 15 or 20 minute chat?"
 
 THE CLOSE (Call to Action)
@@ -1547,7 +1775,8 @@ Trigger endCall."""
     INITIAL_GREETING_DELAY = float(os.getenv("INITIAL_GREETING_DELAY", "1.0"))  # seconds to wait before first greeting
     MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.5"))  # min delay before considering user done speaking
     MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "15.0"))  # max delay before forcing turn end (increased for email collection - people spell emails very slowly letter by letter like "i t z n t p at Gmail dot co")
-    NO_RESPONSE_TIMEOUT = float(os.getenv("NO_RESPONSE_TIMEOUT", "10.0"))  # seconds to wait after greeting for user to speak before hanging up (default 10 seconds)
+    NO_RESPONSE_TIMEOUT = float(os.getenv("NO_RESPONSE_TIMEOUT", "7.0"))  # seconds to wait after greeting for user to speak before hanging up (default 7 seconds)
+    INITIAL_SILENCE_WAIT = float(os.getenv("INITIAL_SILENCE_WAIT", "5.0"))  # seconds to wait for user to speak before agent says "Hello?" (default 5 seconds)
     
     # TTS Configuration - ElevenLabs voice with quota check
     # Get voice ID from environment variable, or use the specified default
@@ -1771,6 +2000,12 @@ Trigger endCall."""
                     "is_final": True
                 })
                 logger.info(f"📝 User transcript captured (legacy): {text.strip()}")
+                
+                # Check for voicemail patterns in real-time
+                if agent.voicemail_detector and agent.voicemail_detector.check_transcript(text.strip()):
+                    # Voicemail detected - handle it asynchronously
+                    logger.warning(f"🚨 Voicemail detected! Hanging up immediately...")
+                    asyncio.create_task(agent.voicemail_detector.handle_voicemail_detection())
         
         def track_agent_transcript(text: str):
             """Capture agent speech transcriptions (legacy method)."""
@@ -1992,6 +2227,12 @@ Trigger endCall."""
     )
 
     # `create_sip_participant` starts dialing the user
+    # Add retry logic for network errors (ServerDisconnectedError, etc.)
+    max_sip_retries = 2
+    sip_retry_delay = 1.0
+    sip_participant_created = False
+    
+    for retry_attempt in range(max_sip_retries + 1):
     try:
         await ctx.api.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
@@ -2003,10 +2244,48 @@ Trigger endCall."""
                 wait_until_answered=True,
             )
         )
-
-        # wait for the agent session start and participant join
-        await session_started
-        participant = await ctx.wait_for_participant(identity=participant_identity)
+            sip_participant_created = True
+            break  # Success, exit retry loop
+        except Exception as sip_error:
+            error_type = type(sip_error).__name__
+            # Don't retry on TwirpError (SIP status codes like 603, 486, etc.) - these are intentional rejections
+            if isinstance(sip_error, api.TwirpError):
+                raise  # Re-raise to be handled by outer TwirpError handler
+            # Retry on network errors (ServerDisconnectedError, ConnectionError, etc.)
+            elif retry_attempt < max_sip_retries and (
+                "ServerDisconnectedError" in error_type or 
+                "ConnectionError" in error_type or
+                "disconnected" in str(sip_error).lower() or
+                "connection" in str(sip_error).lower()
+            ):
+                logger.warning(f"⚠️  SIP connection error (attempt {retry_attempt + 1}/{max_sip_retries + 1}): {sip_error}. Retrying in {sip_retry_delay}s...")
+                await asyncio.sleep(sip_retry_delay)
+                sip_retry_delay *= 2  # Exponential backoff
+            else:
+                # Non-retryable error or max retries reached
+                logger.error(f"❌ Failed to create SIP participant after {retry_attempt + 1} attempts: {sip_error}")
+                raise
+    
+    if not sip_participant_created:
+        raise RuntimeError("Failed to create SIP participant after all retry attempts")
+    
+    try:
+        # wait for the agent session start with timeout
+        try:
+            await asyncio.wait_for(session_started, timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.error("❌ Session start timed out after 30 seconds")
+            raise RuntimeError("Session start timed out")
+        
+        # wait for participant join with timeout
+        try:
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(identity=participant_identity),
+                timeout=60.0  # 60 second timeout for participant to join
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"❌ Participant {participant_identity} did not join within 60 seconds")
+            raise RuntimeError(f"Participant join timeout for {participant_identity}")
         logger.info(f"participant joined: {participant.identity}")
 
         agent.set_participant(participant)
@@ -2016,6 +2295,10 @@ Trigger endCall."""
         
         # Track call start time
         agent.call_start_time = datetime.datetime.now()
+        
+        # Initialize voicemail detector
+        agent.voicemail_detector = VoicemailDetector(agent)
+        logger.info("✅ Voicemail detector initialized")
         
         # OFFICIAL METHOD: Subscribe to conversation_item_added event
         # This is the recommended way to track all conversation items (user and agent)
@@ -2038,6 +2321,12 @@ Trigger endCall."""
                     "is_final": True
                 })
                 logger.info(f"📝 User transcript captured: {text.strip()}")
+                
+                # Check for voicemail patterns in real-time
+                if agent.voicemail_detector and agent.voicemail_detector.check_transcript(text.strip()):
+                    # Voicemail detected - handle it asynchronously
+                    logger.warning(f"🚨 Voicemail detected! Hanging up immediately...")
+                    asyncio.create_task(agent.voicemail_detector.handle_voicemail_detection())
         
         def track_agent_transcript(text: str):
             """Capture agent speech transcriptions."""
@@ -2147,6 +2436,12 @@ Trigger endCall."""
                         if role == 'user' or (hasattr(item, 'role') and item.role == 'user'):
                             track_user_transcript(text.strip())
                             logger.info(f"📝 Captured user transcript from conversation: {text.strip()}")
+                            
+                            # Check for voicemail patterns in real-time
+                            if agent.voicemail_detector and agent.voicemail_detector.check_transcript(text.strip()):
+                                # Voicemail detected - handle it asynchronously
+                                logger.warning(f"🚨 Voicemail detected! Hanging up immediately...")
+                                asyncio.create_task(agent.voicemail_detector.handle_voicemail_detection())
                         elif role == 'assistant' or (hasattr(item, 'role') and item.role == 'assistant'):
                             track_agent_transcript(text.strip())
                             logger.info(f"📝 Captured agent transcript from conversation: {text.strip()}")
@@ -2471,53 +2766,126 @@ Trigger endCall."""
         # Start monitoring as backup
         monitor_task = asyncio.create_task(monitor_and_send_transcript())
         
-        # Wait before initial greeting (adjustable delay)
-        if INITIAL_GREETING_DELAY > 0:
-            logger.info(f"Waiting {INITIAL_GREETING_DELAY} seconds before initial greeting...")
-            await asyncio.sleep(INITIAL_GREETING_DELAY)
-        
-        # Generate initial greeting
+        # Wait for user to speak first, then say "Hello?" if quiet, then hang up if no response
+        logger.info(f"📞 Waiting {INITIAL_SILENCE_WAIT} seconds for user to speak first...")
+        user_first_spoke = False
         greeting_sent_time = None
-        try:
-            # Use "Hello?" if no name, otherwise "Hey, {name}?"
-            if customer_name:
-                greeting_text = f"Hey, {customer_name}?"
-            else:
-                greeting_text = "Hello?"
+        silence_timeout_task = None
+        hello_sent = False
+        customer_transcript_count_before_greeting = 0  # Track transcript count before greeting
+        
+        # Monitor for user's first speech or send "Hello?" if quiet
+        async def wait_for_user_greeting():
+            """Wait for user to speak, say 'Hello?' if quiet after 5 seconds, then hang up if no response after 7 more seconds."""
+            nonlocal user_first_spoke, greeting_sent_time, silence_timeout_task, hello_sent, customer_transcript_count_before_greeting
             
+            check_interval = 0.5
+            elapsed = 0.0
+            
+            # Phase 1: Wait 5 seconds for user to speak first
+            while elapsed < INITIAL_SILENCE_WAIT:
+                await asyncio.sleep(check_interval)
+                elapsed += check_interval
+                
+                # Check if user has spoken
+                user_transcripts = [
+                    entry.get("text", "").lower().strip()
+                    for entry in agent.transcript
+                    if entry.get("speaker") == "Customer"
+                ]
+                
+                if user_transcripts:
+                    # User spoke - respond with business name question
+                    user_first_spoke = True
+                    logger.info(f"✅ User spoke first: {' '.join(user_transcripts)}")
+                    
+                    try:
+                        if agent.business_name:
+                            response_text = f"Hello, are you from {agent.business_name}?"
+                        else:
+                            response_text = "Hello?"
+                        
         await session.generate_reply(
-                instructions=f"Say ONLY this: '{greeting_text}' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
-        )
-            greeting_sent_time = datetime.datetime.now()
-            logger.info(f"📞 Initial greeting sent, waiting up to {NO_RESPONSE_TIMEOUT} seconds for user response...")
-        except RuntimeError as e:
-            if "AgentSession is closing" in str(e) or "cannot use generate_reply" in str(e):
-                logger.error(f"❌ Session is closing, cannot generate reply: {e}")
-                monitor_task.cancel()
-                await send_transcript_on_end()
-                return
-            raise
-        except Exception as e:
-            logger.error(f"Error generating initial greeting: {e}")
-            monitor_task.cancel()
-            await send_transcript_on_end()
-            raise
+                            instructions=f"Say ONLY this: '{response_text}' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
+                        )
+                        greeting_sent_time = datetime.datetime.now()
+                        logger.info(f"📞 Responded with business name question: '{response_text}'")
+                        
+                        # Record transcript count before greeting to detect new speech after
+                        customer_transcript_count_before_greeting = len([
+                            entry for entry in agent.transcript 
+                            if entry.get("speaker") == "Customer"
+                        ])
+                        
+                        # Start silence timeout monitor after greeting is sent
+                        nonlocal silence_timeout_task
+                        silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
+                    except Exception as e:
+                        logger.error(f"Error generating business name response: {e}")
+                    
+                    return  # User spoke, exit function
+                
+                # Check if call already ended
+                if agent.call_end_time:
+                    return
+                
+                # Check if participant disconnected
+                if participant not in ctx.room.remote_participants.values():
+                    return
+            
+            # Phase 2: User didn't speak in 5 seconds - agent says "Hello?"
+            if not user_first_spoke and not hello_sent:
+                logger.info(f"⏱️  No user speech detected after {INITIAL_SILENCE_WAIT} seconds - agent will say 'Hello?'")
+                hello_sent = True
+                
+                # Record transcript count before greeting to detect new speech after
+                customer_transcript_count_before_greeting = len([
+                    entry for entry in agent.transcript 
+                    if entry.get("speaker") == "Customer"
+                ])
+                
+                try:
+                    await session.generate_reply(
+                        instructions="Say ONLY this: 'Hello?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
+                    )
+                    greeting_sent_time = datetime.datetime.now()
+                    logger.info("📞 Agent said 'Hello?' - waiting for response...")
+                    
+                    # Start silence timeout monitor after "Hello?" is sent
+                    silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
+                except Exception as e:
+                    logger.error(f"Error generating 'Hello?' response: {e}")
+                    # If we can't say hello, just hang up
+                    try:
+                        await agent.hangup("no_answer", send_results=True)
+                    except Exception as hangup_error:
+                        logger.error(f"Error hanging up: {hangup_error}")
+                    return
+            
+            # Phase 3: Wait for response after "Hello?" (handled by monitor_silence_timeout)
+        
+        # Start waiting for user greeting
+        greeting_wait_task = asyncio.create_task(wait_for_user_greeting())
         
         # Monitor for user response after greeting (silence timeout)
         async def monitor_silence_timeout():
-            """Monitor if user responds after greeting, hang up if no response within timeout."""
+            """Monitor if user responds after greeting, hang up if no response within 7 seconds."""
             if greeting_sent_time is None:
                 return
             
             try:
-                # Wait for the timeout period
+                # Wait for the timeout period (7 seconds)
                 await asyncio.sleep(NO_RESPONSE_TIMEOUT)
                 
-                # Check if user has spoken (transcript has customer entries)
-                user_has_spoken = any(
-                    entry.get("speaker") == "Customer" 
-                    for entry in agent.transcript
-                )
+                # Check if user has spoken AFTER the greeting was sent
+                # Count current customer transcripts
+                current_customer_transcript_count = len([
+                    entry for entry in agent.transcript 
+                    if entry.get("speaker") == "Customer"
+                ])
+                
+                # If there are more customer transcripts now than before greeting, user spoke
+                user_has_spoken_after_greeting = current_customer_transcript_count > customer_transcript_count_before_greeting
                 
                 # Check if call already ended
                 if agent.call_end_time:
@@ -2527,23 +2895,22 @@ Trigger endCall."""
                 if participant not in ctx.room.remote_participants.values():
                     return
                 
-                # If no user speech detected, hang up
-                if not user_has_spoken:
+                # If no user speech detected after greeting, hang up
+                if not user_has_spoken_after_greeting:
                     logger.warning(f"⚠️  No user response detected after {NO_RESPONSE_TIMEOUT} seconds - hanging up")
                     try:
                         await agent.hangup("no_answer", send_results=True)
                     except Exception as e:
                         logger.error(f"Error hanging up due to silence: {e}")
                 else:
-                    logger.info("✅ User responded - silence timeout cancelled")
+                    logger.info("✅ User responded after greeting - silence timeout cancelled")
                     
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 logger.debug(f"Silence monitor error: {e}")
         
-        # Start silence timeout monitor
-        silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
+        # Silence timeout will be started by wait_for_user_greeting after greeting is sent
         
         # Wait for monitor to complete (will finish when participant disconnects)
         try:
@@ -2552,12 +2919,59 @@ Trigger endCall."""
             pass
         finally:
             # Cancel silence timeout if still running
-            if not silence_timeout_task.done():
+            if silence_timeout_task and not silence_timeout_task.done():
                 silence_timeout_task.cancel()
                 try:
                     await silence_timeout_task
                 except asyncio.CancelledError:
                     pass
+
+    except (RuntimeError, asyncio.TimeoutError, Exception) as e:
+        # Handle network errors, timeouts, and other unexpected errors (but not TwirpError)
+        # TwirpError is handled separately below
+        if isinstance(e, api.TwirpError):
+            raise  # Re-raise to be handled by TwirpError handler below
+        
+        error_type = type(e).__name__
+        error_message = str(e)
+        
+        # Check if it's a network/connection error
+        is_network_error = (
+            "ServerDisconnectedError" in error_type or
+            "ConnectionError" in error_type or
+            "disconnected" in error_message.lower() or
+            "connection" in error_message.lower() or
+            "timeout" in error_message.lower() or
+            isinstance(e, asyncio.TimeoutError)
+        )
+        
+        if is_network_error:
+            call_status = "failed"
+            logger.error(f"❌ Network/connection error during call setup: {e}")
+        else:
+            call_status = "failed"
+            logger.error(f"❌ Unexpected error during call setup: {error_type}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # Clean up session_started task if it's still running
+        if 'session_started' in locals() and not session_started.done():
+            try:
+                session_started.cancel()
+                await session_started
+            except Exception:
+                pass
+        
+        # Update Google Sheets with failure status
+        try:
+            agent.call_end_time = datetime.datetime.now()
+            await agent.send_call_results_to_sheets(call_status)
+            logger.info(f"✅ Error status ({call_status}) sent to Google Sheets")
+        except Exception as sheet_error:
+            logger.error(f"❌ Failed to update Google Sheets with error status: {sheet_error}")
+        
+        ctx.shutdown()
+        return  # Exit early to avoid continuing with failed setup
 
     except api.TwirpError as e:
         sip_status_code = e.metadata.get('sip_status_code')

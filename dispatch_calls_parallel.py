@@ -35,11 +35,10 @@ from dispatch_calls import (
 load_dotenv(dotenv_path=".env.local")
 
 # Parallel dialing configuration
-MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "5"))
+MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "3"))  # Default to 3 for simplicity
 PARALLEL_DIALING_ENABLED = os.getenv("PARALLEL_DIALING_ENABLED", "true").lower() == "true"
-CALL_START_DELAY = float(os.getenv("CALL_START_DELAY", "0.5"))  # Delay between starting calls
-CALL_COMPLETION_CHECK_INTERVAL = int(os.getenv("CALL_COMPLETION_CHECK_INTERVAL", "10"))
-MONITOR_CALLS = os.getenv("MONITOR_CALLS", "true").lower() == "true"  # Monitor call completion
+CALL_START_DELAY = float(os.getenv("CALL_START_DELAY", "1.0"))  # Increased delay to avoid overwhelming
+SKIP_SHEETS_UPDATES_DURING_DISPATCH = os.getenv("SKIP_SHEETS_UPDATES_DURING_DISPATCH", "true").lower() == "true"  # Skip sheet updates during dispatch to avoid thread safety issues
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,8 +49,71 @@ logger = logging.getLogger("parallel-dispatch")
 # Thread pool for synchronous operations
 executor = ThreadPoolExecutor(max_workers=10)
 
+# Lock to serialize Google Sheets API calls (Google Sheets client is NOT thread-safe)
+# This prevents segmentation faults from concurrent access
+sheets_api_lock = asyncio.Lock()
+
+# Semaphore to limit concurrent Google Sheets API calls (not thread-safe)
+# Limit to 1 concurrent update to avoid SSL/connection issues and segfaults
+sheets_api_semaphore = asyncio.Semaphore(1)
+
 # Track active calls
 active_calls: Dict[int, Dict[str, Any]] = {}
+
+
+async def update_sheet_cell_safe(service, row_number: int, column: str, value: str, max_retries: int = 5):
+    """Update a Google Sheets cell with retry logic and rate limiting.
+    
+    Uses both a lock and semaphore to ensure thread-safety and prevent segfaults.
+    """
+    async with sheets_api_semaphore:  # Limit concurrent API calls
+        async with sheets_api_lock:  # Serialize access to prevent segfaults
+            for attempt in range(max_retries):
+                try:
+                    # Add timeout to prevent indefinite hanging (30 seconds)
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            executor,
+                            update_sheet_cell,
+                            service,
+                            row_number,
+                            column,
+                            value
+                        ),
+                        timeout=30.0  # 30 second timeout
+                    )
+                    return True
+                except asyncio.TimeoutError:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2.0  # Exponential backoff: 2s, 4s, 6s, 8s
+                        logger.warning(f"⚠️  Timeout updating {column} for row {row_number} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ Timeout updating {column} for row {row_number} after {max_retries} attempts")
+                        return False
+                except Exception as e:
+                    error_str = str(e).lower()
+                    # Check if it's an SSL error or timeout error
+                    is_ssl_error = "ssl" in error_str or "decryption" in error_str or "wrong_version" in error_str
+                    is_timeout_error = "timeout" in error_str or "timed out" in error_str or "read operation" in error_str
+                    
+                    if is_ssl_error or is_timeout_error:
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 2.0  # Exponential backoff: 2s, 4s, 6s, 8s
+                            error_type = "SSL" if is_ssl_error else "Timeout"
+                            logger.warning(f"⚠️  {error_type} error updating {column} for row {row_number} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            error_type = "SSL" if is_ssl_error else "Timeout"
+                            logger.error(f"❌ {error_type} error updating {column} for row {row_number} after {max_retries} attempts: {e}")
+                            return False
+                    else:
+                        # Non-retryable error, don't retry
+                        logger.error(f"❌ Error updating {column} for row {row_number}: {e}")
+                        return False
+            return False
 
 
 async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -64,26 +126,9 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
     phone_number = row_data["phone_number"]
     
     try:
-        # Update status to "Dispatched" (synchronous operation in thread pool)
-        await asyncio.get_event_loop().run_in_executor(
-            executor,
-            update_sheet_cell,
-            service,
-            row_number,
-            "Status",
-            "Dispatched"
-        )
-        
-        await asyncio.get_event_loop().run_in_executor(
-            executor,
-            update_sheet_cell,
-            service,
-            row_number,
-            "Last Called",
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
-        
         # Dispatch to LiveKit (synchronous operation)
+        # Note: We update the sheet with "Dispatched" status AFTER successful dispatch
+        # This ensures we only mark as dispatched if the call actually started
         job_id = await asyncio.get_event_loop().run_in_executor(
             executor,
             dispatch_to_livekit_cli,
@@ -92,6 +137,26 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
         
         if job_id:
             logger.info(f"✅ [{row_number}] Dispatched call to {phone_number}")
+            
+            # Always update sheet with "Dispatched" status when call is successfully dispatched
+            # This uses the safe update function with semaphore protection, so it's thread-safe
+            try:
+                await update_sheet_cell_safe(
+                    service,
+                    row_number,
+                    "Status",
+                    "Dispatched"
+                )
+                await update_sheet_cell_safe(
+                    service,
+                    row_number,
+                    "Last Called",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                logger.debug(f"📝 [{row_number}] Updated sheet: Status=Dispatched")
+            except Exception as e:
+                logger.warning(f"⚠️  [{row_number}] Failed to update sheet with Dispatched status: {e}")
+                # Continue anyway - the agent will update it when call completes
             
             # Track active call
             active_calls[row_number] = {
@@ -109,9 +174,8 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
             }
         else:
             logger.error(f"❌ [{row_number}] Failed to dispatch call to {phone_number}")
-            await asyncio.get_event_loop().run_in_executor(
-                executor,
-                update_sheet_cell,
+            if not SKIP_SHEETS_UPDATES_DURING_DISPATCH:
+                await update_sheet_cell_safe(
                 service,
                 row_number,
                 "Status",
@@ -126,17 +190,16 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
             
     except Exception as e:
         logger.error(f"❌ [{row_number}] Exception dispatching call: {e}")
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                executor,
-                update_sheet_cell,
-                service,
-                row_number,
-                "Status",
-                "Failed"
-            )
-        except:
-            pass
+        if not SKIP_SHEETS_UPDATES_DURING_DISPATCH:
+            try:
+                await update_sheet_cell_safe(
+                    service,
+                    row_number,
+                    "Status",
+                    "Failed"
+                )
+            except:
+                pass
         
         return {
             "success": False,
@@ -156,12 +219,14 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
         check_count += 1
         
         try:
-            status = await asyncio.get_event_loop().run_in_executor(
-                executor,
-                check_call_status,
-                service,
-                row_number
-            )
+            # Use semaphore for status checks too
+            async with sheets_api_semaphore:
+                status = await asyncio.get_event_loop().run_in_executor(
+                    executor,
+                    check_call_status,
+                    service,
+                    row_number
+                )
             
             if status:
                 status_lower = status.lower()
@@ -193,39 +258,55 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
         return
     
     # Semaphore to limit concurrent dispatches
+    # This ensures only MAX_CONCURRENT_CALLS are dispatched at once
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
     
     async def dispatch_with_limit(row_data: Dict[str, Any], index: int):
         """Dispatch a call with concurrency limit."""
         async with semaphore:
-            # Stagger call starts to avoid overwhelming the system
+            # Stagger call starts to avoid overwhelming the system and API rate limits
             if index > 0:
-                await asyncio.sleep(CALL_START_DELAY * index)
+                delay = CALL_START_DELAY * (index % MAX_CONCURRENT_CALLS)
+                await asyncio.sleep(delay)
             
+            # Dispatch the call
             result = await dispatch_call_async(service, row_data)
             
-            # Optionally monitor call completion
-            if MONITOR_CALLS and result.get("success"):
-                # Start monitoring in background (don't await)
-                asyncio.create_task(
-                    monitor_call_status(
-                        service,
-                        result["row_number"],
-                        result["phone_number"]
-                    )
-                )
+            # Hold semaphore for minimum call duration to prevent too many active calls
+            # This ensures we don't dispatch too many calls that all run simultaneously
+            if result.get("success"):
+                # Wait minimum time before releasing semaphore (simulates call being active)
+                # This prevents dispatching 20 calls all at once
+                min_hold_time = 20.0  # Hold semaphore for 20 seconds (typical call start time)
+                await asyncio.sleep(min_hold_time)
             
             return result
     
-    # Create tasks for all calls
-    tasks = [
-        dispatch_with_limit(row_data, idx)
-        for idx, row_data in enumerate(pending_rows)
-    ]
-    
-    # Execute all calls concurrently (with semaphore limit)
-    logger.info(f"📞 Dispatching {total} calls (max {MAX_CONCURRENT_CALLS} concurrent)...")
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Process calls in batches to maintain true concurrency limit
+    # Instead of dispatching all at once, dispatch MAX_CONCURRENT_CALLS, wait, then next batch
+    results = []
+    for batch_start in range(0, total, MAX_CONCURRENT_CALLS):
+        batch_end = min(batch_start + MAX_CONCURRENT_CALLS, total)
+        batch = pending_rows[batch_start:batch_end]
+        batch_num = (batch_start // MAX_CONCURRENT_CALLS) + 1
+        total_batches = (total + MAX_CONCURRENT_CALLS - 1) // MAX_CONCURRENT_CALLS
+        
+        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} calls)...")
+        
+        # Dispatch this batch with semaphore limit
+        batch_tasks = [
+            dispatch_with_limit(row_data, batch_start + idx)
+            for idx, row_data in enumerate(batch)
+        ]
+        
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        results.extend(batch_results)
+        
+        # Wait between batches to ensure previous calls have time to start
+        if batch_end < total:
+            wait_time = CALL_START_DELAY * MAX_CONCURRENT_CALLS
+            logger.info(f"⏳ Waiting {wait_time}s before next batch...")
+            await asyncio.sleep(wait_time)
     
     # Process results
     successful = 0
@@ -245,10 +326,8 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
     logger.info(f"   ✅ Successful: {successful}")
     logger.info(f"   ❌ Failed: {failed}")
     logger.info(f"   🔄 Active: {len(active_calls)}")
-    
-    if active_calls and MONITOR_CALLS:
-        logger.info(f"\n⏳ Monitoring {len(active_calls)} active calls...")
-        logger.info("   (Calls will update Google Sheets automatically when they complete)")
+    logger.info(f"\n✅ All calls dispatched! The agent will update Google Sheets automatically when calls complete.")
+    logger.info(f"   (No need to monitor - each agent instance updates its own row when done)")
 
 
 async def main_async():
