@@ -21,6 +21,9 @@ google_sheets_token.json
 client_secret_*.json
 *.json.token
 
+# Configuration (user-specific, but example is committed)
+config.json
+
 # IDE
 .vscode/
 .idea/

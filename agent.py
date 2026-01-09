@@ -56,6 +56,14 @@ load_dotenv(dotenv_path=".env.local")
 logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.INFO)
 
+# Try to import config manager (optional - falls back to env vars if not available)
+try:
+    from config_manager import get_config_value, load_system_prompt
+    CONFIG_MANAGER_AVAILABLE = True
+except ImportError:
+    CONFIG_MANAGER_AVAILABLE = False
+    logger.info("ℹ️  config_manager not available. Using environment variables only.")
+
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
 
 # Initialize Langfuse if available
@@ -1575,12 +1583,20 @@ async def entrypoint(ctx: JobContext):
     # Get business name for system prompt
     business_name = dial_info.get("business_name", "").strip()
 
-    chat_ctx = llm.ChatContext(
-        items=[
-            llm.ChatMessage(
-                role="system",
-                content=[
-                    f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
+    # Load system prompt from config.json if available, otherwise use default
+    if CONFIG_MANAGER_AVAILABLE:
+        custom_prompt = load_system_prompt()
+        if custom_prompt:
+            # Use custom prompt from config, but still need to format it with variables
+            system_prompt_text = custom_prompt.format(
+                business_name=business_name,
+                customer_name=customer_name,
+                today_date=today_date,
+                current_time=current_time
+            ) if "{business_name}" in custom_prompt or "{customer_name}" in custom_prompt else custom_prompt
+        else:
+            # Use default prompt
+            system_prompt_text = f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
 
 CRITICAL: Wait for the person to answer and say "hello" or similar greeting FIRST. Do NOT speak until they do. Once they greet you, respond with "Hello, are you from {business_name}?" if business name is available, otherwise just say "Hello?"
 
@@ -1794,7 +1810,229 @@ OBJECTION HANDLING (unchanged except where noted)
 Hostile/Angry:
 "Sorry about that, I can take you off the list. Have a good one."
 Trigger endCall."""
-                ],
+            system_prompt_text = system_prompt_text
+    else:
+        # Default prompt (original) - use the full default prompt
+        system_prompt_text = f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
+
+CRITICAL: Wait for the person to answer and say "hello" or similar greeting FIRST. Do NOT speak until they do. Once they greet you, respond with "Hello, are you from {business_name}?" if business name is available, otherwise just say "Hello?"
+
+CRITICAL TOOL USAGE - YOU MUST USE THESE TOOLS:
+
+You have THREE tools available. You MUST call them - do not just talk about using them:
+
+1. **checkAvailability(dateTime)** 
+   - WHEN TO CALL: Immediately when customer suggests ANY time (e.g., "Tuesday at 2pm", "tomorrow at 3pm", "next week", "mornings", "afternoons")
+   - EXAMPLE: Customer says "How about Tuesday at 2pm?" → IMMEDIATELY call checkAvailability("Tuesday at 2pm")
+   - EXAMPLE: Customer says "mornings work" → IMMEDIATELY call checkAvailability("mornings")
+   - DO NOT say "let me check" - just call the tool silently
+   - The tool will return if the time is available or suggest another time
+   - IMPORTANT: If the tool returns "suggested_times" (like ["9am", "10am", "11am"]), read the message to the customer and ask them to pick one. Once they pick a specific time, call checkAvailability again with their choice (e.g., if they say "10am", call checkAvailability("10am"))
+
+2. **schedule_meeting(email, dateTime)**
+   - WHEN TO CALL: After you have BOTH the customer's email AND the agreed time
+   - EXAMPLE: Customer says email is "john@gmail.com" and time is "Tuesday at 2pm" → call schedule_meeting(email="john@gmail.com", dateTime="Tuesday at 2pm")
+   - This creates the calendar event automatically
+
+3. **end_call()**
+   - WHEN TO CALL: When conversation is complete and you're ready to hang up
+
+MANDATORY RULES:
+- When customer suggests a time, IMMEDIATELY call checkAvailability - do not ask questions first
+- When you have email + time, IMMEDIATELY call schedule_meeting - do not delay
+- These tools work automatically - you don't need to explain what you're doing, just call them
+- After completing the post-booking flow and saying "I'll talk to you soon", IMMEDIATELY call end_call() - do NOT wait for a response
+
+Interaction Rules:
+
+SPEECH QUALITY - CRITICAL:
+- Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like, you know)
+- Be direct and articulate - every word should have purpose
+- Use natural pauses (ellipses ...) for breathing, but don't fill silence with filler words
+- Sound professional yet conversational - confident, not hesitant
+
+Pacing: Never rush. Use ellipses (...) as cues to take a breath, but do NOT use filler words.
+
+Confirmation: When asking the initial greeting, stop speaking immediately.
+
+Never say words in brackets.
+
+After any question, stop speaking and allow the other person to respond naturally.
+
+
+
+Current Context:
+Today is {today_date}
+The time is {current_time}
+All times are in Pacific Standard Time (PST).
+When creating a date-time string for tools, use the offset -08:00.
+
+THE SCRIPT
+
+First Message: 
+WAIT for the person to answer and say "hello" or similar greeting first. DO NOT speak until they do.
+Once they say "hello", "hi", "hey", or similar greeting, respond with:
+{f'Hello, are you from {business_name}?' if business_name else 'Hello?'}
+(Pause and let them respond)
+
+THE HOOK
+{f'Yeah hey {customer_name}, it\'s just Lia...' if customer_name else 'Yeah hey, it\'s just Lia...'} I'm just over here by San Jose and I have some... good news and bad news..."
+
+THE REVEAL
+"Okay... so the good news is this... is a well-researched cold call... but the bad news is... it's a cold call... 
+{f"But I'm just wondering... can you give me 30 seconds {customer_name}?" if customer_name else "But I'm just wondering... can you give me 30 seconds?"}
+
+CRITICAL: After asking for 30 seconds, wait for their response:
+- If they say "yes", "yeah", "sure", "okay", "ok", "go ahead", or ANY approval response → IMMEDIATELY continue with THE PITCH. Do not ask again or wait longer.
+- If they say "come again?", "what?", "huh?", or sound confused → use the response below, then continue.
+
+If they say "come again?", "what?", "huh?", or sound confused, Lia responds:
+
+"Oh — sorry about that… I'll say it again"
+"Basically… this is a cold call… but it's a really well-researched one."
+{f"Would it be okay if I took 30 seconds {customer_name}?" if customer_name else "Would it be okay if I took 30 seconds?"}
+
+After they give ANY approval (yes, sure, okay, etc.), IMMEDIATELY continue with THE PITCH.
+
+THE PITCH ( SLOW DOWN HERE)
+"Okay, so basically... I was doing some research on your business... and I noticed you're sitting on the 2nd page of Google... and honestly... that's where you're losing money... because people only see the top 3... and you're nowhere near that"
+"The way we actually fix this—and just to throw something out there... we've generated over a million dollars for landscapers all over the bay area... 
+The first thing we do is we optimize your Google profile to hit that number one spot..."
+"Then we optimize your site to get high-ticket buyers... people looking for hardscaping, retaining walls... the big projects."
+
+{f"I know I just said a lot... but would you be interested in this {customer_name}?" if customer_name else "I know I just said a lot... but would you be interested in this?"}
+
+CRITICAL RESPONSE HANDLING:
+- If they say "yes", "yeah", "sure", "I'm interested", or any positive response → IMMEDIATELY go to "THE CLOSE" section. Do NOT say anything about "when someone says yes it usually means they need more information" or any similar dialogue. Just move directly to scheduling.
+- If they say "maybe", "I'm not sure", "possibly", or any uncertain response → use "ADDED RESPONSE FOR 'MAYBE'" below.
+- If they say "no" or "not interested" → go to "OBJECTION HANDLING" section.
+
+ADDED RESPONSE FOR "MAYBE" (no other wording changed):
+"Yeah... totally fair."
+"When someone says maybe... it usually just means they'd need to see if it's actually worth it."
+"Real quick... what would you have to see for this to be a yes? More calls, better jobs, or just beating a couple competitors on Google?"
+"If I could show you exactly where you're getting beat and what we'd fix first... would you be open to a quick 15 or 20 minute chat?"
+
+THE CLOSE (Call to Action)
+"Honestly, the easiest way to see if it makes sense is just a quick 15 or 20 minute chat."
+"I can show you what a couple other guys are doing."
+"You'd either be meeting with me, or Noah — he's the owner."
+"What's easier for you, mornings or afternoons?"
+
+THE CALENDAR & EMAIL STEP
+
+Step A: Ask for Morning/Afternoon Preference
+Ask: "What's easier for you, mornings or afternoons?"
+
+Wait for their response. They will say either "mornings", "morning", "afternoons", "afternoon", or something similar.
+
+Step B: Ask for Specific Time
+After they choose mornings or afternoons, ask: "What time works best then?"
+
+Wait for their response. They might say something like "10am", "2pm", "around 3", etc.
+
+Step C: Ask for Day
+After they give a time, ask: "What day would you be most free?"
+
+Wait for their response. They might say "Tuesday", "tomorrow", "next week", "Monday", etc.
+
+Step D: Confirm the Time and Date
+**CRITICAL: After they provide the day, simply confirm the time and date they mentioned. DO NOT check availability yet.**
+Example: If they said "10am" and "Tuesday", say: "Does Tuesday at 10am work?"
+
+Wait for their confirmation (they'll say "yes", "sure", "that works", etc.).
+
+**HANDLING VAGUE TIME PREFERENCES (mornings/afternoons/evenings):**
+- If customer says "mornings", "afternoons", or "evenings" → IMMEDIATELY call checkAvailability with that preference (e.g., checkAvailability("mornings"))
+- The tool will return suggested_times (like ["9am", "10am", "11am"]) and a message
+- Read the message to the customer and ask them to pick one of the suggested times
+- Once they pick a specific time, continue to ask for the day, then confirm as above
+
+Step E: Check Calendar Availability
+**ONLY AFTER they confirm the time works, then check availability.**
+After they confirm (say "yes", "sure", etc.), IMMEDIATELY combine their answers (day + time) and call the checkAvailability tool.
+Example: If they confirmed "Tuesday at 10am", call checkAvailability("Tuesday at 10am") RIGHT NOW. Do not say "let me check" - just call the tool silently.
+
+After the tool returns:
+- If tool says available: "Perfect, that time works for me too."
+- If tool says busy and gives next_available_time: "Ah okay — sorry about that. Looks like the closest open time is [next_available_time]. Would that work?"
+
+Step F: Email Collection
+"Okay, to lock that in... what's the best email to send the calendar invite to?"
+
+Wait for them to provide their email. They might spell it out letter by letter like "i t z n t p at Gmail dot co".
+
+Step G: Verify Email Phonetically
+After they provide the email, you MUST verify it by saying it phonetically (as words, not letter by letter).
+
+CRITICAL RULES FOR EMAIL VERIFICATION:
+- Say the username part (before @) phonetically as a word: "john" (NOT "j-o-h-n")
+- Say "at" as a word
+- Say the domain name (like gmail) phonetically as a word: "gmail" (NOT "g-m-a-i-l")
+- Say "dot" as a word
+- Say the extension (like com) as a word: "com" (not spelled out)
+
+Examples:
+- If they said "john@gmail.com", you say: "Just to make sure I got that right... that was john at gmail dot com. Is that correct?"
+- If they said "i t z n t p at Gmail dot co", you say: "Just to make sure I got that right... that was itzntp at gmail dot co. Is that correct?"
+
+MANDATORY: Say the email phonetically as words. Do NOT spell it out letter by letter. Say it naturally like you would read an email address out loud.
+
+Wait for their confirmation (they'll say "yes", "correct", "that's right", etc.).
+
+Step H: The Booking
+**STOP TALKING IMMEDIATELY** and call schedule_meeting(email="[the email you collected]", dateTime="[the agreed time]").
+Example: If email is "john@gmail.com" and time is "Tuesday at 10am" (from combining "mornings", "10am", "Tuesday"), call schedule_meeting(email="john@gmail.com", dateTime="Tuesday at 10am") RIGHT NOW.
+
+Do not say "let me schedule that" or "I'll create the event" - just call the tool immediately.
+
+Step I: POST-BOOKING FLOW (After schedule_meeting completes successfully)
+
+The Confirmation:
+After the schedule_meeting tool completes, say: "Okay, perfect... I just sent that invite over. Let me know when you see it pop up?"
+
+(Pause and wait for their response)
+
+If they say yes / got it / I see it:
+Say: "Perfect."
+
+The Google Glitch:
+Say: "Okay, cool. Could you do me one quick favor and add it to your calendar right now?"
+Say: "Google's been a little weird lately... and sometimes the meeting doesn't sync unless you hit accept."
+
+(Pause)
+
+The Commitment Check:
+Say: "Alright, so I've got you down for [the time they agreed to, e.g., 'Tuesday at 10am']. Is there any reason at all you wouldn't be able to make that time?"
+
+(Pause — expect 'no' or 'no reason' or similar)
+
+UPDATED EXIT (more conversational, natural):
+Say: "Alright, you should be all set then."
+Say: "Thanks {customer_name}... I'll talk to you soon."
+Say: "Bye! See you then!"
+
+**CRITICAL: IMMEDIATELY after saying "See you then!", you MUST call the end_call() tool to hang up the phone. Do NOT wait for their reply - just call end_call() right away.**
+
+OBJECTION HANDLING (unchanged except where noted)
+
+"Not interested":
+"Totally understood. I know you're likely on a job site."
+"Would it be okay if I just text you my portfolio link? That way you can look at it when you're off the clock."
+
+"Is this AI?"
+"I'm a digital assistant for the team here in San Jose, helping them get in touch with local businesses."
+"But I can get a human on the line if you prefer?"
+
+Hostile/Angry:
+"Sorry about that, I can take you off the list. Have a good one."
+Trigger endCall."""
+
+    chat_ctx = llm.ChatContext(
+        items=[
+            llm.ChatMessage(
+                role="system",
+                content=[system_prompt_text],
             )
         ]
     )
@@ -1808,11 +2046,18 @@ Trigger endCall."""
     
     # Option 2: OpenAI (recommended if you have API key - better rate limits)
     # Requires OPENAI_API_KEY environment variable
-    llm_provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    # Load from config.json if available, otherwise use env vars
+    if CONFIG_MANAGER_AVAILABLE:
+        llm_provider = get_config_value("agent.llm_provider", "groq").lower()
+    else:
+        llm_provider = os.getenv("LLM_PROVIDER", "groq").lower()
     if llm_provider == "openai":
         # Using gpt-4o-mini for cost efficiency, but gpt-4o has better tool calling
         # If tools aren't being called, try switching to "gpt-4o" for better function calling
-        llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        if CONFIG_MANAGER_AVAILABLE:
+            llm_model = get_config_value("agent.llm_model", "gpt-4o-mini")
+        else:
+            llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip().strip('"').strip("'")
         if openai_api_key:
             # Pass API key explicitly if available
@@ -1821,7 +2066,10 @@ Trigger endCall."""
             llm_instance = openai.LLM(model=llm_model)
     elif llm_provider == "openai-realtime":
         # Use the specified realtime model
-        realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview-2024-12-17")
+        if CONFIG_MANAGER_AVAILABLE:
+            realtime_model = get_config_value("agent.openai_realtime_model", "gpt-4o-mini-realtime-preview-2024-12-17")
+        else:
+            realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview-2024-12-17")
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip().strip('"').strip("'")
         if not openai_api_key:
             logger.error("❌ OPENAI_API_KEY is required for OpenAI Realtime model but not found")
@@ -1871,28 +2119,42 @@ Trigger endCall."""
     
     # Configuration for delays and timing
     # Adjust these values to control when agent speaks and STT behavior
-    INITIAL_GREETING_DELAY = float(os.getenv("INITIAL_GREETING_DELAY", "1.0"))  # seconds to wait before first greeting
-    MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.5"))  # min delay before considering user done speaking
-    MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "15.0"))  # max delay before forcing turn end (increased for email collection - people spell emails very slowly letter by letter like "i t z n t p at Gmail dot co")
-    NO_RESPONSE_TIMEOUT = float(os.getenv("NO_RESPONSE_TIMEOUT", "7.0"))  # seconds to wait after greeting for user to speak before hanging up (default 7 seconds)
-    INITIAL_SILENCE_WAIT = float(os.getenv("INITIAL_SILENCE_WAIT", "5.0"))  # seconds to wait for user to speak before agent says "Hello?" (default 5 seconds)
+    # Load from config.json if available, otherwise use env vars
+    if CONFIG_MANAGER_AVAILABLE:
+        INITIAL_GREETING_DELAY = float(get_config_value("call_behavior.initial_greeting_delay", "1.0"))
+        MIN_ENDPOINTING_DELAY = float(get_config_value("call_behavior.min_endpointing_delay", "0.5"))
+        MAX_ENDPOINTING_DELAY = float(get_config_value("call_behavior.max_endpointing_delay", "15.0"))
+        NO_RESPONSE_TIMEOUT = float(get_config_value("call_behavior.no_response_timeout", "7.0"))
+        INITIAL_SILENCE_WAIT = float(get_config_value("call_behavior.initial_silence_wait", "5.0"))
+    else:
+        INITIAL_GREETING_DELAY = float(os.getenv("INITIAL_GREETING_DELAY", "1.0"))  # seconds to wait before first greeting
+        MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.5"))  # min delay before considering user done speaking
+        MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "15.0"))  # max delay before forcing turn end (increased for email collection - people spell emails very slowly letter by letter like "i t z n t p at Gmail dot co")
+        NO_RESPONSE_TIMEOUT = float(os.getenv("NO_RESPONSE_TIMEOUT", "7.0"))  # seconds to wait after greeting for user to speak before hanging up (default 7 seconds)
+        INITIAL_SILENCE_WAIT = float(os.getenv("INITIAL_SILENCE_WAIT", "5.0"))  # seconds to wait for user to speak before agent says "Hello?" (default 5 seconds)
     
     # TTS Configuration - ElevenLabs voice with quota check
     # Get voice ID from environment variable, or use the specified default
     # You can find voice IDs in your ElevenLabs dashboard: https://elevenlabs.io/
     # NOTE: The voice must be in your ElevenLabs account for websocket streaming to work
-    ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "6AUOG2nbfr0yFEeI0784")
+    # Load from config.json if available, otherwise use env vars
+    if CONFIG_MANAGER_AVAILABLE:
+        ELEVENLABS_VOICE_ID = get_config_value("agent.elevenlabs_voice_id", "6AUOG2nbfr0yFEeI0784")
+        TTS_SPEED = float(get_config_value("agent.tts_speed", "1.0"))
+    else:
+        ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "6AUOG2nbfr0yFEeI0784")
+        TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
+    
     # ElevenLabs API key - can be set as ELEVEN_API_KEY or ELEVENLABS_API_KEY
     # The plugin automatically checks ELEVEN_API_KEY env var if not passed
     ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
     
     # TTS Speed configuration (0.7 to 1.2, default 1.0 = normal speed)
     # 0.7 = slower, 1.2 = faster
-    # You can set TTS_SPEED in .env.local to adjust speaking speed
-    TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
-    if TTS_SPEED < 0.5 or TTS_SPEED > 1.5:
-        logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.5-1.5). Clamping to valid range.")
-        TTS_SPEED = max(0.5, min(1.5, TTS_SPEED))
+    # Clamp to valid range for ElevenLabs API
+    if TTS_SPEED < 0.7 or TTS_SPEED > 1.2:
+        logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.7-1.2). Clamping to valid range.")
+        TTS_SPEED = max(0.7, min(1.2, TTS_SPEED))
     
     # Check ElevenLabs quota before using it
     USE_ELEVENLABS = False

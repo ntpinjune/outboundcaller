@@ -1,0 +1,50 @@
+{
+  "agent": {
+    "llm_provider": "groq",
+    "llm_model": "gpt-4o-mini",
+    "openai_realtime_model": "gpt-4o-mini-realtime-preview-2024-12-17",
+    "tts_provider": "elevenlabs",
+    "elevenlabs_voice_id": "6AUOG2nbfr0yFEeI0784",
+    "tts_speed": 1.0,
+    "stt_provider": "deepgram"
+  },
+  "call_behavior": {
+    "initial_greeting_delay": 1.0,
+    "min_endpointing_delay": 0.5,
+    "max_endpointing_delay": 15.0,
+    "no_response_timeout": 7.0,
+    "initial_silence_wait": 5.0,
+    "max_call_duration": 300
+  },
+  "call_dispatch": {
+    "call_delay_seconds": 5,
+    "wait_for_call_completion": true,
+    "call_completion_check_interval": 10,
+    "max_wait_time": 600,
+    "max_retries": 3,
+    "retry_no_answer": true
+  },
+  "integrations": {
+    "livekit_url": "",
+    "livekit_api_key": "",
+    "livekit_api_secret": "",
+    "sip_outbound_trunk_id": "",
+    "google_sheet_id": "",
+    "google_sheet_name": "Sheet1",
+    "aws_bucket_name": "",
+    "aws_region": "us-east-1",
+    "aws_access_key_id": "",
+    "aws_secret_access_key": "",
+    "gcp_bucket_name": "",
+    "gcp_credentials": "",
+    "twilio_account_sid": "",
+    "twilio_auth_token": "",
+    "twilio_from_number": ""
+  },
+  "observability": {
+    "langfuse_public_key": "",
+    "langfuse_secret_key": "",
+    "langfuse_base_url": "https://cloud.langfuse.com"
+  },
+  "system_prompt": ""
+}

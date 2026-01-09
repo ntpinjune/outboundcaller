@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Outbound Caller Agent - Configuration</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📞 Outbound Caller Agent Configuration</h1>
+            <p class="subtitle">Configure your agent settings without code changes</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab-button active" data-tab="agent">Agent Settings</button>
+            <button class="tab-button" data-tab="behavior">Call Behavior</button>
+            <button class="tab-button" data-tab="prompt">System Prompt</button>
+            <button class="tab-button" data-tab="integrations">Integrations</button>
+            <button class="tab-button" data-tab="dispatch">Call Dispatch</button>
+        </div>
+
+        <div id="status-message" class="status-message"></div>
+
+        <!-- Agent Settings Tab -->
+        <div class="tab-content active" id="agent-tab">
+            <h2>Agent Settings</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="llm-provider">LLM Provider</label>
+                    <select id="llm-provider">
+                        <option value="groq">Groq</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="openai-realtime">OpenAI Realtime</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="llm-model">LLM Model</label>
+                    <input type="text" id="llm-model" placeholder="gpt-4o-mini">
+                </div>
+                <div class="form-group">
+                    <label for="tts-voice-id">ElevenLabs Voice ID</label>
+                    <input type="text" id="tts-voice-id" placeholder="6AUOG2nbfr0yFEeI0784">
+                </div>
+                <div class="form-group">
+                    <label for="tts-speed">TTS Speed</label>
+                    <input type="range" id="tts-speed" min="0.7" max="1.2" step="0.1" value="1.0">
+                    <span id="tts-speed-value">1.0</span>
+                </div>
+                <div class="form-group">
+                    <label for="stt-provider">STT Provider</label>
+                    <select id="stt-provider">
+                        <option value="deepgram">Deepgram</option>
+                        <option value="openai-realtime">OpenAI Realtime</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Call Behavior Tab -->
+        <div class="tab-content" id="behavior-tab">
+            <h2>Call Behavior Settings</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="initial-greeting-delay">Initial Greeting Delay (seconds)</label>
+                    <input type="number" id="initial-greeting-delay" step="0.1" min="0" value="1.0">
+                </div>
+                <div class="form-group">
+                    <label for="min-endpointing-delay">Min Endpointing Delay (seconds)</label>
+                    <input type="number" id="min-endpointing-delay" step="0.1" min="0" value="0.5">
+                </div>
+                <div class="form-group">
+                    <label for="max-endpointing-delay">Max Endpointing Delay (seconds)</label>
+                    <input type="number" id="max-endpointing-delay" step="0.1" min="0" value="15.0">
+                </div>
+                <div class="form-group">
+                    <label for="no-response-timeout">No Response Timeout (seconds)</label>
+                    <input type="number" id="no-response-timeout" step="0.1" min="0" value="7.0">
+                </div>
+                <div class="form-group">
+                    <label for="initial-silence-wait">Initial Silence Wait (seconds)</label>
+                    <input type="number" id="initial-silence-wait" step="0.1" min="0" value="5.0">
+                </div>
+                <div class="form-group">
+                    <label for="max-call-duration">Max Call Duration (seconds)</label>
+                    <input type="number" id="max-call-duration" min="0" value="300">
+                </div>
+            </div>
+        </div>
+
+        <!-- System Prompt Tab -->
+        <div class="tab-content" id="prompt-tab">
+            <h2>System Prompt Editor</h2>
+            <p class="help-text">Edit the system prompt that controls the agent's conversation flow. Changes take effect on the next call.</p>
+            <textarea id="system-prompt" rows="30" placeholder="Loading system prompt..."></textarea>
+            <div class="button-group">
+                <button class="btn btn-primary" onclick="savePrompt()">Save Prompt</button>
+                <button class="btn btn-secondary" onclick="loadPrompt()">Reload</button>
+            </div>
+        </div>
+
+        <!-- Integrations Tab -->
+        <div class="tab-content" id="integrations-tab">
+            <h2>Integration Settings</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="livekit-url">LiveKit URL</label>
+                    <input type="text" id="livekit-url" placeholder="wss://your-project.livekit.cloud">
+                </div>
+                <div class="form-group">
+                    <label for="sip-trunk-id">SIP Outbound Trunk ID</label>
+                    <input type="text" id="sip-trunk-id" placeholder="ST_xxxxx">
+                </div>
+                <div class="form-group">
+                    <label for="google-sheet-id">Google Sheet ID</label>
+                    <input type="text" id="google-sheet-id" placeholder="1hpr2PnycZIhXSBuzKFTyiLBpivgP5oq3sD1bf3vwcQU">
+                </div>
+                <div class="form-group">
+                    <label for="google-sheet-name">Google Sheet Name</label>
+                    <input type="text" id="google-sheet-name" placeholder="Sheet1">
+                </div>
+                <div class="form-group">
+                    <label for="aws-bucket">AWS S3 Bucket Name</label>
+                    <input type="text" id="aws-bucket" placeholder="my-call-recordings">
+                </div>
+                <div class="form-group">
+                    <label for="aws-region">AWS Region</label>
+                    <input type="text" id="aws-region" placeholder="us-east-1">
+                </div>
+            </div>
+            <p class="help-text">⚠️ Note: API keys and secrets should be set via environment variables (.env.local) for security.</p>
+        </div>
+
+        <!-- Call Dispatch Tab -->
+        <div class="tab-content" id="dispatch-tab">
+            <h2>Test Call</h2>
+            <div class="test-call-section">
+                <p class="help-text">Enter your phone number below to receive a test call from the agent. Make sure your agent is running!</p>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="test-phone-number">Phone Number *</label>
+                        <input type="tel" id="test-phone-number" placeholder="+1234567890" required onkeypress="if(event.key==='Enter') dispatchTestCall()">
+                        <small>Include country code (e.g., +1 for US)</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="test-name">Your Name (optional)</label>
+                        <input type="text" id="test-name" placeholder="Test Customer">
+                    </div>
+                    <div class="form-group">
+                        <label for="test-business-name">Business Name (optional)</label>
+                        <input type="text" id="test-business-name" placeholder="Your Business">
+                    </div>
+                </div>
+                <button class="btn btn-primary btn-large" onclick="dispatchTestCall()">📞 Make Test Call</button>
+                <div id="test-call-status" class="test-call-status"></div>
+            </div>
+            
+            <hr style="margin: 30px 0; border: 1px solid #e0e0e0;">
+            
+            <h2>Call Dispatch Settings</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="call-delay-seconds">Call Delay (seconds)</label>
+                    <input type="number" id="call-delay-seconds" min="0" value="5">
+                </div>
+                <div class="form-group">
+                    <label for="max-retries">Max Retries</label>
+                    <input type="number" id="max-retries" min="0" value="3">
+                </div>
+                <div class="form-group">
+                    <label for="wait-for-completion">
+                        <input type="checkbox" id="wait-for-completion" checked>
+                        Wait for call completion before next call
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label for="retry-no-answer">
+                        <input type="checkbox" id="retry-no-answer" checked>
+                        Retry "No Answer" calls
+                    </label>
+                </div>
+            </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="action-bar">
+            <button class="btn btn-primary" onclick="saveConfig()">💾 Save Configuration</button>
+            <button class="btn btn-secondary" onclick="loadConfig()">🔄 Reload</button>
+            <button class="btn btn-secondary" onclick="testConnection()">🔌 Test Connection</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
