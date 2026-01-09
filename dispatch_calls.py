@@ -690,9 +690,16 @@ def process_calls(service, pending_rows: List[Dict[str, Any]]):
         update_sheet_cell(service, row_number, "Status", "Dispatched")
         update_sheet_cell(service, row_number, "Last Called", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         
-        # Update retry count if this is a retry
+        # Update retry count if this is a retry and column exists
         if is_retry and retry_count > 0:
-            update_sheet_cell(service, row_number, "Retry Count", str(retry_count))
+            # Check if column exists first to avoid warning logs
+            headers = service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{SHEET_NAME}!A1:Z1"
+            ).execute().get("values", [[]])[0]
+            
+            if get_column_index(headers, "Retry Count") is not None:
+                update_sheet_cell(service, row_number, "Retry Count", str(retry_count))
         
         # Dispatch to LiveKit (try CLI first, fallback to HTTP)
         job_id = dispatch_to_livekit_cli(row_data)

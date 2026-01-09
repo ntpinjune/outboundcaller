@@ -17,7 +17,8 @@ try:
     from langfuse import Langfuse
     from langfuse.decorators import langfuse_context, observe
     LANGFUSE_AVAILABLE = True
-except ImportError:
+except (ImportError, Exception):
+    # Catch all exceptions including Python 3.14 compatibility issues with pydantic v1
     LANGFUSE_AVAILABLE = False
 
 from livekit import rtc, api
@@ -42,8 +43,11 @@ from livekit.plugins import (
     cartesia,
     elevenlabs,
     silero,
-    noise_cancellation,  # noqa: F401
 )
+try:
+    from livekit.plugins import noise_cancellation  # noqa: F401
+except ImportError:
+    pass  # noise_cancellation is optional
 
 
 
@@ -450,6 +454,7 @@ class OutboundCaller(Agent):
         """
         from livekit.agents import ModelSettings
         from typing import AsyncIterable
+        from livekit.agents._exceptions import APIError
         
         # Accumulate text that will be spoken
         accumulated_text = ""
@@ -491,7 +496,7 @@ class OutboundCaller(Agent):
                 })
                 logger.info(f"📝 [TTS_NODE] Captured agent transcript (final): {text_to_add[:100]}...")
         
-        # Process text and get audio
+        # Process text and get audio with error handling
         processed_text = intercepted_text()
         return Agent.default.tts_node(self, processed_text, model_settings)
     
@@ -650,37 +655,37 @@ class OutboundCaller(Agent):
                     items_count = len(chat_ctx.items) if hasattr(chat_ctx.items, '__len__') else 'unknown'
                     logger.info(f"📝 chat_ctx.items available, count: {items_count}")
                     for idx, item in enumerate(chat_ctx.items):
-                if isinstance(item, llm.ChatMessage):
-                    role = item.role
-                    # Get the text content from the message
-                    content_text = ""
-                    if isinstance(item.content, str):
-                        content_text = item.content
-                    elif isinstance(item.content, list):
-                        # Handle list of content blocks (text, images, etc.)
-                        for block in item.content:
-                            if isinstance(block, str):
-                                content_text += block
-                            elif hasattr(block, 'text'):
-                                content_text += block.text
-                    
-                    # Map roles to readable names
-                    if role == "user":
-                        speaker = "Customer"
-                    elif role == "assistant":
-                        speaker = "Lia"
-                    elif role == "system":
-                        continue  # Skip system messages
-                    else:
-                        speaker = role.title()
-                    
-                    if content_text.strip():
-                        transcript_lines.append(f"{speaker}: {content_text.strip()}")
+                        if isinstance(item, llm.ChatMessage):
+                            role = item.role
+                            # Get the text content from the message
+                            content_text = ""
+                            if isinstance(item.content, str):
+                                content_text = item.content
+                            elif isinstance(item.content, list):
+                                # Handle list of content blocks (text, images, etc.)
+                                for block in item.content:
+                                    if isinstance(block, str):
+                                        content_text += block
+                                    elif hasattr(block, 'text'):
+                                        content_text += block.text
+                            
+                            # Map roles to readable names
+                            if role == "user":
+                                speaker = "Customer"
+                            elif role == "assistant":
+                                speaker = "Lia"
+                            elif role == "system":
+                                continue  # Skip system messages
+                            else:
+                                speaker = role.title()
+                            
+                            if content_text.strip():
+                                transcript_lines.append(f"{speaker}: {content_text.strip()}")
                                 logger.info(f"📝 Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
             
                     if transcript_lines:
                         logger.info(f"✅ Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
-            return "\n".join(transcript_lines)
+                        return "\n".join(transcript_lines)
                 else:
                     logger.warning("📝 chat_ctx.items not available")
             
@@ -1430,6 +1435,97 @@ class OutboundCaller(Agent):
         return "ending call due to voicemail"
 
 
+async def start_call_recording(ctx: JobContext, phone_number: str, room_name: str) -> Optional[str]:
+    """
+    Start egress recording for the call using LiveKit's RoomCompositeEgressRequest.
+    
+    Returns:
+        Egress ID if recording started successfully, None otherwise
+    """
+    try:
+        # Check for AWS S3 configuration
+        aws_bucket = os.getenv("AWS_BUCKET_NAME")
+        aws_region = os.getenv("AWS_REGION", "us-east-1")
+        aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        
+        # Check for GCP configuration
+        gcp_bucket = os.getenv("GCP_BUCKET_NAME")
+        gcp_credentials = os.getenv("GCP_CREDENTIALS")  # JSON-encoded credentials
+        
+        # Determine storage type
+        use_s3 = aws_bucket and aws_access_key and aws_secret_key
+        use_gcp = gcp_bucket and gcp_credentials
+        
+        if not use_s3 and not use_gcp:
+            logger.warning("⚠️  No recording storage configured. Set AWS_* or GCP_* environment variables to enable recording.")
+            return None
+        
+        # Create filename with phone number and timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Remove + and special chars from phone number for filename
+        phone_clean = phone_number.replace("+", "").replace("-", "").replace(" ", "")
+        filename = f"calls/{phone_clean}_{timestamp}.ogg"
+        
+        # Build file output configuration
+        if use_s3:
+            file_output = api.EncodedFileOutput(
+                file_type=api.EncodedFileType.OGG,
+                filepath=filename,
+                s3=api.S3Upload(
+                    bucket=aws_bucket,
+                    region=aws_region,
+                    access_key=aws_access_key,
+                    secret=aws_secret_key,
+                ),
+            )
+            logger.info(f"📹 Starting S3 recording: s3://{aws_bucket}/{filename}")
+        else:  # use_gcp
+            file_output = api.EncodedFileOutput(
+                file_type=api.EncodedFileType.OGG,
+                filepath=filename,
+                gcp=api.GCPUpload(
+                    credentials=gcp_credentials,
+                    bucket=gcp_bucket,
+                ),
+            )
+            logger.info(f"📹 Starting GCP recording: gs://{gcp_bucket}/{filename}")
+        
+        # Create egress request
+        req = api.RoomCompositeEgressRequest(
+            room_name=room_name,
+            audio_only=True,  # Only record audio for phone calls
+            file_outputs=[file_output],
+        )
+        
+        # Start egress recording
+        # Get LiveKit credentials from environment
+        livekit_url = os.getenv("LIVEKIT_URL", "").replace("wss://", "https://").replace("ws://", "http://")
+        livekit_api_key = os.getenv("LIVEKIT_API_KEY", "")
+        livekit_api_secret = os.getenv("LIVEKIT_API_SECRET", "")
+        
+        if not livekit_url or not livekit_api_key or not livekit_api_secret:
+            logger.warning("⚠️  LiveKit credentials not configured. Cannot start recording.")
+            return None
+        
+        lkapi = api.LiveKitAPI(
+            url=livekit_url,
+            api_key=livekit_api_key,
+            api_secret=livekit_api_secret,
+        )
+        egress_info = await lkapi.egress.start_room_composite_egress(req)
+        await lkapi.aclose()
+        
+        egress_id = egress_info.egress_id if hasattr(egress_info, 'egress_id') else None
+        logger.info(f"✅ Recording started successfully. Egress ID: {egress_id}")
+        return egress_id
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start call recording: {e}")
+        logger.exception("Recording error details:")
+        return None
+
+
 async def entrypoint(ctx: JobContext):
     # Setup Langfuse OpenTelemetry tracing (if available)
     setup_langfuse_telemetry()
@@ -1445,6 +1541,9 @@ async def entrypoint(ctx: JobContext):
     # - appointment_time: existing appointment time if applicable (optional)
     dial_info = json.loads(ctx.job.metadata)
     participant_identity = phone_number = dial_info["phone_number"]
+    
+    # Start call recording (if storage is configured)
+    recording_egress_id = await start_call_recording(ctx, phone_number, ctx.room.name)
     
     # Get customer info from metadata (can come from Google Sheets via n8n)
     customer_name = dial_info.get("name", "").strip()  # Empty string if no name provided
@@ -1791,9 +1890,9 @@ Trigger endCall."""
     # 0.7 = slower, 1.2 = faster
     # You can set TTS_SPEED in .env.local to adjust speaking speed
     TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
-    if TTS_SPEED < 0.7 or TTS_SPEED > 1.2:
-        logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.7-1.2). Clamping to valid range.")
-        TTS_SPEED = max(0.7, min(1.2, TTS_SPEED))
+    if TTS_SPEED < 0.5 or TTS_SPEED > 1.5:
+        logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.5-1.5). Clamping to valid range.")
+        TTS_SPEED = max(0.5, min(1.5, TTS_SPEED))
     
     # Check ElevenLabs quota before using it
     USE_ELEVENLABS = False
@@ -2174,14 +2273,19 @@ Trigger endCall."""
         if voice_default_settings:
             stability = voice_default_settings.get('stability', 0.5)
             similarity_boost = voice_default_settings.get('similarity_boost', 0.75)
-    else:
+        else:
             stability = 0.5
             similarity_boost = 0.75
+        
+        # Clamp speed to valid range (0.7-1.2) for ElevenLabs
+        valid_speed = max(0.7, min(1.2, TTS_SPEED))
+        if TTS_SPEED != valid_speed:
+            logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside valid range (0.7-1.2). Clamping to {valid_speed}")
         
         voice_settings = VoiceSettings(
             stability=stability,
             similarity_boost=similarity_boost,
-            speed=TTS_SPEED  # Configured speaking speed (0.7-1.2)
+            speed=valid_speed  # Configured speaking speed (clamped to 0.7-1.2 for ElevenLabs)
         )
         tts_instance = elevenlabs.TTS(
             voice_id=ELEVENLABS_VOICE_ID,
@@ -2218,6 +2322,7 @@ Trigger endCall."""
     session_started = asyncio.create_task(
         session.start(
             agent=agent,
+            record=True,
             room=ctx.room,
             room_input_options=RoomInputOptions(
                 # enable Krisp background voice and noise removal
@@ -2233,17 +2338,17 @@ Trigger endCall."""
     sip_participant_created = False
     
     for retry_attempt in range(max_sip_retries + 1):
-    try:
-        await ctx.api.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                room_name=ctx.room.name,
-                sip_trunk_id=outbound_trunk_id,
-                sip_call_to=phone_number,
-                participant_identity=participant_identity,
-                # function blocks until user answers the call, or if the call fails
-                wait_until_answered=True,
+        try:
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=outbound_trunk_id,
+                    sip_call_to=phone_number,
+                    participant_identity=participant_identity,
+                    # function blocks until user answers the call, or if the call fails
+                    wait_until_answered=True,
+                )
             )
-        )
             sip_participant_created = True
             break  # Success, exit retry loop
         except Exception as sip_error:
@@ -2758,7 +2863,7 @@ Trigger endCall."""
                 asyncio.create_task(send_transcript_on_end())
         
         try:
-            ctx.room.on(rtc.RoomEvent.PARTICIPANT_DISCONNECTED, on_participant_disconnected_event)
+            ctx.room.on("participant_disconnected", on_participant_disconnected_event)
             logger.info("✅ Subscribed to participant disconnect event")
         except Exception as e:
             logger.warning(f"⚠️  Could not subscribe to participant disconnect: {e}")
@@ -2805,7 +2910,7 @@ Trigger endCall."""
                         else:
                             response_text = "Hello?"
                         
-        await session.generate_reply(
+                        await session.generate_reply(
                             instructions=f"Say ONLY this: '{response_text}' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
                         )
                         greeting_sent_time = datetime.datetime.now()
