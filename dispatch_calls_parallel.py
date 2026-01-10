@@ -38,13 +38,28 @@ load_dotenv(dotenv_path=".env.local")
 MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "3"))  # Default to 3 for simplicity
 PARALLEL_DIALING_ENABLED = os.getenv("PARALLEL_DIALING_ENABLED", "true").lower() == "true"
 CALL_START_DELAY = float(os.getenv("CALL_START_DELAY", "1.0"))  # Increased delay to avoid overwhelming
-SKIP_SHEETS_UPDATES_DURING_DISPATCH = os.getenv("SKIP_SHEETS_UPDATES_DURING_DISPATCH", "true").lower() == "true"  # Skip sheet updates during dispatch to avoid thread safety issues
+SKIP_SHEETS_UPDATES_DURING_DISPATCH = os.getenv("SKIP_SHEETS_UPDATES_DURING_DISPATCH", "false").lower() == "true"  # Enable updates by default now that we have safe locking
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("parallel-dispatch")
+
+# Helper to emit events for web UI
+def emit_ui_event(event_type: str, data: Dict[str, Any]):
+    """Emit a JSON event to stdout for the web server to capture."""
+    try:
+        event = {
+            "type": "ui_event",
+            "event": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": data
+        }
+        print(json.dumps(event), flush=True)
+    except Exception as e:
+        logger.error(f"Failed to emit UI event: {e}")
+
 
 # Thread pool for synchronous operations
 executor = ThreadPoolExecutor(max_workers=10)
@@ -53,9 +68,26 @@ executor = ThreadPoolExecutor(max_workers=10)
 # This prevents segmentation faults from concurrent access
 sheets_api_lock = asyncio.Lock()
 
+
+import signal
+
+# Global flag for graceful shutdown
+keep_running = True
+
+def signal_handler(sig, frame):
+    """Handle termination signals."""
+    global keep_running
+    logger.info("🛑 Received termination signal! Stopping dispatcher...")
+    keep_running = False
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 # Semaphore to limit concurrent Google Sheets API calls (not thread-safe)
 # Limit to 1 concurrent update to avoid SSL/connection issues and segfaults
 sheets_api_semaphore = asyncio.Semaphore(1)
+
 
 # Track active calls
 active_calls: Dict[int, Dict[str, Any]] = {}
@@ -125,10 +157,26 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
     row_number = row_data["row_number"]
     phone_number = row_data["phone_number"]
     
+    emit_ui_event("call_starting", {
+        "row_number": row_number,
+        "phone_number": phone_number,
+        "name": row_data.get("name", "Unknown")
+    })
+    
     try:
+        # Update sheet to "Dispatching" BEFORE calling LiveKit to prevent duplicates
+        if not SKIP_SHEETS_UPDATES_DURING_DISPATCH:
+             try:
+                await update_sheet_cell_safe(
+                    service,
+                    row_number,
+                    "Status",
+                    "Dispatching..."
+                )
+             except Exception as e:
+                logger.warning(f"⚠️  [{row_number}] Failed to update status to Dispatching: {e}")
+
         # Dispatch to LiveKit (synchronous operation)
-        # Note: We update the sheet with "Dispatched" status AFTER successful dispatch
-        # This ensures we only mark as dispatched if the call actually started
         job_id = await asyncio.get_event_loop().run_in_executor(
             executor,
             dispatch_to_livekit_cli,
@@ -137,9 +185,14 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
         
         if job_id:
             logger.info(f"✅ [{row_number}] Dispatched call to {phone_number}")
+            emit_ui_event("call_dispatched", {
+                "row_number": row_number,
+                "phone_number": phone_number,
+                "job_id": job_id
+            })
+            
             
             # Always update sheet with "Dispatched" status when call is successfully dispatched
-            # This uses the safe update function with semaphore protection, so it's thread-safe
             try:
                 await update_sheet_cell_safe(
                     service,
@@ -156,7 +209,6 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
                 logger.debug(f"📝 [{row_number}] Updated sheet: Status=Dispatched")
             except Exception as e:
                 logger.warning(f"⚠️  [{row_number}] Failed to update sheet with Dispatched status: {e}")
-                # Continue anyway - the agent will update it when call completes
             
             # Track active call
             active_calls[row_number] = {
@@ -174,6 +226,11 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
             }
         else:
             logger.error(f"❌ [{row_number}] Failed to dispatch call to {phone_number}")
+            emit_ui_event("call_failed", {
+                "row_number": row_number,
+                "phone_number": phone_number,
+                "error": "Dispatch failed"
+            })
             if not SKIP_SHEETS_UPDATES_DURING_DISPATCH:
                 await update_sheet_cell_safe(
                 service,
@@ -190,6 +247,11 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
             
     except Exception as e:
         logger.error(f"❌ [{row_number}] Exception dispatching call: {e}")
+        emit_ui_event("call_failed", {
+            "row_number": row_number,
+            "phone_number": phone_number,
+            "error": str(e)
+        })
         if not SKIP_SHEETS_UPDATES_DURING_DISPATCH:
             try:
                 await update_sheet_cell_safe(
@@ -232,6 +294,11 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
                 status_lower = status.lower()
                 if status_lower in ["completed", "voicemail", "failed", "no answer"]:
                     logger.info(f"✅ [{row_number}] Call to {phone_number} completed with status: {status}")
+                    emit_ui_event("call_completed", {
+                        "row_number": row_number,
+                        "phone_number": phone_number,
+                        "status": status
+                    })
                     active_calls.pop(row_number, None)
                     return True
                 elif status_lower == "dispatched":
@@ -291,6 +358,10 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
         batch_num = (batch_start // MAX_CONCURRENT_CALLS) + 1
         total_batches = (total + MAX_CONCURRENT_CALLS - 1) // MAX_CONCURRENT_CALLS
         
+        if not keep_running:
+            logger.info("🛑 Stopping dispatch loop (signal received)")
+            break
+            
         logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} calls)...")
         
         # Dispatch this batch with semaphore limit
@@ -304,6 +375,8 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
         
         # Wait between batches to ensure previous calls have time to start
         if batch_end < total:
+            if not keep_running:
+                break
             wait_time = CALL_START_DELAY * MAX_CONCURRENT_CALLS
             logger.info(f"⏳ Waiting {wait_time}s before next batch...")
             await asyncio.sleep(wait_time)

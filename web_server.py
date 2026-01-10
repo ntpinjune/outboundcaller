@@ -18,7 +18,15 @@ import hmac
 import hashlib
 import requests
 
-from config_manager import load_config, save_config, get_config_value, load_system_prompt
+
+# Import from dispatch_calls
+# Make sure dispatch_calls.py is in the Python path
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from dispatch_calls import get_google_sheets_service, read_pending_rows
+
+from config_manager import load_config, save_config, get_config_value, load_system_prompt, get_effective_system_prompt
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +37,75 @@ CORS(app)  # Enable CORS for all routes
 
 # Configuration
 PORT = int(os.getenv("WEB_SERVER_PORT", "5000"))
-HOST = os.getenv("WEB_SERVER_HOST", "127.0.0.1")
+HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")  # 0.0.0.0 = listen on all interfaces (accessible from network)
+
+# Security: Basic authentication (set via environment variable)
+WEB_SERVER_PASSWORD = os.getenv("WEB_SERVER_PASSWORD", "")  # Set this to require password
+
+
+# Store for agent reload signal and background processes
+_agent_reload_requested = False
+_agent_reload_lock = threading.Lock()
+
+# Store active dispatcher process
+_dispatcher_process = None
+_dispatcher_lock = threading.Lock()
+
+# Event streaming
+import queue
+_event_subscribers = []  # List of Queue objects
+_event_monitor_thread = None
+
+
+
+
+def kill_process_tree(pid):
+    """Kill a process tree (including children) on Windows."""
+    try:
+        import subprocess
+        # Suppress output, check=True will raise CalledProcessError on failure
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)], 
+            check=True, 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL
+        )
+        return True
+    except subprocess.CalledProcessError:
+        # Process likely already dead or not found, which is what we wanted
+        return False
+    except Exception as e:
+        logger.error(f"Error killing process tree {pid}: {e}")
+        return False
+
+
+def check_auth():
+    """Check if request is authenticated (if password is set)."""
+    if not WEB_SERVER_PASSWORD:
+        return True  # No password set, allow access
+    
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Basic '):
+        return False
+    
+    try:
+        encoded = auth.split(' ', 1)[1]
+        decoded = base64.b64decode(encoded).decode('utf-8')
+        username, password = decoded.split(':', 1)
+        return password == WEB_SERVER_PASSWORD
+    except Exception:
+        return False
+
+
+@app.before_request
+def require_auth():
+    """Require authentication for API routes if password is set."""
+    if WEB_SERVER_PASSWORD and request.path.startswith('/api/'):
+        if not check_auth():
+            return jsonify({
+                "success": False,
+                "error": "Authentication required"
+            }), 401
 
 
 @app.route('/')
@@ -74,9 +150,14 @@ def update_config():
         
         # Save to file
         if save_config(new_config):
+            # Signal that agent should be reloaded
+            global _agent_reload_requested
+            with _agent_reload_lock:
+                _agent_reload_requested = True
+            
             return jsonify({
                 "success": True,
-                "message": "Configuration updated successfully"
+                "message": "Configuration updated successfully. Please restart the agent to apply changes."
             })
         else:
             return jsonify({
@@ -104,12 +185,14 @@ def get_config_schema():
 
 @app.route('/api/prompt', methods=['GET'])
 def get_prompt():
-    """Get current system prompt."""
+    """Get current system prompt that the agent is actually using."""
     try:
-        prompt = load_system_prompt()
+        effective_prompt = get_effective_system_prompt()
         return jsonify({
             "success": True,
-            "prompt": prompt
+            "prompt": effective_prompt["prompt"],
+            "source": effective_prompt["source"],
+            "is_default": effective_prompt["is_default"]
         })
     except Exception as e:
         logger.error(f"Error loading prompt: {e}")
@@ -136,9 +219,15 @@ def update_prompt():
         
         # Save
         if save_config(config):
+            # Signal that agent should be reloaded
+            global _agent_reload_requested
+            with _agent_reload_lock:
+                _agent_reload_requested = True
+            logger.info("System prompt updated and agent reload signaled")
             return jsonify({
                 "success": True,
-                "message": "System prompt updated successfully"
+                "message": "System prompt updated successfully. Please restart the agent process to apply changes.",
+                "reload_needed": True
             })
         else:
             return jsonify({
@@ -148,6 +237,61 @@ def update_prompt():
             
     except Exception as e:
         logger.error(f"Error updating prompt: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/piper/voices', methods=['GET'])
+def get_piper_voices():
+    """List available Piper TTS voice models."""
+    try:
+        voices = []
+        
+        # Define paths to check
+        paths_to_check = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "piper1-gpl"),
+            os.path.dirname(os.path.abspath(__file__))
+        ]
+        
+        # Helper to check directory
+        def scan_dir(directory):
+            if not os.path.exists(directory):
+                return
+            
+            for file in os.listdir(directory):
+                if file.endswith(".onnx"):
+                    # Found a model
+                    model_path = os.path.join(directory, file)
+                    config_path = model_path + ".json"
+                    
+                    # Create readable name
+                    name = file.replace(".onnx", "").replace("-", " ").title()
+                    if "En Us" in name:
+                        name = name.replace("En Us", "English (US)")
+                        
+                    voice_entry = {
+                        "name": name,
+                        "model_path": model_path,
+                        "config_path": config_path if os.path.exists(config_path) else "",
+                        "filename": file
+                    }
+                    
+                    # Avoid duplicates
+                    if not any(v["filename"] == file for v in voices):
+                        voices.append(voice_entry)
+
+        for path in paths_to_check:
+            scan_dir(path)
+            
+        return jsonify({
+            "success": True,
+            "voices": voices
+        })
+            
+    except Exception as e:
+        logger.error(f"Error listing Piper voices: {e}")
         return jsonify({
             "success": False,
             "error": str(e)
@@ -364,6 +508,226 @@ def dispatch_call():
         }), 500
 
 
+
+
+@app.route('/api/calls/preview', methods=['GET'])
+def preview_pending_calls():
+    """Get list of pending calls from Google Sheets."""
+    try:
+        service = get_google_sheets_service()
+        pending_rows = read_pending_rows(service)
+        
+        return jsonify({
+            "success": True,
+            "count": len(pending_rows),
+            "calls": pending_rows
+        })
+        
+    except Exception as e:
+        logger.error(f"Error previewing calls: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+
+def _monitor_dispatcher_output(process):
+    """Monitor output from dispatcher process and broadcast to subscribers."""
+    try:
+        # Read line by line
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+                
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Try to parse as JSON event
+            event_data = None
+            try:
+                if line.startswith('{') and 'ui_event' in line:
+                    data = json.loads(line)
+                    if data.get("type") == "ui_event":
+                        event_data = data
+            except:
+                pass
+                
+            # If not a structured event, treat as log
+            if not event_data:
+                event_data = {
+                    "type": "log",
+                    "timestamp": datetime.now().isoformat(),
+                    "message": line
+                }
+            
+            # Broadcast to all subscribers
+            dead_queues = []
+            for q in _event_subscribers:
+                try:
+                    q.put_nowait(event_data)
+                except queue.Full:
+                    dead_queues.append(q)
+                except Exception:
+                    dead_queues.append(q)
+            
+            # cleanup
+            for q in dead_queues:
+                if q in _event_subscribers:
+                    _event_subscribers.remove(q)
+                    
+    except Exception as e:
+        logger.error(f"Error monitoring dispatcher: {e}")
+    finally:
+        # Send finished event
+        final_event = {
+            "type": "control",
+            "timestamp": datetime.now().isoformat(),
+            "event": "process_ended"
+        }
+        for q in _event_subscribers:
+            try:
+                q.put(final_event)
+            except:
+                pass
+
+
+@app.route('/api/calls/parallel/events')
+def stream_dispatcher_events():
+    """Stream events from the dispatcher process via SSE."""
+    def gen():
+        q = queue.Queue()
+        _event_subscribers.append(q)
+        try:
+            # Send initial connected event
+            yield f"data: {json.dumps({'type': 'control', 'event': 'connected'})}\n\n"
+            
+            while True:
+                try:
+                    # Get event from queue (timeout to allow checking for disconnect)
+                    event = q.get(timeout=1.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except queue.Empty:
+                    # Keep alive
+                    yield f": keep-alive\n\n"
+        except GeneratorExit:
+            if q in _event_subscribers:
+                _event_subscribers.remove(q)
+        except Exception as e:
+            logger.error(f"Error in SSE stream: {e}")
+            if q in _event_subscribers:
+                _event_subscribers.remove(q)
+                
+    return app.response_class(gen(), mimetype='text/event-stream')
+
+
+@app.route('/api/calls/dispatch-parallel', methods=['POST'])
+def dispatch_parallel_calls():
+    """Trigger parallel dispatch of calls from Google Sheets."""
+    global _dispatcher_process
+    
+    try:
+        # Check if already running
+        with _dispatcher_lock:
+            if _dispatcher_process and _dispatcher_process.poll() is None:
+                return jsonify({
+                    "success": False,
+                    "error": "Dispatcher is already running",
+                    "pid": _dispatcher_process.pid
+                }), 409
+
+            script_path = os.path.join(os.path.dirname(__file__), "dispatch_calls_parallel.py")
+            if not os.path.exists(script_path):
+                 return jsonify({
+                    "success": False,
+                    "error": "dispatch_calls_parallel.py not found"
+                }), 404
+    
+            # Run in background
+            import sys
+            
+            # Use Popen to run in background
+            process = subprocess.Popen(
+                [sys.executable, script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout
+                text=True,
+                bufsize=1,  # Line buffered
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            
+            _dispatcher_process = process
+            
+            # Start monitoring thread
+            global _event_monitor_thread
+            _event_monitor_thread = threading.Thread(
+                target=_monitor_dispatcher_output,
+                args=(process,),
+                daemon=True
+            )
+            _event_monitor_thread.start()
+        
+        return jsonify({
+            "success": True,
+            "message": "Parallel call dispatch started",
+            "pid": process.pid
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting parallel dispatch: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/calls/stop-parallel', methods=['POST'])
+def stop_parallel_calls():
+    """Stop the running parallel dispatcher."""
+    global _dispatcher_process
+    
+    try:
+        with _dispatcher_lock:
+            if not _dispatcher_process:
+                return jsonify({
+                    "success": False,
+                    "error": "No dispatcher process running"
+                }), 404
+            
+            if _dispatcher_process.poll() is not None:
+                _dispatcher_process = None
+                return jsonify({
+                    "success": False,
+                    "error": "Dispatcher process already finished"
+                }), 409
+            
+            # Kill the process tree logic
+            pid = _dispatcher_process.pid
+            
+            # Try gentle terminate first
+            _dispatcher_process.terminate()
+            
+            # Use taskkill for force if needed (on Windows)
+            if os.name == 'nt':
+                 kill_process_tree(pid)
+            
+            _dispatcher_process = None
+            
+        return jsonify({
+            "success": True,
+            "message": f"Stopped dispatcher process {pid}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error stopping dispatcher: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+
 @app.route('/api/test/connection', methods=['POST'])
 def test_connection():
     """Test LiveKit connection."""
@@ -393,6 +757,98 @@ def test_connection():
         }), 500
 
 
+@app.route('/api/agent/reload', methods=['POST'])
+def reload_agent():
+    """Signal that agent should reload configuration (requires manual restart)."""
+    global _agent_reload_requested
+    
+    try:
+        with _agent_reload_lock:
+            _agent_reload_requested = True
+        
+        logger.info("Agent reload requested via web interface")
+        
+        return jsonify({
+            "success": True,
+            "message": "Agent reload requested. Please restart the agent process manually to apply changes.",
+            "note": "The agent process needs to be restarted for configuration changes to take effect."
+        })
+    except Exception as e:
+        logger.error(f"Error requesting agent reload: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route('/api/agent/status', methods=['GET'])
+def agent_status():
+    """Get agent status and reload request status."""
+    global _agent_reload_requested
+    
+    with _agent_reload_lock:
+        reload_requested = _agent_reload_requested
+        if reload_requested:
+            _agent_reload_requested = False  # Reset after reading
+    
+    return jsonify({
+        "success": True,
+        "reload_requested": reload_requested,
+        "message": "Reload requested - restart agent to apply changes" if reload_requested else "Agent running normally"
+    })
+
+
+
+@app.route('/api/agent/start', methods=['POST'])
+def start_agent():
+    """Start the LiveKit agent in a new terminal window."""
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), "agent.py")
+        if not os.path.exists(script_path):
+             return jsonify({
+                "success": False,
+                "error": "agent.py not found"
+            }), 404
+
+        import sys
+        import platform
+        
+        # Command to run (using the same python executable as web_server)
+        cmd = [sys.executable, script_path, "dev"]
+        
+        # On Windows, open in a new console window so user can see logs
+        if os.name == 'nt':
+            # CREATE_NEW_CONSOLE = 0x00000010
+            process = subprocess.Popen(
+                cmd,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                close_fds=True
+            )
+            message = "Agent started in new terminal window"
+        else:
+            # On generic Linux/Mac, just run in background
+            # A more advanced implementation might use xterm/gnome-terminal
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            message = "Agent started in background"
+            
+        return jsonify({
+            "success": True,
+            "message": message,
+            "pid": process.pid
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting agent: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint."""
@@ -415,8 +871,8 @@ def _deep_merge(base: Dict, override: Dict) -> Dict:
 
 def run_server(host=HOST, port=PORT, debug=False):
     """Run the Flask server."""
-    logger.info(f"🚀 Starting web server on http://{host}:{port}")
-    logger.info(f"📝 Access the configuration interface at http://{host}:{port}")
+    logger.info(f"Starting web server on http://{host}:{port}")
+    logger.info(f"Access the configuration interface at http://{host}:{port}")
     app.run(host=host, port=port, debug=debug)
 
 

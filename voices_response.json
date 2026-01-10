@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "voices": [
+    {
+      "config_path": "C:\\Users\\Nolan\\Desktop\\outboundcaller-1\\piper1-gpl\\en_US-lessac-medium.onnx.json",
+      "filename": "en_US-lessac-medium.onnx",
+      "model_path": "C:\\Users\\Nolan\\Desktop\\outboundcaller-1\\piper1-gpl\\en_US-lessac-medium.onnx",
+      "name": "En_Us Lessac Medium"
+    }
+  ]
+}

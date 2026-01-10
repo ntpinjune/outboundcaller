@@ -1,23 +1,32 @@
+# Use official Python runtime as a parent image
 FROM python:3.11-slim
 
-# Set working directory
+# Set environment variables
+# PYTHONDONTWRITEBYTECODE PREVENTS Python from writing pyc files to disc
+# PYTHONUNBUFFERED ensures stdout/stderr are flushed immediately (vital for logs)
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Set work directory
 WORKDIR /app
 
-# Install system dependencies (needed for some audio libraries)
-RUN apt-get update && apt-get install -y \
+# Install system dependencies
+# ffmpeg is REQUIRED for audio processing in LiveKit/Piper
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy the rest of the application
 COPY . .
 
-# Download required model files (if needed)
-# Uncomment if your agent needs to download models:
-# RUN python agent.py download-files
+# Create a volume for persistent data (like logs, config updates)
+VOLUME ["/app/data"]
 
-# Run the agent
-CMD ["python", "agent.py", "start"]
+# Default command (can be overridden in docker-compose)
+CMD ["python", "web_server.py"]

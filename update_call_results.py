@@ -96,13 +96,30 @@ def update_call_results(service, call_data: Dict[str, Any]):
                 ).execute()
                 
                 values = result.get("values", [])
+                # Try different phone column name variations
                 phone_idx = get_column_index(headers, "Phone Number")
+                if phone_idx is None:
+                    phone_idx = get_column_index(headers, "Phone_number")
+                if phone_idx is None:
+                    phone_idx = get_column_index(headers, "PhoneNumber")
+                if phone_idx is None:
+                    phone_idx = get_column_index(headers, "Phone")
                 
                 if phone_idx is not None:
+                    # Helper to normalize phone numbers for comparison
+                    def normalize_for_comparison(p):
+                        if not p: return ""
+                        return p.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
+
+                    search_phone = normalize_for_comparison(phone_number)
+                    
                     for i, row in enumerate(values, start=2):
-                        if len(row) > phone_idx and row[phone_idx].strip() == phone_number:
-                            row_number = i
-                            break
+                        if len(row) > phone_idx:
+                            sheet_phone = normalize_for_comparison(row[phone_idx])
+                            # Check for exact match or suffix match (to handle missing country codes)
+                            if sheet_phone == search_phone or (len(search_phone) >= 10 and len(sheet_phone) >= 10 and search_phone in sheet_phone) or (len(sheet_phone) >= 10 and sheet_phone in search_phone):
+                                row_number = i
+                                break
         
         if not row_number:
             logger.warning(f"Could not find row for phone number: {call_data.get('phone_number')}")
@@ -193,6 +210,14 @@ def update_call_results(service, call_data: Dict[str, Any]):
         # Update follow-up date (if callback requested)
         if "Follow-up Date" in headers and call_data.get("follow_up_date"):
             updates["Follow-up Date"] = call_data["follow_up_date"]
+
+        # Update Room Name
+        if "Room Name" in headers and call_data.get("room_name"):
+            updates["Room Name"] = call_data["room_name"]
+
+        # Update Session ID
+        if "Session ID" in headers and call_data.get("session_id"):
+            updates["Session ID"] = call_data["session_id"]
         
         # Batch update
         if updates:

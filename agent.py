@@ -44,6 +44,93 @@ from livekit.plugins import (
     elevenlabs,
     silero,
 )
+
+# Try to import Chatterbox TTS (optional)
+try:
+    from livekit_chatterbox_tts import ChatterboxTTS
+    CHATTERBOX_TTS_AVAILABLE = True
+except (ImportError, AttributeError, Exception) as e:
+    CHATTERBOX_TTS_AVAILABLE = False
+    # Use print instead of logger since logger is initialized later
+    print(f"ℹ️  Chatterbox TTS not available: {e}. Install httpx if you want to use it.")
+
+# Try to import Piper TTS (optional)
+try:
+    import sys
+    from pathlib import Path
+    
+    # Try to import OpenAI plugin
+    try:
+        from livekit.plugins.openai import TTS as OpenAITTS
+        OPENAI_TTS_AVAILABLE = True
+    except (ImportError, AttributeError):
+        OPENAI_TTS_AVAILABLE = False
+        print("ℹ️  OpenAI TTS plugin not available. Install livekit-plugins-openai to use it.")
+    
+    # First, try to import from installed piper-tts package (recommended - has pre-built C extensions)
+    try:
+        # Test if piper package is installed and working
+        import piper
+        # Try to test if espeakbridge is available (the C extension)
+        try:
+            from piper.phonemize_espeak import EspeakPhonemizer
+            # If this works, piper is properly installed with C extensions
+            piper_installed = True
+        except (ImportError, AttributeError):
+            # piper is installed but espeakbridge might not be compiled
+            piper_installed = False
+    except ImportError:
+        piper_installed = False
+    
+    # Use local-livekit-plugins package (recommended - CPU only, no GPU issues)
+    # DISABLED: This package version causes high-pitch issues with 16kHz voices (Amy Low)
+    # try:
+    #     from local_livekit_plugins import PiperTTS
+    #     PIPER_TTS_AVAILABLE = True
+    #     print("✅ Piper TTS plugin loaded (using local-livekit-plugins package - CPU only)")
+    # except ImportError:
+    if True:  # Force fallback behavior
+        # Fallback to custom implementation if package not available
+        if piper_installed:
+            # Use installed piper package, import livekit plugin from piper1-gpl folder
+            piper_path = Path(__file__).parent / "piper1-gpl"
+            if piper_path.exists():
+                # Only add to path if it exists, but installed piper takes precedence
+                if str(piper_path) not in sys.path:
+                    sys.path.insert(0, str(piper_path))
+            from livekit_piper_tts import TTS as PiperTTS
+            PIPER_TTS_AVAILABLE = True
+            print("✅ Piper TTS plugin loaded (using installed piper-tts package + local plugin)")
+        else:
+            # Try to use local source code (NOT RECOMMENDED - requires building C extensions)
+            piper_path = Path(__file__).parent / "piper1-gpl"
+            if piper_path.exists():
+                sys.path.insert(0, str(piper_path))
+                # Try importing from local source
+                from livekit_piper_tts import TTS as PiperTTS
+                PIPER_TTS_AVAILABLE = True
+                print("⚠️  Piper TTS loaded from local source (may not work - C extension not built)")
+                print("   To fix: Install piper-tts from PyPI: pip install piper-tts")
+            else:
+                raise ImportError("piper1-gpl folder not found")
+        
+except (ImportError, AttributeError, Exception) as e:
+    PIPER_TTS_AVAILABLE = False
+    # Use print instead of logger since logger is initialized later
+    error_msg = str(e)
+    if "espeakbridge" in error_msg.lower():
+        print(f"❌ Piper TTS not available: espeakbridge C extension not found")
+        print("   The C extension needs to be built or installed from PyPI.")
+        print("   To fix:")
+        print("   1. Install piper-tts from PyPI: pip install piper-tts")
+        print("   2. This will install pre-built wheels with compiled C extensions")
+        print("   3. Then restart the agent")
+    else:
+        print(f"ℹ️  Piper TTS not available: {e}")
+        print("   To use Piper TTS:")
+        print("   1. Install piper-tts from PyPI: pip install piper-tts")
+        print("   2. Download a voice model: python -m piper.download_voices en_US-lessac-medium")
+        print("   3. Restart the agent")
 try:
     from livekit.plugins import noise_cancellation  # noqa: F401
 except ImportError:
@@ -329,9 +416,14 @@ class OutboundCaller(Agent):
         current_time = now_pst.strftime("%I:%M %p")
         
         # Brief instructions for the Agent framework
-        # The full detailed prompt is in the entrypoint function as a system message
+        # If system_prompt is in dial_info, use it. Otherwise use default Lia.
+        if "system_prompt" in dial_info and dial_info["system_prompt"]:
+            instructions = dial_info["system_prompt"]
+        else:
+            instructions = f"""You are "Lia," a local employee for a landscaping marketing firm in San Jose. Be conversational, authentic, and real. Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like). Follow the detailed script provided in the system message. Customer name: {name}. Today is {today_date}, time is {current_time} PST."""
+        
         super().__init__(
-            instructions=f"""You are "Lia," a local employee for a landscaping marketing firm in San Jose. Be conversational, authentic, and real. Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like). Follow the detailed script provided in the system message. Customer name: {name}. Today is {today_date}, time is {current_time} PST."""
+            instructions=instructions
         )
         # keep reference to the participant for transfers
         self.participant: rtc.RemoteParticipant | None = None
@@ -421,6 +513,39 @@ class OutboundCaller(Agent):
         from livekit.agents._exceptions import APIStatusError, APIConnectionError
         
         try:
+            # Apply LLM temperature from config if set
+            # Get temperature from config manager (LLM_TEMPERATURE is defined in entrypoint scope, not accessible here)
+            try:
+                from config_manager import get_config_value
+                llm_temp = float(get_config_value("agent.llm_temperature", "1.0"))
+            except:
+                llm_temp = 1.0  # Default fallback
+            
+            # Update model_settings with temperature
+            # Try to set temperature on model_settings if it supports it
+            try:
+                if model_settings is None:
+                    # Create new ModelSettings with temperature
+                    model_settings = ModelSettings(temperature=llm_temp)
+                else:
+                    # Try to update existing model_settings
+                    if hasattr(model_settings, 'temperature'):
+                        model_settings.temperature = llm_temp
+                    elif isinstance(model_settings, dict):
+                        model_settings['temperature'] = llm_temp
+                    else:
+                        # Create new one with temperature, copying other settings
+                        try:
+                            # ModelSettings might be a dataclass - try to create with temperature
+                            model_settings = ModelSettings(temperature=llm_temp)
+                        except Exception as e:
+                            # Some LLM providers might not support temperature via ModelSettings
+                            # In that case, temperature should be set when creating the LLM instance
+                            logger.debug(f"Could not set temperature via ModelSettings: {e}")
+            except Exception as e:
+                logger.warning(f"Could not apply LLM temperature setting: {e}")
+                # Continue without temperature override
+            
             # Just pass through to default - no transcript capture here
             # Transcripts are captured in tts_node instead to avoid duplicates
             async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
@@ -740,6 +865,45 @@ class OutboundCaller(Agent):
         except Exception as e:
             logger.error(f"Error in auto-hangup after scheduling: {e}")
 
+    async def send_webhook_event(self, event_type: str, payload: dict):
+        """Send a webhook event to the configured Server URL."""
+        webhook_url = None
+        webhook_secret = None
+        
+        if CONFIG_MANAGER_AVAILABLE:
+            from config_manager import get_config_value
+            webhook_url = get_config_value("integrations.webhook_url")
+            webhook_secret = get_config_value("integrations.webhook_secret")
+        else:
+            webhook_url = os.getenv("WEBHOOK_URL")
+            webhook_secret = os.getenv("WEBHOOK_SECRET")
+            
+        if not webhook_url:
+            return
+
+        try:
+            headers = {"Content-Type": "application/json"}
+            if webhook_secret:
+                headers["X-Webhook-Secret"] = webhook_secret
+                
+            full_payload = {
+                "event": event_type,
+                "timestamp": datetime.datetime.now().isoformat(),
+                "agent_id": "outbound-caller",
+                "call_id": self.trace_id,
+                "payload": payload
+            }
+
+            logger.info(f"🚀 Sending webhook to {webhook_url}...")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(webhook_url, json=full_payload, headers=headers, timeout=10.0)
+                if response.status_code >= 200 and response.status_code < 300:
+                    logger.info(f"✅ Webhook sent successfully to {webhook_url}")
+                else:
+                    logger.warning(f"⚠️  Webhook failed with status {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.error(f"❌ Error sending webhook: {e}")
+
     async def send_call_results_to_sheets(self, call_status: str):
         """Update Google Sheets directly with call results (no Make.com needed)."""
         # Import here to avoid circular imports
@@ -842,6 +1006,8 @@ class OutboundCaller(Agent):
             "appointment_scheduled": self.appointment_scheduled,
             "appointment_time": appointment_time_str,  # Now in readable format
             "appointment_email": self.appointment_email,  # The email address
+            "room_name": getattr(self, "room_name", ""),
+            "session_id": getattr(self, "session_id", ""),
             "timestamp": datetime.datetime.now().isoformat(),
             "row_id": self.dial_info.get("row_id")
         }
@@ -855,6 +1021,12 @@ class OutboundCaller(Agent):
                 logger.warning(f"Failed to update Google Sheets with call results")
         except Exception as e:
             logger.error(f"Failed to update Google Sheets: {e}")
+        
+        # Send webhook event
+        try:
+            await self.send_webhook_event("call_completed", data)
+        except Exception as e:
+            logger.error(f"Error triggering webhook: {e}")
         
         # Update Langfuse trace with final call metadata
         if self.langfuse_trace:
@@ -1534,6 +1706,21 @@ async def start_call_recording(ctx: JobContext, phone_number: str, room_name: st
         return None
 
 
+def _get_noise_cancellation_filter(mode: str):
+    """Get noise cancellation filter based on mode."""
+    if mode == "none" or not mode:
+        return None
+    elif mode == "nc":
+        return noise_cancellation.NC()
+    elif mode == "bvc":
+        return noise_cancellation.BVC()
+    elif mode == "bvc_telephony":
+        return noise_cancellation.BVCTelephony()
+    else:
+        # Default to BVC Telephony
+        return noise_cancellation.BVCTelephony()
+
+
 async def entrypoint(ctx: JobContext):
     # Setup Langfuse OpenTelemetry tracing (if available)
     setup_langfuse_telemetry()
@@ -1559,6 +1746,48 @@ async def entrypoint(ctx: JobContext):
     business_name = dial_info.get("business_name", "").strip()  # Business name from Google Sheets
 
     # look up the user's phone number and appointment details
+    # Calculate dates/times needed for system prompt (moved up)
+    today = datetime.datetime.now()
+    tomorrow = today + timedelta(days=1)
+    tomorrow_date = tomorrow.strftime("%A, %B %d, %Y")
+    today_date = today.strftime("%A, %B %d, %Y")
+    
+    # Get current time in PST (moved up)
+    now_pst = datetime.datetime.now() - timedelta(hours=8)
+    current_time = now_pst.strftime("%I:%M %p")
+
+    # Load system prompt from config before creating agent
+    system_prompt_text = ""
+    if CONFIG_MANAGER_AVAILABLE:
+        custom_prompt = load_system_prompt()
+        if custom_prompt and custom_prompt.strip():
+            # Check for placeholders
+            has_placeholders = (
+                "{business_name}" in custom_prompt or 
+                "{customer_name}" in custom_prompt or 
+                "{today_date}" in custom_prompt or 
+                "{current_time}" in custom_prompt
+            )
+            
+            if has_placeholders:
+                try:
+                    system_prompt_text = custom_prompt.format(
+                        business_name=business_name,
+                        customer_name=customer_name,
+                        today_date=today_date,
+                        current_time=current_time
+                    )
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"⚠️  Could not format system prompt: {e}")
+                    system_prompt_text = custom_prompt
+            else:
+                system_prompt_text = custom_prompt
+            logger.info(f"✅ Pre-loaded custom system prompt ({len(system_prompt_text)} chars)")
+            
+            # Add to dial_info so OutboundCaller picks it up
+            dial_info["system_prompt"] = system_prompt_text
+
+    # look up the user's phone number and appointment details
     agent = OutboundCaller(
         name=customer_name,
         appointment_time=appointment_time,
@@ -1566,34 +1795,39 @@ async def entrypoint(ctx: JobContext):
     )
     
     # Store business name in agent for later use
-    business_name = dial_info.get("business_name", "").strip()
     agent.business_name = business_name
 
-    # Get current date and tomorrow's date for the system message (like the example)
-    today = datetime.datetime.now()
-    tomorrow = today + timedelta(days=1)
-    tomorrow_date = tomorrow.strftime("%A, %B %d, %Y")
-    today_date = today.strftime("%A, %B %d, %Y")
-    
-    # Create chat context with system message - Lia persona
-    # Get current time in PST
-    now_pst = datetime.datetime.now() - timedelta(hours=8)  # Approximate PST offset
-    current_time = now_pst.strftime("%I:%M %p")
-    
-    # Get business name for system prompt
-    business_name = dial_info.get("business_name", "").strip()
-
-    # Load system prompt from config.json if available, otherwise use default
-    if CONFIG_MANAGER_AVAILABLE:
+    # Load system prompt from config.json if available and not already loaded, otherwise use default
+    if CONFIG_MANAGER_AVAILABLE and not system_prompt_text:
         custom_prompt = load_system_prompt()
-        if custom_prompt:
-            # Use custom prompt from config, but still need to format it with variables
-            system_prompt_text = custom_prompt.format(
-                business_name=business_name,
-                customer_name=customer_name,
-                today_date=today_date,
-                current_time=current_time
-            ) if "{business_name}" in custom_prompt or "{customer_name}" in custom_prompt else custom_prompt
+        if custom_prompt and custom_prompt.strip():
+            # Use custom prompt from config, but still need to format it with variables if placeholders exist
+            # Check if prompt has placeholders that need formatting
+            has_placeholders = (
+                "{business_name}" in custom_prompt or 
+                "{customer_name}" in custom_prompt or 
+                "{today_date}" in custom_prompt or 
+                "{current_time}" in custom_prompt
+            )
+            
+            if has_placeholders:
+                try:
+                    # Format the prompt with variables
+                    system_prompt_text = custom_prompt.format(
+                        business_name=business_name,
+                        customer_name=customer_name,
+                        today_date=today_date,
+                        current_time=current_time
+                    )
+                except (KeyError, ValueError) as e:
+                    # If formatting fails (e.g., unexpected placeholders), use prompt as-is and log warning
+                    logger.warning(f"⚠️  Could not format system prompt (may contain unexpected placeholders): {e}")
+                    logger.warning("   Using prompt as-is without variable substitution")
+                    system_prompt_text = custom_prompt
+            else:
+                # No placeholders, use prompt as-is
+                system_prompt_text = custom_prompt
+            logger.info(f"✅ Using custom system prompt from config.json ({len(system_prompt_text)} chars)")
         else:
             # Use default prompt
             system_prompt_text = f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
@@ -1811,7 +2045,7 @@ Hostile/Angry:
 "Sorry about that, I can take you off the list. Have a good one."
 Trigger endCall."""
             system_prompt_text = system_prompt_text
-    else:
+    elif not system_prompt_text:
         # Default prompt (original) - use the full default prompt
         system_prompt_text = f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
 
@@ -2126,40 +2360,212 @@ Trigger endCall."""
         MAX_ENDPOINTING_DELAY = float(get_config_value("call_behavior.max_endpointing_delay", "15.0"))
         NO_RESPONSE_TIMEOUT = float(get_config_value("call_behavior.no_response_timeout", "7.0"))
         INITIAL_SILENCE_WAIT = float(get_config_value("call_behavior.initial_silence_wait", "5.0"))
+        # Idle Time & Reminders
+        IDLE_REMINDER_ENABLED = get_config_value("call_behavior.idle_reminder_enabled", False)
+        if isinstance(IDLE_REMINDER_ENABLED, bool):
+            pass  # Already bool
+        else:
+            IDLE_REMINDER_ENABLED = str(IDLE_REMINDER_ENABLED).lower() in ("true", "1", "yes")
+        IDLE_TIME_SECONDS = int(get_config_value("call_behavior.idle_time_seconds", "4"))
+        REMINDER_FREQUENCY = int(get_config_value("call_behavior.reminder_frequency", "1"))
     else:
         INITIAL_GREETING_DELAY = float(os.getenv("INITIAL_GREETING_DELAY", "1.0"))  # seconds to wait before first greeting
         MIN_ENDPOINTING_DELAY = float(os.getenv("MIN_ENDPOINTING_DELAY", "0.5"))  # min delay before considering user done speaking
         MAX_ENDPOINTING_DELAY = float(os.getenv("MAX_ENDPOINTING_DELAY", "15.0"))  # max delay before forcing turn end (increased for email collection - people spell emails very slowly letter by letter like "i t z n t p at Gmail dot co")
         NO_RESPONSE_TIMEOUT = float(os.getenv("NO_RESPONSE_TIMEOUT", "7.0"))  # seconds to wait after greeting for user to speak before hanging up (default 7 seconds)
         INITIAL_SILENCE_WAIT = float(os.getenv("INITIAL_SILENCE_WAIT", "5.0"))  # seconds to wait for user to speak before agent says "Hello?" (default 5 seconds)
+        # Idle Time & Reminders
+        IDLE_REMINDER_ENABLED = os.getenv("IDLE_REMINDER_ENABLED", "false").lower() in ("true", "1", "yes")
+        IDLE_TIME_SECONDS = int(os.getenv("IDLE_TIME_SECONDS", "4"))
+        REMINDER_FREQUENCY = int(os.getenv("REMINDER_FREQUENCY", "1"))
     
-    # TTS Configuration - ElevenLabs voice with quota check
-    # Get voice ID from environment variable, or use the specified default
-    # You can find voice IDs in your ElevenLabs dashboard: https://elevenlabs.io/
-    # NOTE: The voice must be in your ElevenLabs account for websocket streaming to work
-    # Load from config.json if available, otherwise use env vars
+    # Voice Settings and Agent Behavior from config (load after TTS_SPEED so we can use it as fallback)
     if CONFIG_MANAGER_AVAILABLE:
-        ELEVENLABS_VOICE_ID = get_config_value("agent.elevenlabs_voice_id", "6AUOG2nbfr0yFEeI0784")
-        TTS_SPEED = float(get_config_value("agent.tts_speed", "1.0"))
+        # Voice Settings
+        # VOICE_SPEED is already set from TTS config above (uses voice_speed if set, otherwise tts_speed)
+        VOICE_VOLUME = float(get_config_value("agent.voice_volume", None) or get_config_value("agent.piper_volume", "1.0"))
+        LLM_TEMPERATURE = float(get_config_value("agent.llm_temperature", "1.0"))
+        BACKGROUND_SOUND = get_config_value("agent.background_sound", "")
+        NOISE_CANCELLATION_MODE = get_config_value("agent.noise_cancellation_mode", "bvc_telephony")
+        
+        # Agent Behavior
+        RESPONSE_SPEED = get_config_value("agent.response_speed", "normal")  # fast, normal, moderate
+        INTERRUPTION_SENSITIVITY = float(get_config_value("agent.interruption_sensitivity", "0.5"))  # 0.0-1.0
+        
+        # Advanced Voice Settings
+        VOICE_STABILITY = float(get_config_value("voice_settings.stability", "0.5"))
+        VOICE_SIMILARITY_BOOST = float(get_config_value("voice_settings.similarity_boost", "0.75"))
+        VOICE_STYLE = float(get_config_value("voice_settings.style_exaggeration", "0.0"))
+        VOICE_LATENCY = int(get_config_value("voice_settings.optimize_streaming_latency", "3"))
+        VOICE_SPEAKER_BOOST = get_config_value("voice_settings.use_speaker_boost", True)
+        if isinstance(VOICE_SPEAKER_BOOST, str):
+             VOICE_SPEAKER_BOOST = VOICE_SPEAKER_BOOST.lower() == "true"
+        
+        # Map response speed to endpointing delays (override if response speed preset is set)
+        if RESPONSE_SPEED == "fast":
+            MIN_ENDPOINTING_DELAY = 0.2
+            MAX_ENDPOINTING_DELAY = 3.0
+        elif RESPONSE_SPEED == "moderate":
+            MIN_ENDPOINTING_DELAY = 1.0
+            MAX_ENDPOINTING_DELAY = 20.0
+        # else "normal" - keep defaults from config above
     else:
+        # VOICE_SPEED is already set from TTS config above
+        VOICE_VOLUME = float(os.getenv("VOICE_VOLUME", os.getenv("PIPER_VOLUME", "1.0")))
+        LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "1.0"))
+        BACKGROUND_SOUND = os.getenv("BACKGROUND_SOUND", "")
+        NOISE_CANCELLATION_MODE = os.getenv("NOISE_CANCELLATION_MODE", "bvc_telephony")
+        RESPONSE_SPEED = os.getenv("RESPONSE_SPEED", "normal")
+        INTERRUPTION_SENSITIVITY = float(os.getenv("INTERRUPTION_SENSITIVITY", "0.5"))
+        
+        # Map response speed to endpointing delays (override if response speed preset is set)
+        if RESPONSE_SPEED == "fast":
+            MIN_ENDPOINTING_DELAY = 0.2
+            MAX_ENDPOINTING_DELAY = 3.0
+        elif RESPONSE_SPEED == "moderate":
+            MIN_ENDPOINTING_DELAY = 1.0
+            MAX_ENDPOINTING_DELAY = 20.0
+            
+        # Defaults for env var mode
+        VOICE_STABILITY = float(os.getenv("STABILITY", "0.5"))
+        VOICE_SIMILARITY_BOOST = float(os.getenv("SIMILARITY_BOOST", "0.75"))
+        VOICE_STYLE = float(os.getenv("STYLE_EXAGGERATION", "0.0"))
+        VOICE_LATENCY = int(os.getenv("OPTIMIZE_STREAMING_LATENCY", "3"))
+        VOICE_SPEAKER_BOOST = os.getenv("USE_SPEAKER_BOOST", "true").lower() == "true"
+    
+    # TTS Configuration - Support both ElevenLabs and Chatterbox TTS
+    # Load TTS provider from config.json if available, otherwise use env vars
+    if CONFIG_MANAGER_AVAILABLE:
+        TTS_PROVIDER = get_config_value("agent.tts_provider", "elevenlabs").lower()
+        ELEVENLABS_VOICE_ID = get_config_value("agent.elevenlabs_voice_id", "6AUOG2nbfr0yFEeI0784")
+        # Use voice_speed if set (from Voice Settings), otherwise tts_speed
+        voice_speed_config = get_config_value("agent.voice_speed", None)
+        TTS_SPEED = float(voice_speed_config if voice_speed_config is not None else get_config_value("agent.tts_speed", "1.0"))
+        CHATTERBOX_API_URL = get_config_value("agent.chatterbox_api_url", "http://localhost:8004")
+        CHATTERBOX_VOICE = get_config_value("agent.chatterbox_voice", "Emily.wav")
+        CHATTERBOX_MODEL = get_config_value("agent.chatterbox_model", "chatterbox-turbo")
+    else:
+        TTS_PROVIDER = os.getenv("TTS_PROVIDER", "elevenlabs").lower()
         ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "6AUOG2nbfr0yFEeI0784")
-        TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
+        # Use voice_speed if set (from Voice Settings), otherwise tts_speed
+        TTS_SPEED = float(os.getenv("VOICE_SPEED") or os.getenv("TTS_SPEED", "1.0"))
+        CHATTERBOX_API_URL = os.getenv("CHATTERBOX_API_URL", "http://localhost:8004")
+        CHATTERBOX_VOICE = os.getenv("CHATTERBOX_VOICE", "Emily.wav")
+        CHATTERBOX_MODEL = os.getenv("CHATTERBOX_MODEL", "chatterbox-turbo")
     
     # ElevenLabs API key - can be set as ELEVEN_API_KEY or ELEVENLABS_API_KEY
     # The plugin automatically checks ELEVEN_API_KEY env var if not passed
-    ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+    ELEVEN_API_KEY = None
+    if CONFIG_MANAGER_AVAILABLE:
+        ELEVEN_API_KEY = get_config_value("agent.elevenlabs_api_key")
+        
+    if not ELEVEN_API_KEY:
+        ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
     
-    # TTS Speed configuration (0.7 to 1.2, default 1.0 = normal speed)
-    # 0.7 = slower, 1.2 = faster
-    # Clamp to valid range for ElevenLabs API
-    if TTS_SPEED < 0.7 or TTS_SPEED > 1.2:
-        logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.7-1.2). Clamping to valid range.")
-        TTS_SPEED = max(0.7, min(1.2, TTS_SPEED))
+    # TTS Speed configuration
+    # ElevenLabs: 0.7 to 1.2
+    # Chatterbox: typically 0.5 to 2.0 (check your server limits)
+    if TTS_PROVIDER == "elevenlabs":
+        # Clamp to valid range for ElevenLabs API
+        if TTS_SPEED < 0.7 or TTS_SPEED > 1.2:
+            logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.7-1.2). Clamping to valid range.")
+            TTS_SPEED = max(0.7, min(1.2, TTS_SPEED))
+    elif TTS_PROVIDER == "chatterbox":
+        # Chatterbox typically supports wider range, but clamp to reasonable values
+        if TTS_SPEED < 0.5 or TTS_SPEED > 2.0:
+            logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside recommended range (0.5-2.0). Clamping to valid range.")
+            TTS_SPEED = max(0.5, min(2.0, TTS_SPEED))
     
-    # Check ElevenLabs quota before using it
+    # Load Piper TTS settings if provider is piper
+    USE_PIPER = False
+    PIPER_MODEL_PATH = None
+    PIPER_CONFIG_PATH = None
+    PIPER_LENGTH_SCALE = 1.0
+    PIPER_NOISE_SCALE = 0.667
+    PIPER_NOISE_W_SCALE = 0.8
+    PIPER_VOLUME = 1.0
+    
+    if CONFIG_MANAGER_AVAILABLE:
+        PIPER_MODEL_PATH = get_config_value("agent.piper_model_path", "piper1-gpl/en_US-lessac-medium.onnx")
+        PIPER_CONFIG_PATH = get_config_value("agent.piper_config_path", "piper1-gpl/en_US-lessac-medium.onnx.json")
+        # Handle piper_use_cuda - can be bool or string
+        piper_use_cuda_val = get_config_value("agent.piper_use_cuda", False)
+        if isinstance(piper_use_cuda_val, bool):
+            PIPER_USE_CUDA = piper_use_cuda_val
+        else:
+            PIPER_USE_CUDA = str(piper_use_cuda_val).lower() in ("true", "1", "yes")
+        PIPER_LENGTH_SCALE = float(get_config_value("agent.piper_length_scale", "1.0"))
+        PIPER_NOISE_SCALE = float(get_config_value("agent.piper_noise_scale", "0.667"))
+        PIPER_NOISE_W_SCALE = float(get_config_value("agent.piper_noise_w_scale", "0.8"))
+        
+        # OpenAI Voice
+        OPENAI_VOICE = get_config_value("agent.openai_voice", "alloy")
+
+        # Use voice_volume if set, otherwise piper_volume
+        PIPER_VOLUME = float(get_config_value("agent.voice_volume", None) or get_config_value("agent.piper_volume", "1.0"))
+        # Use voice_speed if set, otherwise tts_speed (already set above, but update if voice_speed is explicitly set)
+        voice_speed_config = get_config_value("agent.voice_speed", None)
+        if voice_speed_config is not None:
+            TTS_SPEED = float(voice_speed_config)
+    else:
+        PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "piper1-gpl/en_US-lessac-medium.onnx")
+        PIPER_CONFIG_PATH = os.getenv("PIPER_CONFIG_PATH", "piper1-gpl/en_US-lessac-medium.onnx.json")
+        PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() in ("true", "1", "yes")
+        PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))
+        PIPER_NOISE_SCALE = float(os.getenv("PIPER_NOISE_SCALE", "0.667"))
+        PIPER_NOISE_W_SCALE = float(os.getenv("PIPER_NOISE_W_SCALE", "0.8"))
+        PIPER_VOLUME = float(os.getenv("VOICE_VOLUME", os.getenv("PIPER_VOLUME", "1.0")))
+
+        # OpenAI Voice
+        OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
+        # Use voice_speed if set
+        voice_speed_env = os.getenv("VOICE_SPEED")
+        if voice_speed_env:
+            TTS_SPEED = float(voice_speed_env)
+    
+    # Check TTS provider availability
     USE_ELEVENLABS = False
+    USE_CHATTERBOX = False
+    USE_OPENAI = False
     voice_default_settings = None  # Store voice default settings for later use
-    if ELEVEN_API_KEY:
+    
+    if TTS_PROVIDER == "piper":
+        if PIPER_TTS_AVAILABLE:
+            from pathlib import Path
+            model_path = Path(PIPER_MODEL_PATH)
+            if model_path.exists():
+                USE_PIPER = True
+                logger.info(f"✅ Using Piper TTS: {PIPER_MODEL_PATH}")
+            else:
+                logger.error(f"❌ Piper TTS model not found: {PIPER_MODEL_PATH}")
+                logger.error("   Please check the model path in config.json")
+                logger.error("   Falling back to ElevenLabs if available...")
+                TTS_PROVIDER = "elevenlabs"  # Fallback
+        else:
+            logger.error("❌ Piper TTS requested but not available!")
+            logger.error("   Make sure piper-tts is installed: pip install piper-tts")
+            logger.error("   And that livekit_piper_tts.py exists in piper1-gpl/")
+            logger.error("   Falling back to ElevenLabs if available...")
+            TTS_PROVIDER = "elevenlabs"  # Fallback
+    elif TTS_PROVIDER == "openai":
+        if OPENAI_TTS_AVAILABLE:
+            USE_OPENAI = True
+            logger.info(f"✅ Using OpenAI TTS with voice: {OPENAI_VOICE}")
+        else:
+            logger.error("❌ OpenAI TTS requested but not available!")
+            logger.error("   Make sure livekit-plugins-openai is installed")
+            TTS_PROVIDER = "elevenlabs"
+    elif TTS_PROVIDER == "chatterbox":
+        if CHATTERBOX_TTS_AVAILABLE:
+            USE_CHATTERBOX = True
+            logger.info(f"✅ Using Chatterbox TTS: {CHATTERBOX_API_URL}, voice: {CHATTERBOX_VOICE}")
+        else:
+            logger.error("❌ Chatterbox TTS requested but not available!")
+            logger.error("   Make sure livekit_chatterbox_tts.py exists and httpx is installed")
+            logger.error("   Falling back to ElevenLabs if available...")
+            TTS_PROVIDER = "elevenlabs"  # Fallback
+    
+    if TTS_PROVIDER == "elevenlabs" and ELEVEN_API_KEY:
         try:
             import requests
             headers = {"xi-api-key": ELEVEN_API_KEY}
@@ -2527,26 +2933,35 @@ Trigger endCall."""
         except Exception as e:
             logger.warning(f"⚠️  Could not set STT transcript callback: {e}")
     
-    # Use ElevenLabs TTS only - no fallback to OpenAI
+    # Initialize TTS based on provider
     if USE_ELEVENLABS:
         # Configure voice settings with speed
         from livekit.plugins.elevenlabs import VoiceSettings
         # Use voice default settings if available, otherwise use reasonable defaults
+        # But prioritize our config settings if they differ from defaults
         if voice_default_settings:
-            stability = voice_default_settings.get('stability', 0.5)
-            similarity_boost = voice_default_settings.get('similarity_boost', 0.75)
+            # If config matches the hardcoded default (0.5/0.75), maybe we want to use the voice's natural default?
+            # But here we will enforce the config value if explicit.
+            # actually we loaded from config above, so let's use those vars:
+            stability = VOICE_STABILITY
+            similarity_boost = VOICE_SIMILARITY_BOOST
         else:
-            stability = 0.5
-            similarity_boost = 0.75
+            stability = VOICE_STABILITY
+            similarity_boost = VOICE_SIMILARITY_BOOST
+        
+        # Use TTS_SPEED (already set from voice_speed or tts_speed above)
+        elevenlabs_speed = TTS_SPEED
         
         # Clamp speed to valid range (0.7-1.2) for ElevenLabs
-        valid_speed = max(0.7, min(1.2, TTS_SPEED))
-        if TTS_SPEED != valid_speed:
-            logger.warning(f"⚠️  TTS_SPEED {TTS_SPEED} is outside valid range (0.7-1.2). Clamping to {valid_speed}")
+        valid_speed = max(0.7, min(1.2, elevenlabs_speed))
+        if elevenlabs_speed != valid_speed:
+            logger.warning(f"⚠️  TTS_SPEED {elevenlabs_speed} is outside valid range (0.7-1.2). Clamping to {valid_speed}")
         
         voice_settings = VoiceSettings(
             stability=stability,
             similarity_boost=similarity_boost,
+            style=VOICE_STYLE,
+            use_speaker_boost=VOICE_SPEAKER_BOOST,
             speed=valid_speed  # Configured speaking speed (clamped to 0.7-1.2 for ElevenLabs)
         )
         tts_instance = elevenlabs.TTS(
@@ -2554,20 +2969,121 @@ Trigger endCall."""
             api_key=ELEVEN_API_KEY,
             voice_settings=voice_settings
         )
-        logger.info(f"✅ ElevenLabs TTS instance created with voice ID: {ELEVENLABS_VOICE_ID}, speed: {TTS_SPEED}")
-    else:
-        # Fail if ElevenLabs is not available - no fallback
-        if not ELEVEN_API_KEY:
-            logger.error("❌ ELEVEN_API_KEY not found - ElevenLabs TTS is required!")
-            logger.error("   Please set ELEVEN_API_KEY in your .env.local file")
-            raise ValueError("ELEVEN_API_KEY is required for ElevenLabs TTS")
+        logger.info(f"✅ ElevenLabs TTS instance created with voice ID: {ELEVENLABS_VOICE_ID}, speed: {valid_speed}")
+    elif USE_CHATTERBOX:
+        # Use Chatterbox TTS
+        # Use TTS_SPEED (already set from voice_speed or tts_speed above)
+        chatterbox_speed = TTS_SPEED
+        tts_instance = ChatterboxTTS(
+            api_url=CHATTERBOX_API_URL,
+            voice=CHATTERBOX_VOICE,
+            model=CHATTERBOX_MODEL,
+            speed=chatterbox_speed,
+        )
+        logger.info(f"✅ Chatterbox TTS instance created: {CHATTERBOX_API_URL}, voice: {CHATTERBOX_VOICE}, speed: {chatterbox_speed}")
+    elif USE_PIPER:
+        # Use Piper TTS from local-livekit-plugins package (CPU only)
+        from pathlib import Path
+        
+        # Check if using local-livekit-plugins package
+        using_package = False
+        try:
+            import inspect
+            if hasattr(PiperTTS, '__module__') and 'local_livekit_plugins' in str(PiperTTS.__module__):
+                using_package = True
+        except (AttributeError, ImportError):
+            pass
+        
+        model_path = str(Path(PIPER_MODEL_PATH))
+        
+        if using_package:
+            # Use local-livekit-plugins package API (CPU only, no GPU)
+            # Use voice_speed and voice_volume from config if set
+            # Use TTS_SPEED (already set from voice_speed or tts_speed above) and VOICE_VOLUME (defined earlier in entrypoint)
+            piper_speed = TTS_SPEED
+            piper_volume = VOICE_VOLUME  # VOICE_VOLUME is always defined before this point in both CONFIG_MANAGER_AVAILABLE branches
+            logger.info("Using local-livekit-plugins PiperTTS (CPU only)")
+            tts_instance = PiperTTS(
+                model_path=model_path,
+                use_cuda=False,  # CPU only as requested
+                speed=piper_speed,
+                volume=piper_volume,
+                noise_scale=PIPER_NOISE_SCALE,
+                noise_w=PIPER_NOISE_W_SCALE,  # Package uses 'noise_w' not 'noise_w_scale'
+            )
+            logger.info(f"✅ Piper TTS instance created (CPU): {model_path}, speed: {piper_speed:.2f}, noise_scale: {PIPER_NOISE_SCALE}, volume: {piper_volume:.2f}")
         else:
-            logger.error(f"❌ ElevenLabs TTS not available (quota check failed or quota low)")
-            logger.error(f"   Required voice ID: {ELEVENLABS_VOICE_ID}")
-            logger.error("   Please check your ElevenLabs quota at: https://elevenlabs.io/")
-            logger.error("   ElevenLabs TTS is required - no fallback available")
-            logger.error("   Agent will not start without the specified ElevenLabs voice")
-            raise ValueError(f"ElevenLabs TTS is required but not available. Voice ID: {ELEVENLABS_VOICE_ID}")
+            # Fallback to custom implementation (legacy support)
+            config_path = Path(PIPER_CONFIG_PATH) if PIPER_CONFIG_PATH else None
+            
+            # Convert TTS_SPEED to Piper's length_scale (inverse relationship: higher speed = lower length_scale)
+            # length_scale controls speech speed: lower = faster, higher = slower
+            # Map TTS_SPEED (1.0 = normal) to length_scale: speed 1.5 = length_scale 0.67, speed 0.5 = length_scale 2.0
+            piper_length_scale = PIPER_LENGTH_SCALE / TTS_SPEED if TTS_SPEED != 1.0 else PIPER_LENGTH_SCALE
+            
+            # Force CPU only for custom implementation
+            logger.info("Using custom PiperTTS implementation (CPU only)")
+            tts_instance = PiperTTS(
+                model_path=Path(model_path),
+                config_path=config_path if config_path and config_path.exists() else None,
+                use_cuda=False,  # CPU only
+                length_scale=piper_length_scale,
+                noise_scale=PIPER_NOISE_SCALE,
+                noise_w_scale=PIPER_NOISE_W_SCALE,
+                volume=PIPER_VOLUME,
+            )
+            # Log sample rate to help debug pitch issues
+            try:
+                actual_sample_rate = tts_instance.sample_rate
+                logger.info(f"✅ Piper TTS instance created (CPU): {model_path}")
+                logger.info(f"   Sample Rate: {actual_sample_rate} Hz (from config)")
+                logger.info(f"   Length Scale: {piper_length_scale:.2f} (Speed: {TTS_SPEED:.2f}x)")
+            except:
+                logger.info(f"✅ Piper TTS instance created (CPU): {model_path}, length_scale: {piper_length_scale:.2f}")
+    elif USE_OPENAI:
+        # Use OpenAI TTS
+        logger.info(f"Using OpenAI TTS with voice: {OPENAI_VOICE}")
+        tts_instance = OpenAITTS(voice=OPENAI_VOICE, model="tts-1")
+        logger.info(f"✅ OpenAI TTS instance created: {OPENAI_VOICE}")
+    else:
+        # Fail if no TTS provider is available
+        if TTS_PROVIDER == "elevenlabs":
+            if not ELEVEN_API_KEY:
+                logger.error("❌ ELEVEN_API_KEY not found - ElevenLabs TTS is required!")
+                logger.error("   Please set ELEVEN_API_KEY in your .env.local file")
+                logger.error("   Or switch to Chatterbox TTS by setting TTS_PROVIDER=chatterbox")
+                raise ValueError("ELEVEN_API_KEY is required for ElevenLabs TTS")
+            else:
+                logger.error(f"❌ ElevenLabs TTS not available (quota check failed or quota low)")
+                logger.error(f"   Required voice ID: {ELEVENLABS_VOICE_ID}")
+                logger.error("   Please check your ElevenLabs quota at: https://elevenlabs.io/")
+                logger.error("   Or switch to Chatterbox TTS by setting TTS_PROVIDER=chatterbox")
+                raise ValueError(f"ElevenLabs TTS is required but not available. Voice ID: {ELEVENLABS_VOICE_ID}")
+        elif TTS_PROVIDER == "chatterbox":
+            logger.error("❌ Chatterbox TTS not available!")
+            logger.error("   Make sure:")
+            logger.error("   1. livekit_chatterbox_tts.py exists in the project")
+            logger.error("   2. httpx is installed: pip install httpx")
+            logger.error("   3. Chatterbox TTS server is running at: " + CHATTERBOX_API_URL)
+            raise ValueError(f"Chatterbox TTS is required but not available. API URL: {CHATTERBOX_API_URL}")
+        elif TTS_PROVIDER == "piper":
+            logger.error("❌ Piper TTS not available!")
+            logger.error("   Make sure:")
+            logger.error("   1. piper-tts is installed: pip install piper-tts")
+            logger.error("   2. livekit_piper_tts.py exists in piper1-gpl/")
+            logger.error(f"   3. Model file exists: {PIPER_MODEL_PATH}")
+            raise ValueError(f"Piper TTS is required but not available. Model path: {PIPER_MODEL_PATH}")
+        else:
+            logger.error(f"❌ Unknown TTS provider: {TTS_PROVIDER}")
+            logger.error("   Supported providers: 'elevenlabs', 'chatterbox', 'piper'")
+            raise ValueError(f"Unknown TTS provider: {TTS_PROVIDER}")
+    
+    # Configure interruption sensitivity (maps to min_interruption_duration)
+    # interruption_sensitivity: 0.0 = less sensitive (2.0s), 1.0 = very sensitive (0.0s)
+    # Formula: min_interruption_duration = 2.0 * (1.0 - interruption_sensitivity)
+    min_interruption_duration = 2.0 * (1.0 - INTERRUPTION_SENSITIVITY)
+    min_interruption_duration = max(0.0, min(2.0, min_interruption_duration))  # Clamp to 0.0-2.0
+    logger.info(f"✅ Interruption sensitivity: {INTERRUPTION_SENSITIVITY} (min_interruption_duration: {min_interruption_duration:.2f}s)")
     
     session = AgentSession(
         vad=silero.VAD.load(),
@@ -2577,6 +3093,10 @@ Trigger endCall."""
         # Configure endpointing delays (when to consider user finished speaking)
         min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # Lower = faster response, but may cut off user
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,  # Higher = wait longer for user to continue
+        # Configure interruption sensitivity
+        allow_interruptions=True,  # Always allow interruptions
+        min_interruption_duration=min_interruption_duration,  # Mapped from interruption_sensitivity
+        min_interruption_words=0,  # No minimum words required
     )
 
     # start the session first before dialing, to ensure that when the user picks up
@@ -2587,8 +3107,8 @@ Trigger endCall."""
             record=True,
             room=ctx.room,
             room_input_options=RoomInputOptions(
-                # enable Krisp background voice and noise removal
-                noise_cancellation=noise_cancellation.BVCTelephony(),
+                # Configure noise cancellation based on settings
+                noise_cancellation=_get_noise_cancellation_filter(NOISE_CANCELLATION_MODE),
             ),
         )
     )
@@ -2659,6 +3179,10 @@ Trigger endCall."""
         
         # Store session reference for transcript extraction
         agent._agent_session = session
+        
+        # Store room info
+        agent.room_name = ctx.room.name
+        agent.session_id = ctx.job.id if ctx.job else ""
         
         # Track call start time
         agent.call_start_time = datetime.datetime.now()
@@ -3120,18 +3644,98 @@ Trigger endCall."""
         # Subscribe to participant disconnect event (most reliable)
         def on_participant_disconnected_event(participant_disconnected: rtc.RemoteParticipant):
             """Handle participant disconnect."""
-            if participant_disconnected.identity == phone_number:
-                logger.info(f"📝 Participant {participant_disconnected.identity} disconnected - sending transcript...")
-                asyncio.create_task(send_transcript_on_end())
+            logger.info(f"📝 Participant {participant_disconnected.identity} disconnected - sending transcript...")
+            # Run cleanup synchronously to ensure it happens
+            asyncio.create_task(cleanup_and_shutdown())
+
+        async def cleanup_and_shutdown():
+            """Perform cleanup and shut down the agent."""
+            logger.info("🛑 Starting graceful shutdown...")
+            try:
+                await send_transcript_on_end()
+            except Exception as e:
+                logger.error(f"Error sending transcript during shutdown: {e}")
+            
+            # Cancel monitoring tasks
+            if monitor_task and not monitor_task.done():
+                monitor_task.cancel()
+            
+            logger.info("👋 Shutting down job context...")
+            ctx.shutdown()
         
+        # Subscribe to room disconnected (fallback if participant disconnect isn't caught)
+        def on_room_disconnected_event(event):
+            """Handle room disconnect."""
+            logger.info("📝 Room disconnected - ensuring cleanup...")
+            asyncio.create_task(cleanup_and_shutdown())
+
         try:
             ctx.room.on("participant_disconnected", on_participant_disconnected_event)
-            logger.info("✅ Subscribed to participant disconnect event")
+            ctx.room.on("disconnected", on_room_disconnected_event)
+            logger.info("✅ Subscribed to disconnect events")
         except Exception as e:
-            logger.warning(f"⚠️  Could not subscribe to participant disconnect: {e}")
-        
+            logger.warning(f"⚠️  Could not subscribe to disconnect events: {e}")
+            
+        # Register a shutdown callback as final safety net
+        ctx.add_shutdown_callback(lambda: asyncio.create_task(cleanup_and_shutdown()))
+
         # Start monitoring as backup
         monitor_task = asyncio.create_task(monitor_and_send_transcript())
+        
+        # Idle Time & Reminder monitoring function (will be started after greeting)
+        idle_reminder_task = None
+        if IDLE_REMINDER_ENABLED:
+            async def monitor_idle_and_remind():
+                """Monitor for idle periods during conversation and send reminders."""
+                reminder_count = 0
+                last_transcript_count = len(agent.transcript)
+                last_activity_time = datetime.datetime.now()
+                
+                while not agent.call_end_time:
+                    await asyncio.sleep(1.0)  # Check every second
+                    
+                    # Update last activity time if there's new user or agent speech
+                    current_time = datetime.datetime.now()
+                    current_transcript_count = len(agent.transcript)
+                    
+                    # Check session state for activity
+                    session_active = False
+                    if agent._agent_session:
+                        try:
+                            session_state = getattr(agent._agent_session, 'state', None)
+                            session_active = session_state in ("speaking", "thinking", "listening")
+                        except:
+                            pass
+                    
+                    # Check if there's been new activity (new transcripts or agent speaking)
+                    new_activity = (current_transcript_count > last_transcript_count) or session_active
+                    
+                    if new_activity:
+                        last_activity_time = current_time
+                        last_transcript_count = current_transcript_count
+                        reminder_count = 0  # Reset reminder count on activity
+                        continue
+                    
+                    # Check if idle time threshold is reached
+                    idle_duration = (current_time - last_activity_time).total_seconds()
+                    
+                    if idle_duration >= IDLE_TIME_SECONDS and reminder_count < REMINDER_FREQUENCY:
+                        # Send reminder
+                        reminder_count += 1
+                        logger.info(f"⏰ Idle for {idle_duration:.1f}s - sending reminder {reminder_count}/{REMINDER_FREQUENCY}")
+                        try:
+                            await session.generate_reply(
+                                instructions="Say only: 'Hello? Are you there?' Then wait for their response. Keep it brief."
+                            )
+                            last_activity_time = current_time  # Reset after reminder
+                        except Exception as e:
+                            logger.error(f"Error sending idle reminder: {e}")
+                    
+                    # If max reminders reached and still idle, log warning (let existing timeout handle hangup)
+                    if reminder_count >= REMINDER_FREQUENCY and idle_duration >= (IDLE_TIME_SECONDS * 2):
+                        logger.warning(f"⚠️  Max reminders ({REMINDER_FREQUENCY}) sent, still idle - letting existing timeout handle hangup")
+            
+            logger.info(f"✅ Idle reminder monitoring configured: {IDLE_TIME_SECONDS}s idle time, {REMINDER_FREQUENCY} reminder(s)")
         
         # Wait for user to speak first, then say "Hello?" if quiet, then hang up if no response
         logger.info(f"📞 Waiting {INITIAL_SILENCE_WAIT} seconds for user to speak first...")
@@ -3187,6 +3791,13 @@ Trigger endCall."""
                         # Start silence timeout monitor after greeting is sent
                         nonlocal silence_timeout_task
                         silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
+                        
+                        # Start idle reminder monitoring after greeting is sent (if enabled)
+                        if IDLE_REMINDER_ENABLED:
+                            nonlocal idle_reminder_task
+                            if idle_reminder_task is None:
+                                idle_reminder_task = asyncio.create_task(monitor_idle_and_remind())
+                                logger.info(f"✅ Started idle reminder monitoring: {IDLE_TIME_SECONDS}s idle, {REMINDER_FREQUENCY} reminder(s)")
                     except Exception as e:
                         logger.error(f"Error generating business name response: {e}")
                     
@@ -3236,23 +3847,15 @@ Trigger endCall."""
         
         # Monitor for user response after greeting (silence timeout)
         async def monitor_silence_timeout():
-            """Monitor if user responds after greeting, hang up if no response within 7 seconds."""
+            """Monitor if user responds after greeting, hang up if no response within 7 seconds.
+            Also checks if agent has continued speaking (e.g., started pitch), in which case we don't hang up.
+            """
             if greeting_sent_time is None:
                 return
             
             try:
                 # Wait for the timeout period (7 seconds)
                 await asyncio.sleep(NO_RESPONSE_TIMEOUT)
-                
-                # Check if user has spoken AFTER the greeting was sent
-                # Count current customer transcripts
-                current_customer_transcript_count = len([
-                    entry for entry in agent.transcript 
-                    if entry.get("speaker") == "Customer"
-                ])
-                
-                # If there are more customer transcripts now than before greeting, user spoke
-                user_has_spoken_after_greeting = current_customer_transcript_count > customer_transcript_count_before_greeting
                 
                 # Check if call already ended
                 if agent.call_end_time:
@@ -3261,16 +3864,51 @@ Trigger endCall."""
                 # Check if participant is still connected
                 if participant not in ctx.room.remote_participants.values():
                     return
+
+                # 1. Check if user has spoken AFTER the greeting was sent
+                current_customer_transcript_count = len([
+                    entry for entry in agent.transcript 
+                    if entry.get("speaker") == "Customer"
+                ])
+                user_has_spoken_after_greeting = current_customer_transcript_count > customer_transcript_count_before_greeting
                 
-                # If no user speech detected after greeting, hang up
-                if not user_has_spoken_after_greeting:
+                # 2. Check if AGENT has spoken significantly AFTER the greeting was sent
+                # (meaning the conversation moved on, e.g., to the pitch)
+                # We can check specific timestamps, or just count. 
+                # Ideally, we check if any NEW agent transcripts appeared that correspond to meaningful speech.
+                current_agent_transcript_count = len([
+                    entry for entry in agent.transcript 
+                    if entry.get("speaker") == "Lia"
+                ])
+                # We didn't snapshot the agent count before, but we can check the recent transcripts
+                # If the last transcript is from the AGENT and it's long (pitch), we assume we're active.
+                
+                agent_is_speaking_or_has_spoken = False
+                if agent.transcript:
+                    last_entry = agent.transcript[-1]
+                    if last_entry.get("speaker") == "Lia":
+                        # If the last thing said was by the agent
+                        text = last_entry.get("text", "")
+                        # If it's not just "Hello?" or "Hello, are you...", but something longer
+                        if len(text) > 20: 
+                             agent_is_speaking_or_has_spoken = True
+                             logger.info(f"✅ Agent is active (speaking: '{text[:30]}...') - cancelling silence timeout")
+
+                # Also check active session state
+                if agent._agent_session:
+                     if agent._agent_session.response_task and not agent._agent_session.response_task.done():
+                         agent_is_speaking_or_has_spoken = True
+                         logger.info("✅ Agent is generating/speaking - cancelling silence timeout")
+
+                # If no user speech detected AND agent hasn't taken over, hang up
+                if not user_has_spoken_after_greeting and not agent_is_speaking_or_has_spoken:
                     logger.warning(f"⚠️  No user response detected after {NO_RESPONSE_TIMEOUT} seconds - hanging up")
                     try:
                         await agent.hangup("no_answer", send_results=True)
                     except Exception as e:
                         logger.error(f"Error hanging up due to silence: {e}")
                 else:
-                    logger.info("✅ User responded after greeting - silence timeout cancelled")
+                    logger.info("✅ User responded OR agent continued conversation - silence timeout cancelled")
                     
             except asyncio.CancelledError:
                 pass
@@ -3290,6 +3928,13 @@ Trigger endCall."""
                 silence_timeout_task.cancel()
                 try:
                     await silence_timeout_task
+                except asyncio.CancelledError:
+                    pass
+            # Cancel idle reminder task if enabled and running
+            if IDLE_REMINDER_ENABLED and idle_reminder_task is not None and not idle_reminder_task.done():
+                idle_reminder_task.cancel()
+                try:
+                    await idle_reminder_task
                 except asyncio.CancelledError:
                     pass
 
@@ -3380,9 +4025,36 @@ Trigger endCall."""
 
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller-dev",
+    import sys
+    import time
+    
+    # Check if running in dev mode
+    is_dev = "dev" in sys.argv
+    
+    if is_dev:
+        print("🔁 Agent running in auto-restart mode. Press Ctrl+C to stop.")
+        while True:
+            try:
+                cli.run_app(
+                    WorkerOptions(
+                        entrypoint_fnc=entrypoint,
+                        agent_name="outbound-caller-dev",
+                    )
+                )
+                print("⚠️  Agent worker exited. Restarting in 2 seconds...")
+            except KeyboardInterrupt:
+                print("🛑 Agent stopped by user.")
+                break
+            except Exception as e:
+                print(f"❌ Agent crashed: {e}")
+                print("🔄 Restarting in 2 seconds...")
+            
+            time.sleep(2)
+    else:
+        # Production/Start mode - run once
+        cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                agent_name="outbound-caller-dev",
+            )
         )
-    )
