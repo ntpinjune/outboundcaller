@@ -3342,17 +3342,24 @@ Trigger endCall."""
             except Exception as e:
                 logger.warning(f"⚠️  Could not wrap TTS: {e}")
 
+    # Create VAD instance with optimized settings
+    vad_instance = silero.VAD.load(
+        min_silence_duration=0.2,
+        min_speech_duration=0.05,
+    )
+    logger.info(f"✅ VAD initialized with min_silence_duration=0.2, min_speech_duration=0.05")
+
     session = AgentSession(
-        vad=silero.VAD.load(),
+        vad=vad_instance,
         stt=stt_instance,  # None for Realtime, deepgram.STT() for regular models
         tts=tts_instance,  # None for Realtime, TTS instance for regular models
         llm=llm_instance,
         # Configure endpointing delays (when to consider user finished speaking)
-        min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # Lower = faster response, but may cut off user
+        min_endpointing_delay=0.2, # Force low endpointing delay (override config)
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,  # Higher = wait longer for user to continue
         # Configure interruption sensitivity
         allow_interruptions=True,  # Always allow interruptions
-        min_interruption_duration=min_interruption_duration,  # Mapped from interruption_sensitivity
+        min_interruption_duration=0.5,  # Force faster interruption detection (0.5s instead of 1.0s)
         min_interruption_words=0,  # No minimum words required
     )
 
