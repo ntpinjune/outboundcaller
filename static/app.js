@@ -39,6 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (llmProviderSelect) {
         llmProviderSelect.addEventListener('change', () => {
             updateLLMModelOptions();
+            updateUIForRealtime();
         });
     }
 
@@ -327,6 +328,7 @@ function updateTTSProvider() {
             piperVolume: document.getElementById('piper-volume-group'),
             piperUseCuda: document.getElementById('piper-use-cuda-group'),
             openaiVoice: document.getElementById('openai-voice-group'),
+            cartesiaVoice: document.getElementById('cartesia-voice-group'),
         };
 
         const speedSlider = document.getElementById('tts-speed');
@@ -357,12 +359,53 @@ function updateTTSProvider() {
         } else if (provider === 'openai') {
             if (groups.openaiVoice) groups.openaiVoice.style.display = 'flex';
             if (speedSlider) { speedSlider.min = '0.5'; speedSlider.max = '2.0'; }
+        } else if (provider === 'cartesia') {
+            if (groups.cartesiaVoice) groups.cartesiaVoice.style.display = 'block';
+            if (speedSlider) { speedSlider.min = '0.5'; speedSlider.max = '2.0'; }
         }
 
         updateTTSpeedRange();
 
     } catch (e) {
         console.error("Error updating TTS Provider UI:", e);
+    }
+}
+
+// Update UI visibility for OpenAI Realtime
+function updateUIForRealtime() {
+    const llmProvider = document.getElementById('llm-provider').value;
+    const isRealtime = llmProvider === 'openai-realtime';
+
+    const ttsGroup = document.getElementById('tts-provider').closest('.form-group');
+    const sttGroup = document.getElementById('stt-provider') ? document.getElementById('stt-provider').closest('.form-group') : null;
+    const voiceSettingsTab = document.querySelector('.tab-button[data-tab="voice"]');
+
+    if (isRealtime) {
+        if (ttsGroup) ttsGroup.style.display = 'none';
+        if (sttGroup) sttGroup.style.display = 'none';
+        // Realtime doesn't use standard voice settings tab logic usually, 
+        // but we might want to show OpenAI Voice options still.
+        // For now, let's keep it simple and just hide the providers.
+
+        // Show OpenAI Voice selector if hidden
+        // Realtime uses a specific set of voices (alloy, echo, shimmer)
+        const groups = {
+            openaiVoice: document.getElementById('openai-voice-group'),
+            elevenlabs: document.getElementById('elevenlabs-voice-group'),
+            other: document.getElementById('elevenlabs-advanced-group')
+        };
+
+        // Hide others
+        if (groups.elevenlabs) groups.elevenlabs.style.display = 'none';
+        if (groups.other) groups.other.style.display = 'none';
+
+        // Show OpenAI voice selection
+        if (groups.openaiVoice) groups.openaiVoice.style.display = 'flex';
+
+    } else {
+        if (ttsGroup) ttsGroup.style.display = 'block';
+        if (sttGroup) sttGroup.style.display = 'block';
+        updateTTSProvider(); // Restore normal TTS UI logic
     }
 }
 
@@ -412,6 +455,7 @@ function populateForm(config) {
         setValue('tts-provider', config.agent.tts_provider || 'elevenlabs');
         setValue('elevenlabs-api-key', config.agent.elevenlabs_api_key || '');
         setValue('elevenlabs-voice-id', config.agent.elevenlabs_voice_id);
+        setValue('cartesia-voice-id', config.agent.cartesia_voice_id);
         setValue('chatterbox-api-url', config.agent.chatterbox_api_url || 'http://localhost:8004');
         setValue('chatterbox-voice', config.agent.chatterbox_voice || 'Emily.wav');
         setValue('piper-model-path', config.agent.piper_model_path || 'piper1-gpl/en_US-lessac-medium.onnx');
@@ -467,7 +511,9 @@ function populateForm(config) {
             document.getElementById('piper-volume-value').textContent = config.agent.piper_volume;
         }
         setValue('stt-provider', config.agent.stt_provider);
+        setValue('stt-provider', config.agent.stt_provider);
         updateTTSProvider(); // Update UI based on provider
+        updateUIForRealtime(); // Check if we need to hide things for Realtime
 
         // Voice Settings
         setValue('voice-speed', config.agent.voice_speed || config.agent.tts_speed || 1.0);
@@ -706,6 +752,7 @@ async function saveConfig() {
                 openai_voice: getValue('openai-voice'),
                 elevenlabs_api_key: getValue('elevenlabs-api-key'),
                 elevenlabs_voice_id: getValue('elevenlabs-voice-id'),
+                cartesia_voice_id: getValue('cartesia-voice-id'),
                 chatterbox_api_url: getValue('chatterbox-api-url'),
                 chatterbox_voice: getValue('chatterbox-voice'),
                 chatterbox_model: 'chatterbox-turbo', // Default model

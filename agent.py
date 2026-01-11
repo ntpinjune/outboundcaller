@@ -31,6 +31,10 @@ from livekit.agents import (
     get_job_context,
     cli,
     llm,
+    stt,
+    tts,
+    metrics,
+    MetricsCollectedEvent,
     WorkerOptions,
     RoomInputOptions,
 )
@@ -218,7 +222,216 @@ def setup_langfuse_telemetry():
         logger.warning(f"Failed to setup Langfuse OpenTelemetry tracing: {e}")
 
 
+
+# -------------------------------------------------------------------------
+# Langfuse Tracing Wrappers
+# -------------------------------------------------------------------------
+
+class TracingSTT(stt.STT):
+    def __init__(self, stt_instance: stt.STT, langfuse_client: Any):
+        super().__init__(streaming_supported=stt_instance.streaming_supported)
+        self._stt = stt_instance
+        self._langfuse = langfuse_client
+        self.label = stt_instance.label
+
+    async def recognize(self, buffer: rtc.AudioBuffer, *, language: str | None = None, conn_options: Any | None = None) -> stt.SpeechEvent:
+        start_time = datetime.datetime.now()
+        span = None
+        if self._langfuse:
+            try:
+                span = self._langfuse.span(
+                    name="stt_recognize",
+                    metadata={"provider": self.label}
+                )
+            except: pass
+            
+        try:
+            result = await self._stt.recognize(buffer, language=language, conn_options=conn_options)
+            return result
+        finally:
+            end_time = datetime.datetime.now()
+            duration = (end_time - start_time).total_seconds() * 1000
+            if span:
+                try:
+                    span.end(metadata={"duration_ms": duration})
+                    logger.info(f"📊 STT Latency: {duration:.2f}ms")
+                except: pass
+
+    def stream(self, *, language: str | None = None, conn_options: Any | None = None) -> stt.SpeechStream:
+        return TracingSpeechStream(self._stt.stream(language=language, conn_options=conn_options), self._langfuse, self.label)
+
+class TracingSpeechStream(stt.SpeechStream):
+    def __init__(self, stream: stt.SpeechStream, langfuse_client: Any, label: str):
+        self._stream = stream
+        self._langfuse = langfuse_client
+        self._label = label
+        self._start_time = None
+        self._span = None
+    
+    @property
+    def language(self) -> str | None:
+        return self._stream.language
+
+    async def push_frame(self, frame: rtc.AudioFrame):
+        # Start timer on first frame of speech (approximate)
+        if not self._start_time:
+            self._start_time = datetime.datetime.now()
+            if self._langfuse:
+                try:
+                    self._span = self._langfuse.span(
+                        name="stt_stream",
+                        metadata={"provider": self._label}
+                    )
+                except: pass
+        await self._stream.push_frame(frame)
+
+    async def aclose(self, wait: bool = True):
+        await self._stream.aclose(wait)
+
+    async def __anext__(self) -> stt.SpeechEvent:
+        try:
+            event = await self._stream.__anext__()
+            # If final result, end trace
+            if event.is_final and self._span:
+                end_time = datetime.datetime.now()
+                if self._start_time:
+                    duration = (end_time - self._start_time).total_seconds() * 1000
+                    try:
+                        self._span.end(metadata={"duration_ms": duration})
+                        logger.info(f"📊 STT Stream Latency (approx): {duration:.2f}ms")
+                    except: pass
+                self._span = None # Reset for next utterance
+                self._start_time = None
+            return event
+        except StopAsyncIteration:
+            raise
+
+class TracingLLM(llm.LLM):
+    def __init__(self, llm_instance: llm.LLM, langfuse_client: Any):
+        super().__init__()
+        self._llm = llm_instance
+        self._langfuse = langfuse_client
+        self.label = llm_instance.label
+
+    async def chat(self, chat_ctx: llm.ChatContext, fnc_ctx: llm.FunctionContext | None = None,
+                   temperature: float | None = None, max_tokens: int | None = None, n: int | None = None) -> llm.LLMStream:
+        start_time = datetime.datetime.now()
+        span = None
+        if self._langfuse:
+            try:
+                span = self._langfuse.span(
+                    name="llm_chat",
+                    metadata={"provider": self.label, "model": getattr(self._llm, 'model', 'unknown')}
+                )
+            except: pass
+
+        try:
+            # We need to capture the first token time, so we wrap the stream
+            stream = await self._llm.chat(chat_ctx, fnc_ctx, temperature, max_tokens, n)
+            return TracingLLMStream(stream, self._langfuse, span, start_time)
+        except Exception as e:
+            if span: span.end(level="ERROR", status_message=str(e))
+            raise
+
+class TracingLLMStream(llm.LLMStream):
+    def __init__(self, stream: llm.LLMStream, langfuse_client: Any, span: Any, start_time: datetime.datetime):
+        self._stream = stream
+        self._langfuse = langfuse_client
+        self._span = span
+        self._start_time = start_time
+        self._ttft_recorded = False
+
+    async def aclose(self, wait: bool = True):
+        await self._stream.aclose(wait)
+
+    async def __anext__(self) -> llm.ChatChunk:
+        try:
+            chunk = await self._stream.__anext__()
+            if not self._ttft_recorded and self._span:
+                ttft = (datetime.datetime.now() - self._start_time).total_seconds() * 1000
+                try:
+                    self._span.event(
+                        name="llm_ttft",
+                        metadata={"duration_ms": ttft}
+                    )
+                    logger.info(f"📊 LLM TTFT: {ttft:.2f}ms")
+                except: pass
+                self._ttft_recorded = True
+            return chunk
+        except StopAsyncIteration:
+            if self._span:
+                total_duration = (datetime.datetime.now() - self._start_time).total_seconds() * 1000
+                try:
+                    self._span.end(metadata={"total_duration_ms": total_duration})
+                    logger.info(f"📊 LLM Total Generation: {total_duration:.2f}ms")
+                except: pass
+            raise
+
+class TracingTTS(tts.TTS):
+    def __init__(self, tts_instance: tts.TTS, langfuse_client: Any):
+        super().__init__(
+            streaming_supported=tts_instance.streaming_supported,
+            sample_rate=tts_instance.sample_rate,
+            num_channels=tts_instance.num_channels
+        )
+        self._tts = tts_instance
+        self._langfuse = langfuse_client
+        self.label = tts_instance.label
+
+    def synthesize(self, text: str, *, conn_options: Any | None = None) -> tts.ChunkedStream:
+        start_time = datetime.datetime.now()
+        span = None
+        if self._langfuse:
+            try:
+                span = self._langfuse.span(
+                    name="tts_synthesize",
+                    metadata={"provider": self.label, "text_length": len(text)}
+                )
+            except: pass
+        
+        try:
+            stream = self._tts.synthesize(text, conn_options=conn_options)
+            return TracingTTSStream(stream, self._langfuse, span, start_time)
+        except Exception as e:
+            if span: span.end(level="ERROR", status_message=str(e))
+            raise
+
+class TracingTTSStream(tts.ChunkedStream):
+    def __init__(self, stream: tts.ChunkedStream, langfuse_client: Any, span: Any, start_time: datetime.datetime):
+        self._stream = stream
+        self._langfuse = langfuse_client
+        self._span = span
+        self._start_time = start_time
+        self._ttf_audio = False
+
+    async def aclose(self, wait: bool = True):
+        await self._stream.aclose(wait)
+
+    async def __anext__(self) -> rtc.AudioFrame:
+        try:
+            frame = await self._stream.__anext__()
+            if not self._ttf_audio and self._span:
+                ttfa = (datetime.datetime.now() - self._start_time).total_seconds() * 1000
+                try:
+                    self._span.event(
+                        name="tts_ttfa",
+                        metadata={"duration_ms": ttfa}
+                    )
+                    logger.info(f"📊 TTS Time-to-First-Audio: {ttfa:.2f}ms")
+                except: pass
+                self._ttf_audio = True
+            return frame
+        except StopAsyncIteration:
+            if self._span:
+                total_duration = (datetime.datetime.now() - self._start_time).total_seconds() * 1000
+                try:
+                    self._span.end(metadata={"total_duration_ms": total_duration})
+                except: pass
+            raise
+
+
 class VoicemailDetector:
+
     """Automatic voicemail detection based on transcript patterns.
     
     Monitors user transcripts in real-time and detects common voicemail greetings
@@ -1155,12 +1368,14 @@ class OutboundCaller(Agent):
         Args:
             dateTime: The date and time to check (e.g., "Tuesday at 2pm", "2024-01-15 14:00:00", "tomorrow at 3pm")
         """
-        # Log function call start to Langfuse
-        self._log_to_langfuse("span", {
-            "name": "checkAvailability",
-            "input": {"dateTime": dateTime},
-            "metadata": {"function": "checkAvailability", "status": "started"},
-        })
+        # Create Langfuse span for duration tracking
+        span = None
+        if self.langfuse_trace:
+            span = self.langfuse_trace.span(
+                name="checkAvailability",
+                input={"dateTime": dateTime},
+                metadata={"function": "checkAvailability"}
+            )
         
         logger.info(f"Checking availability for {dateTime}")
         
@@ -1177,12 +1392,8 @@ class OutboundCaller(Agent):
                 "suggested_times": ["9am", "10am", "11am"],
                 "time_preference": "morning"
             }
-            self._log_to_langfuse("span", {
-                "name": "checkAvailability",
-                "input": {"dateTime": dateTime},
-                "output": result,
-                "metadata": {"function": "checkAvailability", "status": "vague_preference", "preference": "morning"},
-            })
+            if span:
+                span.end(output=result, metadata={"status": "vague_preference", "preference": "morning"})
             return result
         elif "afternoon" in time_lower:
             # Suggest afternoon times: 1pm, 2pm, 3pm
@@ -1192,12 +1403,8 @@ class OutboundCaller(Agent):
                 "suggested_times": ["1pm", "2pm", "3pm"],
                 "time_preference": "afternoon"
             }
-            self._log_to_langfuse("span", {
-                "name": "checkAvailability",
-                "input": {"dateTime": dateTime},
-                "output": result,
-                "metadata": {"function": "checkAvailability", "status": "vague_preference", "preference": "afternoon"},
-            })
+            if span:
+                span.end(output=result, metadata={"status": "vague_preference", "preference": "afternoon"})
             return result
         elif "evening" in time_lower:
             # Suggest evening times: 4pm, 5pm, 6pm
@@ -1207,12 +1414,8 @@ class OutboundCaller(Agent):
                 "suggested_times": ["4pm", "5pm", "6pm"],
                 "time_preference": "evening"
             }
-            self._log_to_langfuse("span", {
-                "name": "checkAvailability",
-                "input": {"dateTime": dateTime},
-                "output": result,
-                "metadata": {"function": "checkAvailability", "status": "vague_preference", "preference": "evening"},
-            })
+            if span:
+                span.end(output=result, metadata={"status": "vague_preference", "preference": "evening"})
             return result
         
         # Try to parse specific times
@@ -1289,12 +1492,8 @@ class OutboundCaller(Agent):
             if is_available:
                 result = {"available": True, "message": "That time works perfectly."}
                 # Log success to Langfuse
-                self._log_to_langfuse("span", {
-                    "name": "checkAvailability",
-                    "input": {"dateTime": dateTime},
-                    "output": result,
-                    "metadata": {"function": "checkAvailability", "status": "success", "available": True},
-                })
+                if span:
+                    span.end(output=result, metadata={"status": "success", "available": True})
                 return result
             else:
                 # Get next available time
@@ -1306,22 +1505,14 @@ class OutboundCaller(Agent):
                     "message": f"Ah okay — sorry about that. Looks like the closest open time is {next_available_str}. Would that work?"
                 }
                 # Log result to Langfuse
-                self._log_to_langfuse("span", {
-                    "name": "checkAvailability",
-                    "input": {"dateTime": dateTime},
-                    "output": result,
-                    "metadata": {"function": "checkAvailability", "status": "success", "available": False, "next_available": next_available_str},
-                })
+                if span:
+                    span.end(output=result, metadata={"status": "success", "available": False, "next_available": next_available_str})
                 return result
         except Exception as e:
             logger.error(f"Error in checkAvailability: {e}")
             # Log error to Langfuse
-            self._log_to_langfuse("span", {
-                "name": "checkAvailability",
-                "input": {"dateTime": dateTime},
-                "output": {"error": str(e)},
-                "metadata": {"function": "checkAvailability", "status": "error"},
-            })
+            if span:
+                span.end(metadata={"status": "error", "error": str(e)})
             raise
 
     async def send_sms(self, phone_number: str, message_text: str) -> bool:
@@ -1385,21 +1576,22 @@ class OutboundCaller(Agent):
             email: The customer's email address to send the calendar invite to (required)
             dateTime: When to schedule the meeting (e.g., 'Tuesday at 2pm', '2024-01-15 14:00:00', 'tomorrow at 2pm') (required)
         """
-        # Log function call start to Langfuse
-        self._log_to_langfuse("span", {
-            "name": "schedule_meeting",
-            "input": {"email": email, "dateTime": dateTime},
-            "metadata": {"function": "schedule_meeting", "status": "started"},
-        })
+        # Create Langfuse span for duration tracking
+        span = None
+        if self.langfuse_trace:
+            span = self.langfuse_trace.span(
+                name="schedule_meeting",
+                input={"email": email, "dateTime": dateTime},
+                metadata={"function": "schedule_meeting"}
+            )
         
         if not email:
             error_msg = "I need your email address to send the calendar invite. Could you provide it?"
-            self._log_to_langfuse("span", {
-                "name": "schedule_meeting",
-                "input": {"email": email, "dateTime": dateTime},
-                "output": {"error": "Missing email"},
-                "metadata": {"function": "schedule_meeting", "status": "error", "error": "missing_email"},
-            })
+            if span:
+                span.end(
+                    output={"error": "Missing email"},
+                    metadata={"status": "error", "error": "missing_email"}
+                )
             return error_msg
         
         # Parse email - handle spelled-out formats like "i t z n t p at Gmail dot co"
@@ -1561,18 +1753,17 @@ class OutboundCaller(Agent):
             logger.info(f"Appointment scheduled: {time_str} for {email} (stored time: {start_time})")
             
             # Log success to Langfuse
-            self._log_to_langfuse("span", {
-                "name": "schedule_meeting",
-                "input": {"email": email, "dateTime": dateTime},
-                "output": {"success": True, "time_str": time_str, "meet_link": meet_link},
-                "metadata": {
-                    "function": "schedule_meeting",
-                    "status": "success",
-                    "appointment_scheduled": True,
-                    "appointment_time": str(start_time),
-                    "appointment_email": email,
-                },
-            })
+            if span:
+                span.end(
+                    output={"success": True, "time_str": time_str, "meet_link": meet_link},
+                    metadata={
+                        "function": "schedule_meeting",
+                        "status": "success",
+                        "appointment_scheduled": True,
+                        "appointment_time": str(start_time),
+                        "appointment_email": email,
+                    }
+                )
             
             # DO NOT auto-hangup here - let the agent complete the post-booking flow
             # The agent will follow the post-booking instructions and call end_call() at the end
@@ -1585,12 +1776,12 @@ class OutboundCaller(Agent):
         except Exception as e:
             logger.error(f"Error creating Google Calendar event: {e}")
             # Log error to Langfuse
-            self._log_to_langfuse("span", {
-                "name": "schedule_meeting",
-                "input": {"email": email, "dateTime": dateTime},
-                "output": {"error": str(e)},
-                "metadata": {"function": "schedule_meeting", "status": "error"},
-            })
+            # Log error to Langfuse
+            if span:
+                span.end(
+                    output={"error": str(e)},
+                    metadata={"function": "schedule_meeting", "status": "error"}
+                )
             return f"I've noted your meeting request for {time_str} with {email}. Our system is processing it, and you'll receive a confirmation email shortly."
 
     @function_tool()
@@ -1600,19 +1791,39 @@ class OutboundCaller(Agent):
         This will immediately hang up the call, mark it as voicemail in Google Sheets,
         and allow the dispatch script to move to the next call in the list.
         """
-        logger.info(f"📞 Voicemail detected for {self.participant.identity} - hanging up immediately")
+        # Create Langfuse span for duration tracking
+        span = None
+        if self.langfuse_trace:
+            span = self.langfuse_trace.span(
+                name="detected_answering_machine",
+                input={"reason": reason},
+                metadata={"function": "detected_answering_machine"}
+            )
         
-        # Mark call end time
-        self.call_end_time = datetime.datetime.now()
-        
-        # Send results to Google Sheets with voicemail status (this updates the Status column)
-        await self.send_call_results_to_sheets("voicemail")
-        logger.info("✅ Voicemail status sent to Google Sheets - dispatch script will move to next call")
-        
-        # Hang up immediately (don't send results again, already sent above)
-        await self.hangup("voicemail", send_results=False)
-        
-        return "ending call due to voicemail"
+        try:
+            logger.info(f"📞 Voicemail detected for {self.participant.identity} - hanging up immediately")
+            
+            # Mark call end time
+            self.call_end_time = datetime.datetime.now()
+            
+            # Send results to Google Sheets with voicemail status (this updates the Status column)
+            await self.send_call_results_to_sheets("voicemail")
+            logger.info("✅ Voicemail status sent to Google Sheets - dispatch script will move to next call")
+            
+            # Hang up immediately (don't send results again, already sent above)
+            await self.hangup("voicemail", send_results=False)
+            
+            if span:
+                span.end(
+                    output={"result": "ending call due to voicemail"},
+                    metadata={"status": "success"}
+                )
+            
+            return "ending call due to voicemail"
+        except Exception as e:
+            if span:
+                span.end(metadata={"status": "error", "error": str(e)})
+            raise
 
 
 async def start_call_recording(ctx: JobContext, phone_number: str, room_name: str) -> Optional[str]:
@@ -1728,20 +1939,27 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect()
 
-    # when dispatching the agent, we'll pass it the approriate info to dial the user
-    # dial_info is a dict with the following keys:
-    # - phone_number: the phone number to dial (required)
-    # - transfer_to: the phone number to transfer the call to when requested (optional)
-    # - name: the customer's name (optional, for personalized greeting)
-    # - appointment_time: existing appointment time if applicable (optional)
-    dial_info = json.loads(ctx.job.metadata)
-    participant_identity = phone_number = dial_info["phone_number"]
+    # Parse metadata - handle Playground (empty/invalid) vs Dispatch (populated)
+    dial_info = {}
+    phone_number = "web-user"
+    participant_identity = "web-user"
     
+    if ctx.job.metadata:
+        try:
+            dial_info = json.loads(ctx.job.metadata)
+            if "phone_number" in dial_info:
+                phone_number = dial_info["phone_number"]
+                participant_identity = phone_number
+        except Exception:
+            logger.warning("Could not parse job metadata - defaulting to web mode")
+    
+    logger.info(f"Agent starting for: {phone_number}")
+
     # Start call recording (if storage is configured)
     recording_egress_id = await start_call_recording(ctx, phone_number, ctx.room.name)
     
     # Get customer info from metadata (can come from Google Sheets via n8n)
-    customer_name = dial_info.get("name", "").strip()  # Empty string if no name provided
+    customer_name = dial_info.get("name", "Test User").strip()  # Empty string if no name provided
     appointment_time = dial_info.get("appointment_time", "")
     business_name = dial_info.get("business_name", "").strip()  # Business name from Google Sheets
 
@@ -2453,6 +2671,12 @@ Trigger endCall."""
         CHATTERBOX_VOICE = os.getenv("CHATTERBOX_VOICE", "Emily.wav")
         CHATTERBOX_MODEL = os.getenv("CHATTERBOX_MODEL", "chatterbox-turbo")
     
+    # STT Configuration
+    if CONFIG_MANAGER_AVAILABLE:
+        STT_PROVIDER = get_config_value("agent.stt_provider", "deepgram").lower()
+    else:
+        STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram").lower()
+    
     # ElevenLabs API key - can be set as ELEVEN_API_KEY or ELEVENLABS_API_KEY
     # The plugin automatically checks ELEVEN_API_KEY env var if not passed
     ELEVEN_API_KEY = None
@@ -2500,6 +2724,7 @@ Trigger endCall."""
         
         # OpenAI Voice
         OPENAI_VOICE = get_config_value("agent.openai_voice", "alloy")
+        CARTESIA_VOICE_ID = get_config_value("agent.cartesia_voice_id", None)
 
         # Use voice_volume if set, otherwise piper_volume
         PIPER_VOLUME = float(get_config_value("agent.voice_volume", None) or get_config_value("agent.piper_volume", "1.0"))
@@ -2518,6 +2743,7 @@ Trigger endCall."""
 
         # OpenAI Voice
         OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
+        CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID")
         # Use voice_speed if set
         voice_speed_env = os.getenv("VOICE_SPEED")
         if voice_speed_env:
@@ -2685,6 +2911,11 @@ Trigger endCall."""
         
         # Create STT instance with wrapper
         stt_instance = TranscriptingSTT()
+        
+        # Wrap with Langfuse Tracing if available
+        if langfuse:
+            stt_instance = TracingSTT(stt_instance, langfuse)
+            logger.info("✅ STT wrapped with Langfuse Tracing")
         
         # Set up transcript capture using conversation_item_added event
         # This is the official LiveKit way to track all conversation items
@@ -2981,6 +3212,14 @@ Trigger endCall."""
             speed=chatterbox_speed,
         )
         logger.info(f"✅ Chatterbox TTS instance created: {CHATTERBOX_API_URL}, voice: {CHATTERBOX_VOICE}, speed: {chatterbox_speed}")
+    elif TTS_PROVIDER == "cartesia":
+        # Use Cartesia TTS
+        if CARTESIA_VOICE_ID:
+            tts_instance = cartesia.TTS(voice=CARTESIA_VOICE_ID)
+            logger.info(f"✅ Cartesia TTS instance created with voice: {CARTESIA_VOICE_ID}")
+        else:
+            tts_instance = cartesia.TTS()
+            logger.info("✅ Cartesia TTS instance created (default voice)")
     elif USE_PIPER:
         # Use Piper TTS from local-livekit-plugins package (CPU only)
         from pathlib import Path
@@ -3085,6 +3324,24 @@ Trigger endCall."""
     min_interruption_duration = max(0.0, min(2.0, min_interruption_duration))  # Clamp to 0.0-2.0
     logger.info(f"✅ Interruption sensitivity: {INTERRUPTION_SENSITIVITY} (min_interruption_duration: {min_interruption_duration:.2f}s)")
     
+    # Wrap LLM and TTS with Langfuse Tracing if available
+    if langfuse:
+        # Wrap LLM if it exists
+        if llm_instance:
+            try:
+                llm_instance = TracingLLM(llm_instance, langfuse)
+                logger.info("✅ LLM wrapped with Langfuse Tracing")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not wrap LLM: {e}")
+        
+        # Wrap TTS if it exists (only for non-Realtime models)
+        if tts_instance:
+            try:
+                tts_instance = TracingTTS(tts_instance, langfuse)
+                logger.info("✅ TTS wrapped with Langfuse Tracing")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not wrap TTS: {e}")
+
     session = AgentSession(
         vad=silero.VAD.load(),
         stt=stt_instance,  # None for Realtime, deepgram.STT() for regular models
@@ -3098,6 +3355,23 @@ Trigger endCall."""
         min_interruption_duration=min_interruption_duration,  # Mapped from interruption_sensitivity
         min_interruption_words=0,  # No minimum words required
     )
+
+    # --- Metrics & Usage Collection ---
+    usage_collector = metrics.UsageCollector()
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        # Log metrics to LiveKit Cloud (enabled by default)
+        # Also collect for local summary
+        usage_collector.collect(ev.metrics)
+        logger.debug(f"📊 Metrics collected: {ev.metrics}")
+
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"📋 Session Usage Summary: {summary}")
+    
+    ctx.add_shutdown_callback(log_usage)
+    # ----------------------------------
 
     # start the session first before dialing, to ensure that when the user picks up
     # the agent does not miss anything the user says
@@ -3119,42 +3393,50 @@ Trigger endCall."""
     sip_retry_delay = 1.0
     sip_participant_created = False
     
-    for retry_attempt in range(max_sip_retries + 1):
-        try:
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=outbound_trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=participant_identity,
-                    # function blocks until user answers the call, or if the call fails
-                    wait_until_answered=True,
-                )
-            )
-            sip_participant_created = True
-            break  # Success, exit retry loop
-        except Exception as sip_error:
-            error_type = type(sip_error).__name__
-            # Don't retry on TwirpError (SIP status codes like 603, 486, etc.) - these are intentional rejections
-            if isinstance(sip_error, api.TwirpError):
-                raise  # Re-raise to be handled by outer TwirpError handler
-            # Retry on network errors (ServerDisconnectedError, ConnectionError, etc.)
-            elif retry_attempt < max_sip_retries and (
-                "ServerDisconnectedError" in error_type or 
-                "ConnectionError" in error_type or
-                "disconnected" in str(sip_error).lower() or
-                "connection" in str(sip_error).lower()
-            ):
-                logger.warning(f"⚠️  SIP connection error (attempt {retry_attempt + 1}/{max_sip_retries + 1}): {sip_error}. Retrying in {sip_retry_delay}s...")
-                await asyncio.sleep(sip_retry_delay)
-                sip_retry_delay *= 2  # Exponential backoff
-            else:
-                # Non-retryable error or max retries reached
-                logger.error(f"❌ Failed to create SIP participant after {retry_attempt + 1} attempts: {sip_error}")
-                raise
+    # Check if we should dial via SIP
+    should_dial_sip = phone_number and phone_number.lower() not in ["web-user", "test", "browser"]
     
-    if not sip_participant_created:
-        raise RuntimeError("Failed to create SIP participant after all retry attempts")
+    if should_dial_sip:
+        logger.info(f"📞 Dialing {phone_number} via SIP trunk {outbound_trunk_id}...")
+        for retry_attempt in range(max_sip_retries + 1):
+            try:
+                await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=ctx.room.name,
+                        sip_trunk_id=outbound_trunk_id,
+                        sip_call_to=phone_number,
+                        participant_identity=participant_identity,
+                        # function blocks until user answers the call, or if the call fails
+                        wait_until_answered=True,
+                    )
+                )
+                sip_participant_created = True
+                break  # Success, exit retry loop
+            except Exception as sip_error:
+                error_type = type(sip_error).__name__
+                # Don't retry on TwirpError (SIP status codes like 603, 486, etc.) - these are intentional rejections
+                if isinstance(sip_error, api.TwirpError):
+                    raise  # Re-raise to be handled by outer TwirpError handler
+                # Retry on network errors (ServerDisconnectedError, ConnectionError, etc.)
+                elif retry_attempt < max_sip_retries and (
+                    "ServerDisconnectedError" in error_type or 
+                    "ConnectionError" in error_type or
+                    "disconnected" in str(sip_error).lower() or
+                    "connection" in str(sip_error).lower()
+                ):
+                    logger.warning(f"⚠️  SIP connection error (attempt {retry_attempt + 1}/{max_sip_retries + 1}): {sip_error}. Retrying in {sip_retry_delay}s...")
+                    await asyncio.sleep(sip_retry_delay)
+                    sip_retry_delay *= 2  # Exponential backoff
+                else:
+                    # Non-retryable error or max retries reached
+                    logger.error(f"❌ Failed to create SIP participant after {retry_attempt + 1} attempts: {sip_error}")
+                    raise
+        
+        if not sip_participant_created:
+            raise RuntimeError("Failed to create SIP participant after all retry attempts")
+    else:
+        logger.info("🌐 Web/Test mode detected - skipping SIP dialing. Waiting for user to join room...")
+        sip_participant_created = True  # Pretend we created it so we proceed to wait logic
     
     try:
         # wait for the agent session start with timeout
