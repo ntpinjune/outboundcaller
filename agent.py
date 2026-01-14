@@ -11,6 +11,15 @@ from datetime import timedelta
 import httpx
 from twilio.rest import Client as TwilioClient
 import uuid
+from typing import Any, Optional
+
+# Import config manager
+try:
+    import config_manager
+    CONFIG_MANAGER_AVAILABLE = True
+except ImportError:
+    CONFIG_MANAGER_AVAILABLE = False
+    print("⚠️  config_manager module not found. Using defaults.")
 
 # Langfuse for observability
 try:
@@ -58,6 +67,14 @@ except (ImportError, AttributeError, Exception) as e:
     # Use print instead of logger since logger is initialized later
     print(f"ℹ️  Chatterbox TTS not available: {e}. Install httpx if you want to use it.")
 
+# Try to import dispatch_calls for Google Sheets integration
+try:
+    from dispatch_calls import get_google_sheets_service
+    DISPATCH_AVAILABLE = True
+except (ImportError, Exception):
+    DISPATCH_AVAILABLE = False
+    print("⚠️  dispatch_calls module not found or import failed. Google Sheets testing will be disabled.")
+
 # Try to import Piper TTS (optional)
 try:
     import sys
@@ -104,7 +121,7 @@ try:
                     sys.path.insert(0, str(piper_path))
             from livekit_piper_tts import TTS as PiperTTS
             PIPER_TTS_AVAILABLE = True
-            print("✅ Piper TTS plugin loaded (using installed piper-tts package + local plugin)")
+            print("[OK] Piper TTS plugin loaded (using installed piper-tts package + local plugin)")
         else:
             # Try to use local source code (NOT RECOMMENDED - requires building C extensions)
             piper_path = Path(__file__).parent / "piper1-gpl"
@@ -113,7 +130,7 @@ try:
                 # Try importing from local source
                 from livekit_piper_tts import TTS as PiperTTS
                 PIPER_TTS_AVAILABLE = True
-                print("⚠️  Piper TTS loaded from local source (may not work - C extension not built)")
+                print("[WARN] Piper TTS loaded from local source (may not work - C extension not built)")
                 print("   To fix: Install piper-tts from PyPI: pip install piper-tts")
             else:
                 raise ImportError("piper1-gpl folder not found")
@@ -123,14 +140,14 @@ except (ImportError, AttributeError, Exception) as e:
     # Use print instead of logger since logger is initialized later
     error_msg = str(e)
     if "espeakbridge" in error_msg.lower():
-        print(f"❌ Piper TTS not available: espeakbridge C extension not found")
+        print(f"[X] Piper TTS not available: espeakbridge C extension not found")
         print("   The C extension needs to be built or installed from PyPI.")
         print("   To fix:")
         print("   1. Install piper-tts from PyPI: pip install piper-tts")
         print("   2. This will install pre-built wheels with compiled C extensions")
         print("   3. Then restart the agent")
     else:
-        print(f"ℹ️  Piper TTS not available: {e}")
+        print(f"[INFO] Piper TTS not available: {e}")
         print("   To use Piper TTS:")
         print("   1. Install piper-tts from PyPI: pip install piper-tts")
         print("   2. Download a voice model: python -m piper.download_voices en_US-lessac-medium")
@@ -155,7 +172,7 @@ except ImportError:
     CONFIG_MANAGER_AVAILABLE = False
     logger.info("ℹ️  config_manager not available. Using environment variables only.")
 
-outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+# out-bound trunk ID will be loaded dynamically in entrypoint
 
 # Initialize Langfuse if available
 langfuse = None
@@ -441,6 +458,7 @@ class VoicemailDetector:
     def __init__(self, agent_instance):
         self.agent = agent_instance
         self.detected = False
+        self.hangup_task = None
         self.recent_transcripts = []  # Keep last few transcripts for pattern matching
         self.max_recent = 5  # Keep last 5 transcripts
         
@@ -516,6 +534,39 @@ class VoicemailDetector:
             r"message for.*\d+",
             r"six.*five.*zero",  # Common pattern in voicemail
             r"have reached.*\d+",  # "have reached 650..."
+            
+            # Expanded patterns (added after analysis)
+            r"visit our website",
+            r"contact page",
+            r"send a fax",
+            r"press one",
+            r"press two",
+            r"press three",
+            r"press four",
+            r"press five",
+            r"press six",
+            r"press seven",
+            r"press eight",
+            r"press nine",
+            r"press zero",
+            r"press star",
+            r"press pound",
+            r"to replay",
+            r"to delete",
+            r"to cancel",
+            r"to send this message",
+            r"delivery options",
+            r"for the fast.*response",
+            r"leave a message here",
+            r"if you're calling",
+            r"if you are calling",
+            r"no one is available to take your call",
+            r"subscriber you have dialed",
+            r"subscriber you are calling",
+            r"leave a message after the tone",
+            r"record your message after the tone",
+            r"is not available",
+            r"please leave a detailed message",
         ]
         
         # Compile patterns for faster matching
@@ -575,37 +626,33 @@ class VoicemailDetector:
     async def handle_voicemail_detection(self):
         """Handle voicemail detection by hanging up and updating status."""
         if not self.detected:
-            logger.warning("⚠️  handle_voicemail_detection called but detected=False")
             return
         
         # Prevent duplicate hangup attempts
         if self.hangup_task and not self.hangup_task.done():
-            logger.warning("⚠️  Hangup already in progress, skipping duplicate detection")
             return
         
-        logger.info(f"📞 Automatic voicemail detection triggered for {self.agent.participant.identity if self.agent.participant else 'unknown'}")
+        logger.info(f"📞 Voicemail detected for {self.agent.participant.identity if self.agent.participant else 'unknown'} - hanging up IMMEDIATELY")
         
         async def do_hangup():
             try:
                 # Mark call end time
                 self.agent.call_end_time = datetime.datetime.now()
                 
-                # Send results to Google Sheets with voicemail status
-                await self.agent.send_call_results_to_sheets("voicemail")
-                logger.info("✅ Voicemail status sent to Google Sheets - dispatch script will move to next call")
+                # Initiate hangup as quickly as possible (fire and forget sheet update)
+                # This ensures the user doesn't hear any weird silence or agent artifacts
+                asyncio.create_task(self.agent.send_call_results_to_sheets("voicemail"))
                 
                 # Hang up immediately
                 await self.agent.hangup("voicemail", send_results=False)
-                logger.info("✅ Call hung up due to voicemail detection")
+                logger.debug("✅ Call hung up successfully after voicemail detection")
             except Exception as e:
                 logger.error(f"❌ Error handling voicemail detection: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                # Try to hang up anyway
+                # Try to hang up anyway if possible
                 try:
                     await self.agent.hangup("voicemail", send_results=False)
-                except Exception as e2:
-                    logger.error(f"❌ Failed to hang up after error: {e2}")
+                except:
+                    pass
         
         self.hangup_task = asyncio.create_task(do_hangup())
 
@@ -633,7 +680,11 @@ class OutboundCaller(Agent):
         if "system_prompt" in dial_info and dial_info["system_prompt"]:
             instructions = dial_info["system_prompt"]
         else:
-            instructions = f"""You are "Lia," a local employee for a landscaping marketing firm in San Jose. Be conversational, authentic, and real. Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like). Follow the detailed script provided in the system message. Customer name: {name}. Today is {today_date}, time is {current_time} PST."""
+            # Get location from global config if available
+            config = config_manager.load_config() if CONFIG_MANAGER_AVAILABLE else {}
+            location = config.get("agent", {}).get("location", "San Jose") or "San Jose"
+            
+            instructions = f"""You are "Lia," a local employee for a landscaping marketing firm in {location}. Be conversational, authentic, and real. Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like). Follow the detailed script provided in the system message. Customer name: {name}. Today is {today_date}, time is {current_time} PST."""
         
         super().__init__(
             instructions=instructions
@@ -667,6 +718,10 @@ class OutboundCaller(Agent):
         self.langfuse_trace = None
         self.langfuse_generation = None
         self._init_langfuse_trace()
+        
+        # Last detected user speech (for robust interruption)
+        self.last_user_speech_time = None
+        self.last_user_speech_text = None
     
     async def stt_node(self, audio, model_settings):
         """Official LiveKit hook to intercept STT output - captures user speech."""
@@ -704,13 +759,21 @@ class OutboundCaller(Agent):
                     is_final = not getattr(event, 'is_interim', False)
                 
                 if transcript_text and isinstance(transcript_text, str) and transcript_text.strip() and is_final:
-                    self.transcript.append({
-                        "speaker": "Customer",
-                        "text": transcript_text.strip(),
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "is_final": True
-                    })
-                    logger.info(f"📝 [STT_NODE] Captured user transcript: {transcript_text.strip()}")
+                    # Do NOT append to self.transcript here to avoid duplicates with conversation_item_added
+                    # self.transcript.append(...) 
+                    
+                    logger.info(f"📝 [STT_NODE] Fast track user transcript: {transcript_text.strip()}")
+                    
+                    # Update robust tracking flag
+                    try:
+                        self.last_user_speech_time = datetime.datetime.now()
+                        self.last_user_speech_text = transcript_text.strip()
+                    except: pass
+                    
+                    # Check for voicemail patterns IMMEDIATELY (Fastest path)
+                    if getattr(self, 'voicemail_detector', None) and self.voicemail_detector.check_transcript(transcript_text.strip()):
+                        logger.warning(f"🚨 Voicemail detected via STT_NODE! Hanging up immediately...")
+                        asyncio.create_task(self.voicemail_detector.handle_voicemail_detection())
                 
                 yield event
         
@@ -808,6 +871,18 @@ class OutboundCaller(Agent):
         async def intercepted_text():
             nonlocal accumulated_text
             async for text_chunk in text:
+                # Check for text-based tool calls (LLM fail-safe)
+                if isinstance(text_chunk, str) and "/end_call" in text_chunk:
+                    logger.info("[TOOL] Detected text-based /end_call - executing hangup")
+                    # Try to parse reason simply
+                    reason = "completed"
+                    if "customer not interested" in text_chunk or "customer not interested" in accumulated_text:
+                        reason = "not_interested"
+                    
+                    # Trigger hangup in background
+                    asyncio.create_task(self.hangup(reason, send_results=True))
+                    return  # Stop yielding text to TTS (be silent)
+
                 if isinstance(text_chunk, str) and text_chunk.strip():
                     accumulated_text += text_chunk
                     
@@ -826,7 +901,7 @@ class OutboundCaller(Agent):
                             "timestamp": datetime.datetime.now().isoformat(),
                             "is_final": True
                         })
-                        logger.info(f"📝 [TTS_NODE] Captured agent transcript: {text_to_add[:100]}...")
+                        logger.info(f"[TTS_NODE] Captured agent transcript: {text_to_add[:100]}...")
                         accumulated_text = ""
                 
                 yield text_chunk
@@ -840,7 +915,7 @@ class OutboundCaller(Agent):
                     "timestamp": datetime.datetime.now().isoformat(),
                     "is_final": True
                 })
-                logger.info(f"📝 [TTS_NODE] Captured agent transcript (final): {text_to_add[:100]}...")
+                logger.info(f"[TTS_NODE] Captured agent transcript (final): {text_to_add[:100]}...")
         
         # Process text and get audio with error handling
         processed_text = intercepted_text()
@@ -1117,7 +1192,7 @@ class OutboundCaller(Agent):
         except Exception as e:
             logger.error(f"❌ Error sending webhook: {e}")
 
-    async def send_call_results_to_sheets(self, call_status: str):
+    async def send_call_results_to_sheets(self, call_status: str, failure_reason: str = None):
         """Update Google Sheets directly with call results (no Make.com needed)."""
         # Import here to avoid circular imports
         from update_call_results import update_from_webhook_data
@@ -1162,14 +1237,14 @@ class OutboundCaller(Agent):
             except Exception as e:
                 logger.debug(f"Could not extract transcript from conversation: {e}")
         
-        # Combine both sources - prefer real-time if it has substantial content
-        # Otherwise use conversation history
-        if realtime_transcript and len(realtime_transcript) > 10:
-            transcript_text = realtime_transcript
-            logger.info(f"📝 Using real-time transcript ({len(transcript_text)} characters)")
-        elif conversation_transcript and len(conversation_transcript) > 50:
+        # Combine both sources - prefer conversation history (most complete)
+        # Otherwise use real-time transcript
+        if conversation_transcript and len(conversation_transcript) > 20:
             transcript_text = conversation_transcript
             logger.info(f"📝 Using conversation history transcript ({len(transcript_text)} characters)")
+        elif realtime_transcript and len(realtime_transcript) > 10:
+            transcript_text = realtime_transcript
+            logger.info(f"📝 Using real-time transcript ({len(transcript_text)} characters)")
         else:
             # Fallback: combine both if available
             if realtime_transcript:
@@ -1196,16 +1271,20 @@ class OutboundCaller(Agent):
         outcome_details = None
         if call_status == "completed" and self.appointment_scheduled:
             outcome_details = "Appointment Scheduled"
-        elif call_status == "completed" and not self.appointment_scheduled:
+        elif call_status == "completed":
             outcome_details = "Call Completed - No Appointment"
         elif call_status == "voicemail":
-            outcome_details = "Voicemail - Left Message"
+            outcome_details = "Voicemail"
         elif call_status == "hung_up":
             outcome_details = "Customer Hung Up"
+        elif call_status == "declined":
+            outcome_details = "Declined/Rejected"
+        elif call_status == "busy":
+            outcome_details = "Busy"
         elif call_status == "no_answer":
-            outcome_details = "No Answer - No Pickup"
-        elif call_status == "failed":
-            outcome_details = "Call Failed"
+            outcome_details = "No Answer"
+        else:
+            outcome_details = f"Failed ({failure_reason or 'Unknown error'})"
         
         data = {
             "phone_number": self.participant.identity if self.participant else "",
@@ -1273,17 +1352,18 @@ class OutboundCaller(Agent):
             except Exception as e:
                 logger.error(f"Failed to update Langfuse trace: {e}")
 
-    async def hangup(self, call_status: str = "completed", send_results: bool = True):
+    async def hangup(self, call_status: str = "completed", send_results: bool = True, failure_reason: str = None):
         """Helper function to hang up the call by deleting the room
         
         Args:
             call_status: Status of the call (completed, failed, voicemail, etc.)
             send_results: Whether to send call results (set to False if already sent)
+            failure_reason: Optional reason for failure/hangup
         """
         # Mark call end time and send results if not already sent
         if send_results and not self.call_end_time:
             self.call_end_time = datetime.datetime.now()
-            await self.send_call_results_to_sheets(call_status)
+            await self.send_call_results_to_sheets(call_status, failure_reason)
         elif not self.call_end_time:
             self.call_end_time = datetime.datetime.now()
 
@@ -1962,6 +2042,12 @@ async def entrypoint(ctx: JobContext):
     customer_name = dial_info.get("name", "Test User").strip()  # Empty string if no name provided
     appointment_time = dial_info.get("appointment_time", "")
     business_name = dial_info.get("business_name", "").strip()  # Business name from Google Sheets
+    
+    # Get location from global config
+    config = config_manager.load_config() if CONFIG_MANAGER_AVAILABLE else {}
+    location = config.get("agent", {}).get("location", "San Jose")
+    if not location:
+        location = "San Jose"
 
     # look up the user's phone number and appointment details
     # Calculate dates/times needed for system prompt (moved up)
@@ -1984,7 +2070,8 @@ async def entrypoint(ctx: JobContext):
                 "{business_name}" in custom_prompt or 
                 "{customer_name}" in custom_prompt or 
                 "{today_date}" in custom_prompt or 
-                "{current_time}" in custom_prompt
+                "{current_time}" in custom_prompt or
+                "{location}" in custom_prompt
             )
             
             if has_placeholders:
@@ -1993,7 +2080,8 @@ async def entrypoint(ctx: JobContext):
                         business_name=business_name,
                         customer_name=customer_name,
                         today_date=today_date,
-                        current_time=current_time
+                        current_time=current_time,
+                        location=location
                     )
                 except (KeyError, ValueError) as e:
                     logger.warning(f"⚠️  Could not format system prompt: {e}")
@@ -2025,7 +2113,8 @@ async def entrypoint(ctx: JobContext):
                 "{business_name}" in custom_prompt or 
                 "{customer_name}" in custom_prompt or 
                 "{today_date}" in custom_prompt or 
-                "{current_time}" in custom_prompt
+                "{current_time}" in custom_prompt or
+                "{location}" in custom_prompt
             )
             
             if has_placeholders:
@@ -2035,7 +2124,8 @@ async def entrypoint(ctx: JobContext):
                         business_name=business_name,
                         customer_name=customer_name,
                         today_date=today_date,
-                        current_time=current_time
+                        current_time=current_time,
+                        location=location
                     )
                 except (KeyError, ValueError) as e:
                     # If formatting fails (e.g., unexpected placeholders), use prompt as-is and log warning
@@ -2725,6 +2815,11 @@ Trigger endCall."""
         # OpenAI Voice
         OPENAI_VOICE = get_config_value("agent.openai_voice", "alloy")
         CARTESIA_VOICE_ID = get_config_value("agent.cartesia_voice_id", None)
+        CARTESIA_API_KEY = get_config_value("agent.cartesia_api_key", None)
+        CARTESIA_SPEED = float(get_config_value("agent.cartesia_speed", "1.0"))
+        CARTESIA_EMOTION = get_config_value("agent.cartesia_emotion", [])
+        if isinstance(CARTESIA_EMOTION, str):
+             CARTESIA_EMOTION = [e.strip() for e in CARTESIA_EMOTION.split(",") if e.strip()]
 
         # Use voice_volume if set, otherwise piper_volume
         PIPER_VOLUME = float(get_config_value("agent.voice_volume", None) or get_config_value("agent.piper_volume", "1.0"))
@@ -2744,6 +2839,9 @@ Trigger endCall."""
         # OpenAI Voice
         OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
         CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID")
+        CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
+        CARTESIA_SPEED = float(os.getenv("CARTESIA_SPEED", "1.0"))
+        CARTESIA_EMOTION = [e.strip() for e in os.getenv("CARTESIA_EMOTION", "").split(",") if e.strip()]
         # Use voice_speed if set
         voice_speed_env = os.getenv("VOICE_SPEED")
         if voice_speed_env:
@@ -3050,108 +3148,8 @@ Trigger endCall."""
         # Set up transcript capture handler EARLY (before session starts)
         # This ensures we capture all logs from the beginning
         
-        # Attach log handler EARLY to capture Deepgram transcripts
-        # Use both handler AND filter for maximum coverage
-        try:
-            livekit_logger = logging.getLogger("livekit.agents")
-            root_logger = logging.getLogger()
-            
-            class TranscriptCaptureHandler(logging.Handler):
-                """Handler to capture transcripts from LiveKit logs - PRIMARY METHOD."""
-                def __init__(self, track_func):
-                    super().__init__()
-                    self.track_func = track_func
-                    self.setLevel(logging.DEBUG)
-                    self.call_count = 0
-                
-                def emit(self, record):
-                    try:
-                        self.call_count += 1
-                        msg = record.getMessage()
-                        
-                        # Look for "received user transcript" pattern (case insensitive)
-                        if "received user transcript" in msg.lower():
-                            import json
-                            import re
-                            
-                            # The log format is: "received user transcript {"user_transcript": "...", "language": "..."}"
-                            # Try to extract JSON from the log message
-                            json_start = msg.find('{')
-                            if json_start != -1:
-                                json_str = msg[json_start:]
-                                
-                                # Try to parse as complete JSON first
-                                try:
-                                    data = json.loads(json_str)
-                                    transcript_text = data.get("user_transcript")
-                                    if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
-                                        self.track_func(transcript_text.strip())
-                                        # Use print to avoid recursion with logger
-                                        print(f"📝 [LOG HANDLER] Captured: {transcript_text.strip()}", flush=True)
-                                        return
-                                except (json.JSONDecodeError, ValueError):
-                                    pass
-                            
-                            # Fallback: Use regex to extract just the transcript value
-                            match = re.search(r'"user_transcript"\s*:\s*"((?:[^"\\]|\\.)*)"', msg)
-                            if match:
-                                transcript_text = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
-                                if transcript_text and transcript_text.strip():
-                                    self.track_func(transcript_text.strip())
-                                    print(f"📝 [LOG HANDLER] Captured (regex): {transcript_text.strip()}", flush=True)
-                    except Exception:
-                        pass
-            
-            # Also create a filter that processes ALL log records
-            class TranscriptCaptureFilter(logging.Filter):
-                """Filter to capture transcripts from ALL log records."""
-                def __init__(self, track_func):
-                    super().__init__()
-                    self.track_func = track_func
-                
-                def filter(self, record):
-                    try:
-                        msg = record.getMessage()
-                        if "received user transcript" in msg.lower():
-                            import json
-                            import re
-                            
-                            json_start = msg.find('{')
-                            if json_start != -1:
-                                json_str = msg[json_start:]
-                                try:
-                                    data = json.loads(json_str)
-                                    transcript_text = data.get("user_transcript")
-                                    if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
-                                        self.track_func(transcript_text.strip())
-                                        print(f"📝 [LOG FILTER] Captured: {transcript_text.strip()}", flush=True)
-                                except (json.JSONDecodeError, ValueError):
-                                    match = re.search(r'"user_transcript"\s*:\s*"((?:[^"\\]|\\.)*)"', msg)
-                                    if match:
-                                        transcript_text = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
-                                        if transcript_text and transcript_text.strip():
-                                            self.track_func(transcript_text.strip())
-                                            print(f"📝 [LOG FILTER] Captured (regex): {transcript_text.strip()}", flush=True)
-                    except Exception:
-                        pass
-                    return True  # Don't filter out any records
-            
-            transcript_handler = TranscriptCaptureHandler(track_user_transcript)
-            transcript_handler.setLevel(logging.DEBUG)
-            transcript_filter = TranscriptCaptureFilter(track_user_transcript)
-            
-            # Make sure loggers accept DEBUG level messages
-            livekit_logger.setLevel(logging.DEBUG)
-            root_logger.setLevel(logging.DEBUG)
-            
-            # Add handler AND filter to both loggers
-            livekit_logger.addHandler(transcript_handler)
-            livekit_logger.addFilter(transcript_filter)
-            root_logger.addHandler(transcript_handler)
-            root_logger.addFilter(transcript_filter)
-            
-            logger.info("✅ Added transcript capture handler AND filter EARLY (before session start)")
-            logger.info(f"   Logger level: {livekit_logger.level}, Handler level: {transcript_handler.level}")
+            # Redundant log-based capture removed for performance
+            pass
         except Exception as e:
             logger.warning(f"⚠️  Could not add early transcript capture handler: {e}")
     
@@ -3214,12 +3212,17 @@ Trigger endCall."""
         logger.info(f"✅ Chatterbox TTS instance created: {CHATTERBOX_API_URL}, voice: {CHATTERBOX_VOICE}, speed: {chatterbox_speed}")
     elif TTS_PROVIDER == "cartesia":
         # Use Cartesia TTS
+        cartesia_args = {
+            "speed": CARTESIA_SPEED,
+            "emotion": CARTESIA_EMOTION
+        }
         if CARTESIA_VOICE_ID:
-            tts_instance = cartesia.TTS(voice=CARTESIA_VOICE_ID)
-            logger.info(f"✅ Cartesia TTS instance created with voice: {CARTESIA_VOICE_ID}")
-        else:
-            tts_instance = cartesia.TTS()
-            logger.info("✅ Cartesia TTS instance created (default voice)")
+            cartesia_args["voice"] = CARTESIA_VOICE_ID
+        if CARTESIA_API_KEY:
+            cartesia_args["api_key"] = CARTESIA_API_KEY
+            
+        tts_instance = cartesia.TTS(**cartesia_args)
+        logger.info(f"✅ Cartesia TTS instance created with voice: {CARTESIA_VOICE_ID}, speed: {CARTESIA_SPEED}, emotion: {CARTESIA_EMOTION}")
     elif USE_PIPER:
         # Use Piper TTS from local-livekit-plugins package (CPU only)
         from pathlib import Path
@@ -3404,6 +3407,9 @@ Trigger endCall."""
     should_dial_sip = phone_number and phone_number.lower() not in ["web-user", "test", "browser"]
     
     if should_dial_sip:
+        # Get latest SIP trunk ID from config
+        outbound_trunk_id = config.get("integrations", {}).get("sip_outbound_trunk_id") or os.getenv("SIP_OUTBOUND_TRUNK_ID")
+        
         logger.info(f"📞 Dialing {phone_number} via SIP trunk {outbound_trunk_id}...")
         for retry_attempt in range(max_sip_retries + 1):
             try:
@@ -3489,273 +3495,9 @@ Trigger endCall."""
         
         logger.info("✅ Subscribed to conversation_item_added events (official method)")
         
-        # DIRECT STT ACCESS - Access the STT stream directly (most reliable method)
-        # The session's STT instance processes audio and we can intercept transcriptions
-        def track_user_transcript(text: str):
-            """Capture user speech transcriptions from STT."""
-            if text and text.strip():
-                agent.transcript.append({
-                    "speaker": "Customer",
-                    "text": text.strip(),
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "is_final": True
-                })
-                logger.info(f"📝 User transcript captured: {text.strip()}")
-                
-                # Check for voicemail patterns in real-time
-                if agent.voicemail_detector and agent.voicemail_detector.check_transcript(text.strip()):
-                    # Voicemail detected - handle it asynchronously
-                    logger.warning(f"🚨 Voicemail detected! Hanging up immediately...")
-                    asyncio.create_task(agent.voicemail_detector.handle_voicemail_detection())
-        
-        def track_agent_transcript(text: str):
-            """Capture agent speech transcriptions."""
-            if text and text.strip():
-                agent.transcript.append({
-                    "speaker": "Lia",
-                    "text": text.strip(),
-                    "timestamp": datetime.datetime.now().isoformat(),
-                    "is_final": True
-                })
-                logger.info(f"📝 Agent transcript captured: {text.strip()}")
-        
-        # Method 1: Access STT instance directly from session
-        if hasattr(session, 'stt') and session.stt is not None:
-            try:
-                stt_instance = session.stt
-                logger.info(f"✅ STT instance available: {type(stt_instance)}")
-                
-                # Deepgram STT should have a way to access transcriptions
-                # Try to wrap the transcribe method or access the stream
-                if hasattr(stt_instance, 'transcribe'):
-                    original_transcribe = stt_instance.transcribe
-                    
-                    async def wrapped_transcribe(*args, **kwargs):
-                        """Wrap transcribe to capture transcriptions."""
-                        result = await original_transcribe(*args, **kwargs)
-                        # Extract transcript from result
-                        if hasattr(result, 'text'):
-                            track_user_transcript(result.text)
-                        elif isinstance(result, str):
-                            track_user_transcript(result)
-                        elif isinstance(result, dict):
-                            text = result.get('text') or result.get('transcript')
-                            if text:
-                                track_user_transcript(text)
-                        return result
-                    
-                    stt_instance.transcribe = wrapped_transcribe
-                    logger.info("✅ Wrapped STT transcribe method to capture transcriptions")
-            except Exception as e:
-                logger.debug(f"Could not wrap STT transcribe method: {e}")
-        
-        # Method 2: Access session's input/output streams which contain transcriptions
-        # The AgentSession processes audio through STT and publishes transcriptions
-        if hasattr(session, 'input') and hasattr(session.input, 'on'):
-            try:
-                def on_input_transcript(event):
-                    """Handle transcriptions from session input stream."""
-                    try:
-                        transcript_text = None
-                        if hasattr(event, 'text'):
-                            transcript_text = event.text
-                        elif hasattr(event, 'transcript'):
-                            transcript_text = event.transcript
-                        elif isinstance(event, dict):
-                            transcript_text = event.get('text') or event.get('transcript')
-                        elif isinstance(event, str):
-                            transcript_text = event
-                        
-                        if transcript_text and isinstance(transcript_text, str) and transcript_text.strip():
-                            track_user_transcript(transcript_text.strip())
-                            logger.info(f"📝 [INPUT STREAM] Captured user transcript: {transcript_text.strip()}")
-                    except Exception as e:
-                        logger.debug(f"Error in input stream handler: {e}")
-                
-                # Try different event names
-                for event_name in ["transcript", "transcription", "stt_result", "speech"]:
-                    try:
-                        session.input.on(event_name, on_input_transcript)
-                        logger.info(f"✅ Subscribed to session input '{event_name}' events")
-                        break
-                    except:
-                        continue
-            except Exception as e:
-                logger.debug(f"Could not subscribe to input stream: {e}")
-        
-        # Additional transcript capture methods (backup methods)
-        
-        # Method 1: Listen to conversation_item_added events (official API)
-        # This captures both user and agent messages when they're added to chat history
-        if hasattr(session, 'on'):
-            def on_conversation_item_added(item):
-                """Capture transcripts when items are added to conversation."""
-                try:
-                    # Extract text and role from the conversation item
-                    text = None
-                    role = None
-                    
-                    if hasattr(item, 'text'):
-                        text = item.text
-                    elif hasattr(item, 'content'):
-                        text = item.content
-                    elif isinstance(item, dict):
-                        text = item.get('text') or item.get('content')
-                        role = item.get('role')
-                    elif hasattr(item, 'role'):
-                        role = item.role
-                        if hasattr(item, 'content'):
-                            if isinstance(item.content, str):
-                                text = item.content
-                            elif isinstance(item.content, list):
-                                # Handle list of content blocks
-                                text = " ".join(str(block) for block in item.content if block)
-                    
-                    if text and isinstance(text, str) and text.strip():
-                        # Determine if it's user or agent based on role
-                        if role == 'user' or (hasattr(item, 'role') and item.role == 'user'):
-                            track_user_transcript(text.strip())
-                            logger.info(f"📝 Captured user transcript from conversation: {text.strip()}")
-                            
-                            # Check for voicemail patterns in real-time
-                            if agent.voicemail_detector and agent.voicemail_detector.check_transcript(text.strip()):
-                                # Voicemail detected - handle it asynchronously
-                                logger.warning(f"🚨 Voicemail detected! Hanging up immediately...")
-                                asyncio.create_task(agent.voicemail_detector.handle_voicemail_detection())
-                        elif role == 'assistant' or (hasattr(item, 'role') and item.role == 'assistant'):
-                            track_agent_transcript(text.strip())
-                            logger.info(f"📝 Captured agent transcript from conversation: {text.strip()}")
-                        else:
-                            # Default to user if we can't determine
-                            track_user_transcript(text.strip())
-                            logger.info(f"📝 Captured transcript (unknown role) from conversation: {text.strip()}")
-                except Exception as e:
-                    logger.debug(f"Error in conversation_item_added handler: {e}")
-            
-            try:
-                session.on("conversation_item_added", on_conversation_item_added)
-                logger.info("✅ Subscribed to conversation_item_added events")
-            except Exception as e:
-                logger.debug(f"Could not subscribe to conversation_item_added: {e}")
-        
-        # Method 2: Subscribe to room text stream events for lk.transcription topic (official API)
-        # This captures transcriptions published to text streams in real-time
-        def on_text_stream_received(data):
-            """Handle text stream events including transcriptions."""
-            try:
-                # Extract topic, message, and attributes
-                topic = None
-                message = None
-                attributes = {}
-                sender_identity = None
-                
-                # Try different ways to access the data
-                if hasattr(data, 'topic'):
-                    topic = data.topic
-                elif hasattr(data, 'info') and hasattr(data.info, 'topic'):
-                    topic = data.info.topic
-                    attributes = getattr(data.info, 'attributes', {})
-                    sender_identity = getattr(data.info, 'sender_identity', None)
-                elif isinstance(data, dict):
-                    topic = data.get('topic')
-                    message = data.get('message')
-                    attributes = data.get('attributes', {})
-                    sender_identity = data.get('sender_identity')
-                
-                # Check if this is a transcription
-                if topic == 'lk.transcription' or (isinstance(topic, str) and 'transcription' in topic.lower()):
-                    # Extract text from message
-                    text = None
-                    if message:
-                        if isinstance(message, str):
-                            text = message
-                        elif hasattr(message, 'text'):
-                            text = message.text
-                        elif hasattr(message, 'value'):
-                            text = message.value
-                        elif isinstance(message, dict):
-                            text = message.get('text') or message.get('value') or str(message)
-                    elif hasattr(data, 'message'):
-                        msg = data.message
-                        if isinstance(msg, str):
-                            text = msg
-                        elif hasattr(msg, 'text'):
-                            text = msg.text
-                        elif hasattr(msg, 'value'):
-                            text = msg.value
-                    
-                    # Get attributes if not already extracted
-                    if not attributes:
-                        if hasattr(data, 'attributes'):
-                            attributes = data.attributes
-                        elif hasattr(data, 'info') and hasattr(data.info, 'attributes'):
-                            attributes = data.info.attributes
-                    
-                    # Get sender if not already extracted
-                    if not sender_identity:
-                        if hasattr(data, 'sender_identity'):
-                            sender_identity = data.sender_identity
-                        elif hasattr(data, 'sender'):
-                            sender_identity = data.sender
-                        elif hasattr(data, 'info') and hasattr(data.info, 'sender_identity'):
-                            sender_identity = data.info.sender_identity
-                    
-                    # Check if this is a final transcription (not interim)
-                    is_final = attributes.get('lk.transcription_final', 'false') == 'true'
-                    has_track_id = attributes.get('lk.transcribed_track_id') is not None
-                    
-                    if text and text.strip() and is_final:
-                        # Determine speaker from sender identity or transcribed_track_id
-                        if sender_identity == participant.identity or sender_identity == phone_number:
-                            track_user_transcript(text.strip())
-                            logger.info(f"📝 Captured user transcription from text stream: {text.strip()}")
-                        elif "agent" in str(sender_identity).lower() or sender_identity == "agent":
-                            track_agent_transcript(text.strip())
-                            logger.info(f"📝 Captured agent transcription from text stream: {text.strip()}")
-                        elif has_track_id:
-                            # Has transcribed_track_id means it's user audio being transcribed
-                            track_user_transcript(text.strip())
-                            logger.info(f"📝 Captured user transcription (via track_id): {text.strip()}")
-                        else:
-                            # Default to agent if no track_id (likely agent speech)
-                            track_agent_transcript(text.strip())
-                            logger.info(f"📝 Captured agent transcription (default): {text.strip()}")
-            except Exception as e:
-                logger.debug(f"Error handling text stream: {e}")
-        
-        # Subscribe to room text stream events
-        try:
-            # Try the official room event subscription
-            if hasattr(ctx.room, 'on'):
-                ctx.room.on("text_stream_received", on_text_stream_received)
-                logger.info("✅ Subscribed to room text_stream_received events")
-            else:
-                raise AttributeError("Room does not have 'on' method")
-        except Exception as e:
-            logger.warning(f"⚠️  Could not subscribe to text stream events: {e}")
-            # Try alternative method if available
-            try:
-                if hasattr(ctx.room, 'register_text_stream_handler'):
-                    ctx.room.register_text_stream_handler("lk.transcription", on_text_stream_received)
-                    logger.info("✅ Registered text stream handler for lk.transcription (alternative method)")
-            except Exception as e2:
-                logger.warning(f"⚠️  Alternative text stream registration also failed: {e2}")
-        
-        # Also track transcriptions from participant tracks if available
-        # When STT processes audio, it may emit events we can capture
-        async def track_participant_transcriptions():
-            """Monitor participant tracks for transcription data."""
-            try:
-                for track in participant.track_publications.values():
-                    if track.kind == rtc.TrackKind.KIND_AUDIO:
-                        # Audio tracks from participants are transcribed by STT
-                        # The transcription will come through text streams above
-                        pass
-            except Exception as e:
-                logger.debug(f"Error tracking participant transcriptions: {e}")
-        
-        # Start background task to monitor transcriptions
-        asyncio.create_task(track_participant_transcriptions())
+        # Redundant transcript capture methods removed.
+        # - Voicemail detection is handled in OutboundCaller.stt_node (fast path)
+        # - Transcript storage is handled by the official conversation_item_added handler above
         
         # Log call start to Langfuse
         if agent.langfuse_trace:
@@ -4039,66 +3781,57 @@ Trigger endCall."""
             """Wait for user to speak, say 'Hello?' if quiet after 5 seconds, then hang up if no response after 7 more seconds."""
             nonlocal user_first_spoke, greeting_sent_time, silence_timeout_task, hello_sent, customer_transcript_count_before_greeting
             
-            check_interval = 0.5
-            elapsed = 0.0
+            # Create an event to signal when user starts speaking (VAD)
+            user_speech_event = asyncio.Event()
             
-            # Phase 1: Wait 5 seconds for user to speak first
-            while elapsed < INITIAL_SILENCE_WAIT:
-                await asyncio.sleep(check_interval)
-                elapsed += check_interval
+            def on_speech_started(evt):
+                if not user_speech_event.is_set():
+                    user_speech_event.set()
+                    logger.info("✅ VAD detected speech start during initial wait")
+            
+            # Subscribe to speech started event
+            session.on("input_speech_started", on_speech_started)
+            
+            try:
+                # Phase 1: Robust Polling for 5 seconds
+                # We poll for both VAD event AND transcript presence to be safe
+                start_time = datetime.datetime.now()
+                check_interval = 0.1  # Check every 100ms
                 
-                # Check if user has spoken
-                user_transcripts = [
-                    entry.get("text", "").lower().strip()
-                    for entry in agent.transcript
-                    if entry.get("speaker") == "Customer"
-                ]
-                
-                if user_transcripts:
-                    # User spoke - respond with business name question
-                    user_first_spoke = True
-                    logger.info(f"✅ User spoke first: {' '.join(user_transcripts)}")
+                while (datetime.datetime.now() - start_time).total_seconds() < INITIAL_SILENCE_WAIT:
+                    # 1. Check VAD event
+                    if user_speech_event.is_set():
+                        user_first_spoke = True
+                        logger.info("✅ User speech detected (VAD Event) - skipping initial greeting wait")
+                        return
+
+                    # 2. Check Transcripts (Backup in case VAD missed or race condition)
+                    # Check our custom robust flag first (updated by stt_node directly)
+                    if hasattr(agent, 'last_user_speech_time') and agent.last_user_speech_time and \
+                       agent.call_start_time and agent.last_user_speech_time > agent.call_start_time:
+                        user_first_spoke = True
+                        logger.info(f"✅ User speech detected (Robust Flag) - skipping initial greeting wait. Text: {getattr(agent, 'last_user_speech_text', 'unknown')}")
+                        return
+
+                    user_transcripts = [
+                        entry.get("text", "").lower().strip()
+                        for entry in agent.transcript
+                        if entry.get("speaker") == "Customer"
+                    ]
+                    if user_transcripts:
+                        user_first_spoke = True
+                        logger.info(f"✅ User speech detected (Transcript) - skipping initial greeting wait: {' '.join(user_transcripts)}")
+                        return
                     
-                    try:
-                        if agent.business_name:
-                            response_text = f"Hello, are you from {agent.business_name}?"
-                        else:
-                            response_text = "Hello?"
-                        
-                        await session.generate_reply(
-                            instructions=f"Say ONLY this: '{response_text}' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
-                        )
-                        greeting_sent_time = datetime.datetime.now()
-                        logger.info(f"📞 Responded with business name question: '{response_text}'")
-                        
-                        # Record transcript count before greeting to detect new speech after
-                        customer_transcript_count_before_greeting = len([
-                            entry for entry in agent.transcript 
-                            if entry.get("speaker") == "Customer"
-                        ])
-                        
-                        # Start silence timeout monitor after greeting is sent
-                        nonlocal silence_timeout_task
-                        silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
-                        
-                        # Start idle reminder monitoring after greeting is sent (if enabled)
-                        if IDLE_REMINDER_ENABLED:
-                            nonlocal idle_reminder_task
-                            if idle_reminder_task is None:
-                                idle_reminder_task = asyncio.create_task(monitor_idle_and_remind())
-                                logger.info(f"✅ Started idle reminder monitoring: {IDLE_TIME_SECONDS}s idle, {REMINDER_FREQUENCY} reminder(s)")
-                    except Exception as e:
-                        logger.error(f"Error generating business name response: {e}")
+                    # 3. Check if call ended or participant left
+                    if agent.call_end_time or participant not in ctx.room.remote_participants.values():
+                        return
+
+                    await asyncio.sleep(check_interval)
                     
-                    return  # User spoke, exit function
-                
-                # Check if call already ended
-                if agent.call_end_time:
-                    return
-                
-                # Check if participant disconnected
-                if participant not in ctx.room.remote_participants.values():
-                    return
+            finally:
+                # Clean up event handler
+                session.off("input_speech_started", on_speech_started)
             
             # Phase 2: User didn't speak in 5 seconds - agent says "Hello?"
             if not user_first_spoke and not hello_sent:
@@ -4181,23 +3914,23 @@ Trigger endCall."""
                         # If it's not just "Hello?" or "Hello, are you...", but something longer
                         if len(text) > 20: 
                              agent_is_speaking_or_has_spoken = True
-                             logger.info(f"✅ Agent is active (speaking: '{text[:30]}...') - cancelling silence timeout")
+                             logger.info(f"[OK] Agent is active (speaking: '{text[:30]}...') - cancelling silence timeout")
 
                 # Also check active session state
                 if agent._agent_session:
                      if agent._agent_session.response_task and not agent._agent_session.response_task.done():
                          agent_is_speaking_or_has_spoken = True
-                         logger.info("✅ Agent is generating/speaking - cancelling silence timeout")
+                         logger.info("[OK] Agent is generating/speaking - cancelling silence timeout")
 
                 # If no user speech detected AND agent hasn't taken over, hang up
                 if not user_has_spoken_after_greeting and not agent_is_speaking_or_has_spoken:
-                    logger.warning(f"⚠️  No user response detected after {NO_RESPONSE_TIMEOUT} seconds - hanging up")
+                    logger.warning(f"[WARN] No user response detected after {NO_RESPONSE_TIMEOUT} seconds - hanging up")
                     try:
                         await agent.hangup("no_answer", send_results=True)
                     except Exception as e:
                         logger.error(f"Error hanging up due to silence: {e}")
                 else:
-                    logger.info("✅ User responded OR agent continued conversation - silence timeout cancelled")
+                    logger.info("[OK] User responded OR agent continued conversation - silence timeout cancelled")
                     
             except asyncio.CancelledError:
                 pass
@@ -4248,10 +3981,10 @@ Trigger endCall."""
         
         if is_network_error:
             call_status = "failed"
-            logger.error(f"❌ Network/connection error during call setup: {e}")
+            logger.error(f"[X] Network/connection error during call setup: {e}")
         else:
             call_status = "failed"
-            logger.error(f"❌ Unexpected error during call setup: {error_type}: {e}")
+            logger.error(f"[X] Unexpected error during call setup: {error_type}: {e}")
             import traceback
             logger.error(traceback.format_exc())
         
@@ -4266,10 +3999,10 @@ Trigger endCall."""
         # Update Google Sheets with failure status
         try:
             agent.call_end_time = datetime.datetime.now()
-            await agent.send_call_results_to_sheets(call_status)
-            logger.info(f"✅ Error status ({call_status}) sent to Google Sheets")
+            await agent.send_call_results_to_sheets(call_status, failure_reason=error_message)
+            logger.info(f"[OK] Error status ({call_status}) sent to Google Sheets")
         except Exception as sheet_error:
-            logger.error(f"❌ Failed to update Google Sheets with error status: {sheet_error}")
+            logger.error(f"[X] Failed to update Google Sheets with error status: {sheet_error}")
         
         ctx.shutdown()
         return  # Exit early to avoid continuing with failed setup
@@ -4286,16 +4019,16 @@ Trigger endCall."""
         # Determine call status based on SIP error code
         if sip_status_code == 603:
             call_status = "declined"
-            logger.info(f"📞 Call declined (603) for {phone_number} - marking as 'Declined' in Google Sheets")
+            logger.info(f"[CALL] Call declined (603) for {phone_number} - marking as 'Declined' in Google Sheets")
         elif sip_status_code == 486:
             call_status = "busy"
-            logger.info(f"📞 Call busy (486) for {phone_number} - marking as 'Busy' in Google Sheets")
+            logger.info(f"[CALL] Call busy (486) for {phone_number} - marking as 'Busy' in Google Sheets")
         elif sip_status_code == 480:
             call_status = "no_answer"
-            logger.info(f"📞 Call no answer (480) for {phone_number} - marking as 'No Answer' in Google Sheets")
+            logger.info(f"[CALL] Call no answer (480) for {phone_number} - marking as 'No Answer' in Google Sheets")
         else:
             call_status = "failed"
-            logger.info(f"📞 Call failed (SIP {sip_status_code}) for {phone_number} - marking as 'Failed' in Google Sheets")
+            logger.info(f"[CALL] Call failed (SIP {sip_status_code}) for {phone_number} - marking as 'Failed' in Google Sheets")
         
         # Update Google Sheets with the status before shutting down
         try:
@@ -4303,10 +4036,11 @@ Trigger endCall."""
             agent.call_end_time = datetime.datetime.now()
             
             # Send results to Google Sheets
-            await agent.send_call_results_to_sheets(call_status)
-            logger.info(f"✅ SIP error status ({call_status}) sent to Google Sheets - dispatch script will move to next call")
+            sip_reason = f"SIP {sip_status_code} {sip_status}"
+            await agent.send_call_results_to_sheets(call_status, failure_reason=sip_reason)
+            logger.info(f"[OK] SIP error status ({call_status}) sent to Google Sheets - dispatch script will move to next call")
         except Exception as sheet_error:
-            logger.error(f"❌ Failed to update Google Sheets with SIP error status: {sheet_error}")
+            logger.error(f"[X] Failed to update Google Sheets with SIP error status: {sheet_error}")
             import traceback
             logger.error(traceback.format_exc())
         
@@ -4321,22 +4055,23 @@ if __name__ == "__main__":
     is_dev = "dev" in sys.argv
     
     if is_dev:
-        print("🔁 Agent running in auto-restart mode. Press Ctrl+C to stop.")
+        print("[LOOP] Agent running in auto-restart mode. Press Ctrl+C to stop.")
         while True:
             try:
                 cli.run_app(
                     WorkerOptions(
                         entrypoint_fnc=entrypoint,
                         agent_name="outbound-caller-dev",
+                        num_idle_processes=3,
                     )
                 )
-                print("⚠️  Agent worker exited. Restarting in 2 seconds...")
+                print("[WARN] Agent worker exited. Restarting in 2 seconds...")
             except KeyboardInterrupt:
-                print("🛑 Agent stopped by user.")
+                print("[STOP] Agent stopped by user.")
                 break
             except Exception as e:
-                print(f"❌ Agent crashed: {e}")
-                print("🔄 Restarting in 2 seconds...")
+                print(f"[X] Agent crashed: {e}")
+                print("[RESTART] Restarting in 2 seconds...")
             
             time.sleep(2)
     else:

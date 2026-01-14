@@ -108,6 +108,16 @@ def require_auth():
             }), 401
 
 
+@app.after_request
+def add_header(response):
+    """Add headers to both force latest IE rendering engine or Chrome Frame,
+    and also to cache the rendered page for 10 minutes."""
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 @app.route('/')
 def index():
     """Serve the main web interface."""
@@ -157,7 +167,7 @@ def update_config():
             
             return jsonify({
                 "success": True,
-                "message": "Configuration updated successfully. Please restart the agent to apply changes."
+                "message": "Configuration saved. Agent will pick up changes on next call (restart required for API keys)."
             })
         else:
             return jsonify({
@@ -581,14 +591,16 @@ def _monitor_dispatcher_output(process):
         logger.error(f"Error monitoring dispatcher: {e}")
     finally:
         # Send finished event
+        return_code = process.poll()
         final_event = {
             "type": "control",
             "timestamp": datetime.now().isoformat(),
-            "event": "process_ended"
+            "event": "process_ended",
+            "return_code": return_code
         }
         for q in _event_subscribers:
             try:
-                q.put(final_event)
+                q.put_nowait(final_event)
             except:
                 pass
 
@@ -647,6 +659,11 @@ def dispatch_parallel_calls():
             # Run in background
             import sys
             
+            # Force UTF-8 encoding and unbuffered output for child process to prevent Windows errors
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
+
             # Use Popen to run in background
             process = subprocess.Popen(
                 [sys.executable, script_path],
@@ -654,7 +671,8 @@ def dispatch_parallel_calls():
                 stderr=subprocess.STDOUT,  # Merge stderr into stdout
                 text=True,
                 bufsize=1,  # Line buffered
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                env=env
             )
             
             _dispatcher_process = process

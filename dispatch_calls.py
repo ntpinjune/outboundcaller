@@ -16,9 +16,11 @@ import base64
 import hmac
 import hashlib
 import subprocess
-from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+# Config Manager
+from config_manager import load_config
 
 # Google Sheets API
 from google.oauth2.credentials import Credentials
@@ -30,23 +32,21 @@ from googleapiclient.errors import HttpError
 # HTTP requests
 import requests
 
-# Load environment variables
-load_dotenv(dotenv_path=".env.local")
+# Load initial configuration
+config = load_config()
+integrations = config.get("integrations", {})
 
 # Configuration
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1hpr2PnycZIhXSBuzKFTyiLBpivgP5oq3sD1bf3vwcQU")
-SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1")
-AGENT_NAME = "outbound-caller-dev"
+SPREADSHEET_ID = integrations.get("google_sheet_id") or os.getenv("GOOGLE_SHEET_ID", "12wHDiAFCFKdXSfxdbyw6UhQSPxe8eZt3ehjzTDv2-Jo")
+SHEET_NAME = integrations.get("google_sheet_name") or os.getenv("GOOGLE_SHEET_NAME", "Sheet1")
+AGENT_NAME = os.getenv("AGENT_NAME", "outbound-caller-dev")
 
 # LiveKit credentials
-# Ensure URL uses https:// (not wss://) for HTTP requests
-# For local agent: Make sure you're running `python agent.py dev` locally
-# The dispatch will go through LiveKit Cloud but will route to your local agent if it's running
-livekit_url_raw = os.getenv("LIVEKIT_URL", "https://cold-caller-6vmkvmbr.livekit.cloud")
+livekit_url_raw = integrations.get("livekit_url") or os.getenv("LIVEKIT_URL", "https://cold-caller-6vmkvmbr.livekit.cloud")
 LIVEKIT_URL = livekit_url_raw.replace("wss://", "https://").replace("ws://", "http://")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+LIVEKIT_API_KEY = integrations.get("livekit_api_key") or os.getenv("LIVEKIT_API_KEY")
+LIVEKIT_API_SECRET = integrations.get("livekit_api_secret") or os.getenv("LIVEKIT_API_SECRET")
 
 # Use local agent if specified (set USE_LOCAL_AGENT=true in .env.local)
 # When using local agent, make sure cloud agent is stopped to avoid conflicts
@@ -287,8 +287,10 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
         logger.info(f"Found {len(pending_rows)} rows to call: {pending_count} new (Pending) + {retry_count} retries (No Answer)")
         return pending_rows
     
-    except HttpError as error:
-        logger.error(f"Error reading Google Sheets: {error}")
+    except Exception as error:
+        logger.error(f"Error reading Google Sheets (ID: {SPREADSHEET_ID}, Sheet: {SHEET_NAME}): {error}")
+        import traceback
+        logger.error(traceback.format_exc())
         return []
 
 
@@ -379,16 +381,24 @@ def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
         else:
             logger.info(f"☁️  Dispatching to CLOUD agent")
         
-        logger.info(f"Using LiveKit CLI to dispatch call to {phone_number}")
-        logger.debug(f"CLI command: {' '.join(cmd)}")
+        logger.info(f"🔍 Using LiveKit CLI to dispatch call to {phone_number}")
         
         # Run CLI command
+        logger.info(f"🔍 Running subprocess: {' '.join(cmd)}")
+        
+        # Suppress console window on Windows
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
+            
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            creationflags=creationflags
         )
+        logger.info(f"🔍 Subprocess finished with code {result.returncode}")
         
         if result.returncode == 0:
             logger.info(f"✅ Successfully dispatched call to {phone_number} via CLI")
@@ -428,6 +438,7 @@ def dispatch_to_livekit_http(row_data: Dict[str, Any]) -> Optional[str]:
             "phone_number": phone_number,
             "name": row_data["name"],
             "appointment_time": row_data.get("appointment_time", ""),
+            "business_name": row_data.get("business_name", ""),
             "row_id": str(row_data["row_number"])
         }
         
@@ -725,6 +736,7 @@ def process_calls(service, pending_rows: List[Dict[str, Any]]):
             failed += 1
             logger.error(f"✗ Failed to dispatch call")
             update_sheet_cell(service, row_number, "Status", "Failed")
+            update_sheet_cell(service, row_number, "Outcome Details", "Dispatch Failed")
     
     logger.info(f"\n=== Summary ===")
     logger.info(f"Total calls: {total}")

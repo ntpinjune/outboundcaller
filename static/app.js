@@ -429,7 +429,7 @@ function updateTTSpeedRange() {
 // Load configuration from API
 async function loadConfig() {
     try {
-        const response = await fetch(`${API_BASE}/api/config`);
+        const response = await fetch(`${API_BASE}/api/config?t=${Date.now()}`);
         const data = await response.json();
 
         if (data.success) {
@@ -451,11 +451,16 @@ function populateForm(config) {
     if (config.agent) {
         setValue('llm-provider', config.agent.llm_provider);
         updateLLMModelOptions(config.agent.llm_model); // Update models and set value
+        setValue('agent-location', config.agent.location || 'San Jose');
 
         setValue('tts-provider', config.agent.tts_provider || 'elevenlabs');
         setValue('elevenlabs-api-key', config.agent.elevenlabs_api_key || '');
         setValue('elevenlabs-voice-id', config.agent.elevenlabs_voice_id);
+        setValue('cartesia-api-key', config.agent.cartesia_api_key || '');
         setValue('cartesia-voice-id', config.agent.cartesia_voice_id);
+        setValue('cartesia-speed', config.agent.cartesia_speed || '1.0');
+        const emotions = config.agent.cartesia_emotion || [];
+        setValue('cartesia-emotion', Array.isArray(emotions) ? emotions.join(', ') : emotions);
         setValue('chatterbox-api-url', config.agent.chatterbox_api_url || 'http://localhost:8004');
         setValue('chatterbox-voice', config.agent.chatterbox_voice || 'Emily.wav');
         setValue('piper-model-path', config.agent.piper_model_path || 'piper1-gpl/en_US-lessac-medium.onnx');
@@ -596,14 +601,14 @@ function populateForm(config) {
     // Integrations
     if (config.integrations) {
         setValue('livekit-url', config.integrations.livekit_url);
-        setValue('livekit-url', config.integrations.livekit_url);
-        setValue('sip-trunk-id', config.integrations.sip_outbound_trunk_id);
-        setValue('webhook-url', config.integrations.webhook_url);
-        // Secrets are usually not returned, but if they are, populate
+        setValue('livekit-url', config.agent.livekit_url || '');
+        setValue('sip-trunk-id', config.agent.sip_trunk_id || '');
+        setValue('google-sheet-id', config.agent.google_sheet_id || '');
+        setValue('google-sheet-name', config.integrations.google_sheet_name || 'Sheet1');
+        setValue('webhook-url', config.integrations.webhook_url || '');
         if (config.integrations.webhook_secret) setValue('webhook-secret', config.integrations.webhook_secret);
         setValue('google-sheet-id', config.integrations.google_sheet_id);
         setValue('google-sheet-embed-url', config.integrations.google_sheet_embed_url);
-        setValue('google-sheet-name', config.integrations.google_sheet_name);
         setValue('aws-bucket', config.integrations.aws_bucket_name);
         setValue('aws-region', config.integrations.aws_region);
 
@@ -747,12 +752,16 @@ async function saveConfig() {
             agent: {
                 llm_provider: getValue('llm-provider'),
                 llm_model: getValue('llm-model'),
+                location: getValue('agent-location'),
                 tts_provider: getValue('tts-provider'),
                 tts_provider: getValue('tts-provider'),
                 openai_voice: getValue('openai-voice'),
                 elevenlabs_api_key: getValue('elevenlabs-api-key'),
                 elevenlabs_voice_id: getValue('elevenlabs-voice-id'),
+                cartesia_api_key: getValue('cartesia-api-key'),
                 cartesia_voice_id: getValue('cartesia-voice-id'),
+                cartesia_speed: getValue('cartesia-speed'),
+                cartesia_emotion: getValue('cartesia-emotion').split(',').map(e => e.trim()).filter(e => e),
                 chatterbox_api_url: getValue('chatterbox-api-url'),
                 chatterbox_voice: getValue('chatterbox-voice'),
                 chatterbox_model: 'chatterbox-turbo', // Default model
@@ -808,15 +817,14 @@ async function saveConfig() {
                 max_retries: parseInt(getValue('max-retries')),
                 wait_for_call_completion: getCheckbox('wait-for-completion'),
                 retry_no_answer: getCheckbox('retry-no-answer'),
+                openai_realtime_voice: getValue('openai-voice'),
                 test_phone_number: getValue('test-phone-number'),
             },
             integrations: {
                 livekit_url: getValue('livekit-url'),
                 sip_outbound_trunk_id: getValue('sip-trunk-id'),
-                sip_outbound_trunk_id: getValue('sip-trunk-id'),
                 webhook_url: getValue('webhook-url'),
                 webhook_secret: getValue('webhook-secret'),
-                google_sheet_id: getValue('google-sheet-id'),
                 google_sheet_id: getValue('google-sheet-id'),
                 google_sheet_embed_url: getValue('google-sheet-embed-url'),
                 google_sheet_name: getValue('google-sheet-name'),
@@ -1125,13 +1133,26 @@ async function startParallelDispatch() {
         return;
     }
 
-    // Show loading state
+    // Show loading state and clear logs
     statusEl.className = 'test-call-status info';
     statusEl.textContent = '🚀 Starting parallel dispatcher...';
     statusEl.style.display = 'block';
 
-    // Reset and show log
-    liveLog.textContent = '';
+    // Clear logs for fresh run
+    liveLog.textContent = ''; // Clear the live log content
+    const appendLog = (message, type = 'info') => { // Define appendLog here for immediate use
+        const div = document.createElement('div');
+        const time = new Date().toLocaleTimeString();
+        div.innerHTML = `<span style="color: #888">[${time}]</span> ${message}`;
+
+        if (type === 'error') div.style.color = '#ff4444';
+        if (type === 'success') div.style.color = '#00ff00';
+        if (type === 'highlight') div.style.fontWeight = 'bold';
+
+        liveLog.appendChild(div);
+        liveLog.scrollTop = liveLog.scrollHeight;
+    };
+    appendLog('🚀 Initializing parallel dispatcher...', 'info');
     liveLogContainer.style.display = 'block';
 
     try {
@@ -1209,7 +1230,9 @@ function setupEventSource() {
                 appendLog(data.message, 'log');
             } else if (data.type === 'control') {
                 if (data.event === 'process_ended') {
-                    appendLog('🛑 Dispatcher process ended', 'highlight');
+                    const rc = payload && payload.return_code !== undefined ? payload.return_code : 'unknown';
+                    const exitStatus = rc === 0 ? 'success' : (rc === null ? 'aborted' : 'error');
+                    appendLog(`🛑 Dispatcher process ended (Exit Code: ${rc})`, exitStatus === 'success' ? 'success' : 'highlight');
                     eventSource.close();
                     eventSource = null;
 
@@ -1385,10 +1408,107 @@ function refreshSheetIframe() {
 // Initialize persistence on load
 document.addEventListener('DOMContentLoaded', () => {
     const checkbox = document.getElementById('auto-refresh-sheet');
-    const savedState = localStorage.getItem('autoRefreshSheet');
-
-    if (savedState === 'true') {
-        checkbox.checked = true;
-        toggleAutoRefresh(); // Start the timer
+    if (checkbox) {
+        const savedState = localStorage.getItem('autoRefreshSheet');
+        if (savedState === 'true') {
+            checkbox.checked = true;
+            toggleAutoRefresh(); // Start the timer
+        }
     }
+
+    // Initialize prompt history
+    loadPromptHistory();
 });
+
+// --- Prompt History Logic ---
+const MAX_SAVED_PROMPTS = 20;
+const PROMPT_HISTORY_KEY = 'agent_prompt_history';
+
+function loadPromptHistory() {
+    const select = document.getElementById('prompt-history-select');
+    if (!select) return;
+
+    const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) || '[]');
+
+    // Clear existing options except first
+    while (select.options.length > 1) {
+        select.remove(1);
+    }
+
+    history.forEach((item, index) => {
+        const option = document.createElement('option');
+        // Truncate preview
+        const preview = item.content.substring(0, 40).replace(/\n/g, ' ') + (item.content.length > 40 ? '...' : '');
+        const dateStr = new Date(item.timestamp).toLocaleString();
+
+        option.value = index;
+        option.textContent = `${item.name || 'Untitled'} (${dateStr}) - ${preview}`;
+        select.appendChild(option);
+    });
+}
+
+function saveCurrentPromptToHistory() {
+    const content = document.getElementById('system-prompt').value;
+    if (!content || !content.trim()) {
+        alert('Cannot save empty prompt!');
+        return;
+    }
+
+    const nameInput = document.getElementById('prompt-save-name');
+    const name = nameInput.value.trim();
+
+    const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) || '[]');
+
+    // Check for duplicate content at the top to avoid spamming
+    if (history.length > 0 && history[0].content === content && history[0].name === name) {
+        // Just update timestamp if exact same
+        history[0].timestamp = new Date().toISOString();
+    } else {
+        // Add new item
+        history.unshift({
+            name: name,
+            content: content,
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    // Limit size
+    if (history.length > MAX_SAVED_PROMPTS) {
+        history.length = MAX_SAVED_PROMPTS;
+    }
+
+    localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(history));
+    loadPromptHistory();
+
+    // Feedback
+    const btn = document.querySelector('button[onclick="saveCurrentPromptToHistory()"]');
+    const originalText = btn.textContent;
+    btn.textContent = 'Saved!';
+    setTimeout(() => btn.textContent = originalText, 1500);
+}
+
+function loadSelectedPrompt() {
+    const select = document.getElementById('prompt-history-select');
+    const index = select.value;
+
+    if (index === "") return;
+
+    const history = JSON.parse(localStorage.getItem(PROMPT_HISTORY_KEY) || '[]');
+    const item = history[index];
+
+    if (item) {
+        if (confirm('Load this saved prompt? This will replace current text.')) {
+            document.getElementById('system-prompt').value = item.content;
+            if (item.name) document.getElementById('prompt-save-name').value = item.name;
+        }
+        // Reset select to default so user can select same item again if needed (change event)
+        select.value = "";
+    }
+}
+
+function clearPromptHistory() {
+    if (confirm('Are you sure you want to clear all saved prompts?')) {
+        localStorage.removeItem(PROMPT_HISTORY_KEY);
+        loadPromptHistory();
+    }
+}

@@ -41,7 +41,7 @@ CALL_START_DELAY = float(os.getenv("CALL_START_DELAY", "1.0"))  # Increased dela
 SKIP_SHEETS_UPDATES_DURING_DISPATCH = os.getenv("SKIP_SHEETS_UPDATES_DURING_DISPATCH", "false").lower() == "true"  # Enable updates by default now that we have safe locking
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("parallel-dispatch")
@@ -64,15 +64,12 @@ def emit_ui_event(event_type: str, data: Dict[str, Any]):
 # Thread pool for synchronous operations
 executor = ThreadPoolExecutor(max_workers=10)
 
-# Lock to serialize Google Sheets API calls (Google Sheets client is NOT thread-safe)
-# This prevents segmentation faults from concurrent access
-sheets_api_lock = asyncio.Lock()
-
-
-import signal
-
 # Global flag for graceful shutdown
 keep_running = True
+
+# Global locks and semaphores (initialized lazily to ensure correct event loop affinity)
+sheets_api_lock = None
+sheets_api_semaphore = None
 
 def signal_handler(sig, frame):
     """Handle termination signals."""
@@ -81,12 +78,11 @@ def signal_handler(sig, frame):
     keep_running = False
 
 # Register signal handlers
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Semaphore to limit concurrent Google Sheets API calls (not thread-safe)
-# Limit to 1 concurrent update to avoid SSL/connection issues and segfaults
-sheets_api_semaphore = asyncio.Semaphore(1)
+try:
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+except Exception as e:
+    logger.warning(f"⚠️  Could not register signal handlers: {e}")
 
 
 # Track active calls
@@ -98,8 +94,29 @@ async def update_sheet_cell_safe(service, row_number: int, column: str, value: s
     
     Uses both a lock and semaphore to ensure thread-safety and prevent segfaults.
     """
+    global sheets_api_lock, sheets_api_semaphore
+    
+    # Lazy initialization of lock and semaphore to ensure they are bound to the current event loop
+    if sheets_api_lock is None:
+        sheets_api_lock = asyncio.Lock()
+    if sheets_api_semaphore is None:
+        sheets_api_semaphore = asyncio.Semaphore(1)
+        
     async with sheets_api_semaphore:  # Limit concurrent API calls
         async with sheets_api_lock:  # Serialize access to prevent segfaults
+            # Ensure we have a valid service object (build is NOT thread-safe for creds refresh)
+            # Rebuilding it here ensures we are within the lock
+            current_service = service
+            if current_service is None:
+                try:
+                    current_service = await asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        get_google_sheets_service
+                    )
+                except Exception as e:
+                    logger.error(f"❌ Failed to build Google Sheets service: {e}")
+                    return False
+
             for attempt in range(max_retries):
                 try:
                     # Add timeout to prevent indefinite hanging (30 seconds)
@@ -107,7 +124,7 @@ async def update_sheet_cell_safe(service, row_number: int, column: str, value: s
                         asyncio.get_event_loop().run_in_executor(
                             executor,
                             update_sheet_cell,
-                            service,
+                            current_service,
                             row_number,
                             column,
                             value
@@ -167,21 +184,25 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
         # Update sheet to "Dispatching" BEFORE calling LiveKit to prevent duplicates
         if not SKIP_SHEETS_UPDATES_DURING_DISPATCH:
              try:
+                logger.info(f"🔍 [{row_number}] Updating sheet to Dispatching...")
                 await update_sheet_cell_safe(
                     service,
                     row_number,
                     "Status",
                     "Dispatching..."
                 )
+                logger.info(f"🔍 [{row_number}] Sheet updated to Dispatching")
              except Exception as e:
                 logger.warning(f"⚠️  [{row_number}] Failed to update status to Dispatching: {e}")
 
         # Dispatch to LiveKit (synchronous operation)
+        logger.info(f"🔍 [{row_number}] Calling dispatch_to_livekit_cli...")
         job_id = await asyncio.get_event_loop().run_in_executor(
             executor,
             dispatch_to_livekit_cli,
             row_data
         )
+        logger.info(f"🔍 [{row_number}] dispatch_to_livekit_cli returned job_id: {job_id}")
         
         if job_id:
             logger.info(f"✅ [{row_number}] Dispatched call to {phone_number}")
@@ -238,6 +259,12 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
                 "Status",
                 "Failed"
             )
+            await update_sheet_cell_safe(
+                service,
+                row_number,
+                "Outcome Details",
+                "Dispatch Failed - No Job ID returned"
+            )
             return {
                 "success": False,
                 "row_number": row_number,
@@ -259,6 +286,12 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
                     row_number,
                     "Status",
                     "Failed"
+                )
+                await update_sheet_cell_safe(
+                    service,
+                    row_number,
+                    "Outcome Details",
+                    f"Dispatch Error: {str(e)}"
                 )
             except:
                 pass
@@ -316,9 +349,9 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
 async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
     """Process calls in parallel with concurrency limit."""
     total = len(pending_rows)
-    logger.info(f"🚀 Starting parallel dispatch of {total} calls")
-    logger.info(f"⚙️  Max concurrent calls: {MAX_CONCURRENT_CALLS}")
-    logger.info(f"⏱️  Call start delay: {CALL_START_DELAY}s")
+    logger.info(f"[START] Starting parallel dispatch of {total} calls")
+    logger.info(f"[CONFIG] Max concurrent calls: {MAX_CONCURRENT_CALLS}")
+    logger.info(f"[CONFIG] Call start delay: {CALL_START_DELAY}s")
     
     if not PARALLEL_DIALING_ENABLED:
         logger.warning("⚠️  Parallel dialing is disabled. Set PARALLEL_DIALING_ENABLED=true")
@@ -370,7 +403,9 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
             for idx, row_data in enumerate(batch)
         ]
         
+        logger.debug(f"🔍 Starting asyncio.gather for batch {batch_num}...")
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        logger.debug(f"🔍 Finished asyncio.gather for batch {batch_num}")
         results.extend(batch_results)
         
         # Wait between batches to ensure previous calls have time to start
@@ -405,54 +440,67 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
 
 async def main_async():
     """Async main function."""
-    logger.info("=" * 60)
-    logger.info("LiveKit Parallel Call Dispatcher")
-    logger.info("=" * 60)
-    
-    # Validate environment variables
-    if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
-        logger.error("Missing LIVEKIT_API_KEY or LIVEKIT_API_SECRET in .env.local")
-        return
-    
-    if not LIVEKIT_URL:
-        logger.error("Missing LIVEKIT_URL in .env.local")
-        return
-    
-    # Get Google Sheets service
     try:
-        logger.info("Authenticating with Google Sheets...")
-        service = await asyncio.get_event_loop().run_in_executor(
+        logger.info("=" * 60)
+        logger.info("LiveKit Parallel Call Dispatcher")
+        logger.info("=" * 60)
+        
+        # Validate environment variables
+        if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+            logger.error("Missing LIVEKIT_API_KEY or LIVEKIT_API_SECRET in .env.local")
+            return
+        
+        if not LIVEKIT_URL:
+            logger.error("Missing LIVEKIT_URL in .env.local")
+            return
+        
+        # Get Google Sheets service
+        try:
+            logger.info("Authenticating with Google Sheets...")
+            service = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                get_google_sheets_service
+            )
+            logger.info("✅ Google Sheets authentication successful")
+        except Exception as e:
+            logger.error(f"❌ Failed to authenticate with Google Sheets: {e}")
+            return
+        
+        # Read pending rows
+        logger.info(f"Reading pending rows from sheet: {SPREADSHEET_ID}")
+        pending_rows = await asyncio.get_event_loop().run_in_executor(
             executor,
-            get_google_sheets_service
+            read_pending_rows,
+            service
         )
-        logger.info("✅ Google Sheets authentication successful")
+        
+        if not pending_rows:
+            logger.info("No pending calls to dispatch")
+            return
+        
+        # Process calls in parallel
+        await process_calls_parallel(service, pending_rows)
+        
+        logger.info("=" * 60)
+        logger.info("Parallel dispatch process completed")
+        logger.info("=" * 60)
     except Exception as e:
-        logger.error(f"❌ Failed to authenticate with Google Sheets: {e}")
-        return
-    
-    # Read pending rows
-    logger.info(f"Reading pending rows from sheet: {SPREADSHEET_ID}")
-    pending_rows = await asyncio.get_event_loop().run_in_executor(
-        executor,
-        read_pending_rows,
-        service
-    )
-    
-    if not pending_rows:
-        logger.info("No pending calls to dispatch")
-        return
-    
-    # Process calls in parallel
-    await process_calls_parallel(service, pending_rows)
-    
-    logger.info("=" * 60)
-    logger.info("Parallel dispatch process completed")
-    logger.info("=" * 60)
+        logger.critical(f"💥 CRITICAL ERROR in dispatcher main loop: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    finally:
+        # Clear active calls on exit
+        active_calls.clear()
 
 
 def main():
     """Main entry point."""
-    asyncio.run(main_async())
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Dispatcher stopped by user (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"Fatal error running dispatcher: {e}")
 
 
 if __name__ == "__main__":

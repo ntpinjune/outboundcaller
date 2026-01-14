@@ -9,9 +9,11 @@ with call results from the LiveKit agent.
 import os
 import json
 import logging
-from dotenv import load_dotenv
 from typing import Dict, Any, Optional
 from datetime import datetime
+
+# Config Manager
+from config_manager import load_config
 
 # Google Sheets API
 from google.oauth2.credentials import Credentials
@@ -19,13 +21,14 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Load environment variables
-load_dotenv(dotenv_path=".env.local")
+# Load initial configuration
+config = load_config()
+integrations = config.get("integrations", {})
 
 # Configuration
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1hpr2PnycZIhXSBuzKFTyiLBpivgP5oq3sD1bf3vwcQU")
-SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1")
+SPREADSHEET_ID = integrations.get("google_sheet_id") or os.getenv("GOOGLE_SHEET_ID", "12wHDiAFCFKdXSfxdbyw6UhQSPxe8eZt3ehjzTDv2-Jo")
+SHEET_NAME = integrations.get("google_sheet_name") or os.getenv("GOOGLE_SHEET_NAME", "Sheet1")
 
 logging.basicConfig(
     level=logging.INFO,

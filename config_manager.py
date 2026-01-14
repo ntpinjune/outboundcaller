@@ -9,6 +9,11 @@ import os
 import logging
 from typing import Dict, Any, Optional
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env.local if it exists
+# This ensures env vars are available before config is loaded or overridden
+load_dotenv(dotenv_path=".env.local")
 
 logger = logging.getLogger("config-manager")
 
@@ -17,10 +22,15 @@ CONFIG_SCHEMA = {
     "agent": {
         "llm_provider": "groq",  # groq, openai, openai-realtime
         "llm_model": "gpt-4o-mini",
+        "location": "San Jose",
         "openai_realtime_model": "gpt-4o-mini-realtime-preview-2024-12-17",
         "tts_provider": "elevenlabs",  # elevenlabs, chatterbox, piper
         "elevenlabs_voice_id": "6AUOG2nbfr0yFEeI0784",
         "elevenlabs_api_key": "", # Optional override for API Key
+        "cartesia_voice_id": "f786b574-daa5-4673-aa0c-cbe3e8534c02",
+        "cartesia_api_key": "", # Optional override for API Key
+        "cartesia_speed": "1.0",
+        "cartesia_emotion": [], # List of emotions e.g. ["positivity:high", "curiosity"]
         "chatterbox_api_url": "http://localhost:8004",
         "chatterbox_voice": "Emily.wav",
         "chatterbox_model": "chatterbox-turbo",
@@ -84,6 +94,7 @@ CONFIG_SCHEMA = {
         "max_wait_time": 600,
         "max_retries": 3,
         "retry_no_answer": True,
+        "openai_realtime_voice": "alum",
         "test_phone_number": "",
     },
     "integrations": {
@@ -203,6 +214,13 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         config["agent"]["elevenlabs_voice_id"] = os.getenv("ELEVENLABS_VOICE_ID")
     if os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVEN_API_KEY"):
         config["agent"]["elevenlabs_api_key"] = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVEN_API_KEY")
+    if os.getenv("CARTESIA_API_KEY"):
+        config["agent"]["cartesia_api_key"] = os.getenv("CARTESIA_API_KEY")
+    if os.getenv("CARTESIA_SPEED"):
+        config["agent"]["cartesia_speed"] = os.getenv("CARTESIA_SPEED")
+    if os.getenv("CARTESIA_EMOTION"):
+        # Expect comma-separated string from env, convert to list
+        config["agent"]["cartesia_emotion"] = [e.strip() for e in os.getenv("CARTESIA_EMOTION").split(",") if e.strip()]
     if os.getenv("CHATTERBOX_API_URL"):
         config["agent"]["chatterbox_api_url"] = os.getenv("CHATTERBOX_API_URL")
     if os.getenv("CHATTERBOX_VOICE"):
@@ -279,6 +297,12 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         config["integrations"]["google_sheet_embed_url"] = os.getenv("GOOGLE_SHEET_EMBED_URL")
     if os.getenv("GOOGLE_SHEET_NAME"):
         config["integrations"]["google_sheet_name"] = os.getenv("GOOGLE_SHEET_NAME")
+    if os.getenv("LIVEKIT_API_KEY"):
+        config["integrations"]["livekit_api_key"] = os.getenv("LIVEKIT_API_KEY")
+    if os.getenv("LIVEKIT_API_SECRET"):
+        config["integrations"]["livekit_api_secret"] = os.getenv("LIVEKIT_API_SECRET")
+    if os.getenv("SIP_OUTBOUND_TRUNK_ID"):
+        config["integrations"]["sip_outbound_trunk_id"] = os.getenv("SIP_OUTBOUND_TRUNK_ID")
     if os.getenv("AWS_BUCKET_NAME"):
         config["integrations"]["aws_bucket_name"] = os.getenv("AWS_BUCKET_NAME")
     if os.getenv("AWS_REGION"):

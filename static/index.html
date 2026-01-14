@@ -40,6 +40,11 @@
                     </select>
                 </div>
                 <div class="form-group">
+                    <label for="agent-location">Agent Location</label>
+                    <input type="text" id="agent-location" placeholder="San Jose">
+                    <small>The city/location the agent claims to be from.</small>
+                </div>
+                <div class="form-group">
                     <label for="llm-model">LLM Model</label>
                     <select id="llm-model">
                         <!-- Options populated by app.js -->
@@ -74,8 +79,19 @@
                     <input type="text" id="tts-voice-id" placeholder="6AUOG2nbfr0yFEeI0784">
                 </div>
                 <div class="form-group" id="cartesia-voice-group" style="display: none;">
+                    <label for="cartesia-api-key">Cartesia API Key (Optional)</label>
+                    <input type="password" id="cartesia-api-key" placeholder="sk_car_...">
+                    <small>Leave empty to use server environment variable</small>
+                    <div style="margin-bottom: 10px;"></div>
                     <label for="cartesia-voice-id">Cartesia Voice ID</label>
                     <input type="text" id="cartesia-voice-id" placeholder="e.g. 79a125e8-cd45-4c13-8a67-18808fc4399c">
+                    <div style="margin-bottom: 10px;"></div>
+                    <label for="cartesia-speed">Voice Speed (0.0 - 2.0)</label>
+                    <input type="number" id="cartesia-speed" placeholder="1.0" step="0.1" min="0.0" max="2.0">
+                    <div style="margin-bottom: 10px;"></div>
+                    <label for="cartesia-emotion">Emotions (comma-separated)</label>
+                    <input type="text" id="cartesia-emotion" placeholder="e.g. positivity:high, curiosity">
+                    <small>Available: anger, sadness, happiness, surprise, positivity:high, curiosity, etc.</small>
                 </div>
                 <div class="form-group" id="chatterbox-api-group" style="display: none;">
                     <label for="chatterbox-api-url">Chatterbox API URL</label>
@@ -467,12 +483,33 @@
         <p class="help-text">Edit the system prompt that controls the agent's conversation flow. <strong>⚠️
                 Important:</strong> You must restart the agent process after saving for changes to take effect.</p>
         <p class="help-text" style="margin-top: 8px; color: #666;">You can use placeholders:
-            <code>{'{business_name}'}</code>, <code>{'{customer_name}'}</code>, <code>{'{today_date}'}</code>,
-            <code>{'{current_time}'}</code>
+            <code>{business_name}</code>, <code>{customer_name}</code>, <code>{today_date}</code>,
+            <code>{current_time}</code>, <code>{location}</code>
         </p>
         <div id="prompt-info"
             style="display: none; margin-bottom: 10px; padding: 8px; background: #f0f0f0; border-radius: 4px; font-size: 0.9em;">
         </div>
+
+        <!-- Prompt History -->
+        <div class="form-group"
+            style="margin-bottom: 15px; background: #f8f9fa; padding: 10px; border-radius: 4px; border: 1px solid #dee2e6;">
+            <label style="display: flex; justify-content: space-between; align-items: center;">
+                <span>Saved Prompts (Local Browser Storage)</span>
+                <button type="button" class="btn btn-secondary" onclick="clearPromptHistory()"
+                    style="padding: 2px 8px; font-size: 0.8em; height: auto;">Clear</button>
+            </label>
+            <div style="display: flex; gap: 10px; margin-top: 5px;">
+                <select id="prompt-history-select" onchange="loadSelectedPrompt()" style="flex: 2; padding: 8px;">
+                    <option value="">-- Select a previously saved prompt --</option>
+                </select>
+                <input type="text" id="prompt-save-name" placeholder="Name (optional)" style="flex: 1;">
+                <button type="button" class="btn btn-primary" onclick="saveCurrentPromptToHistory()"
+                    style="padding: 4px 10px; background-color: #28a745;">Save</button>
+            </div>
+            <small style="margin-top: 4px; display: block; color: #666;">Prompts are saved to your browser's local
+                storage.</small>
+        </div>
+
         <textarea id="system-prompt" rows="30" placeholder="Loading system prompt..."></textarea>
         <div class="button-group">
             <button class="btn btn-primary" onclick="savePrompt()">Save Prompt</button>
@@ -504,7 +541,15 @@
             </div>
             <div class="form-group">
                 <label for="google-sheet-id">Google Sheet ID</label>
-                <input type="text" id="google-sheet-id" placeholder="1hpr2PnycZIhXSBuzKFTyiLBpivgP5oq3sD1bf3vwcQU">
+                <div style="display: flex; gap: 10px;">
+                    <input type="text" id="google-sheet-id" placeholder="12wHDiAFCFKdXSfxdbyw6UhQSPxe8eZt3ehjzTDv2-Jo"
+                        style="flex: 1;">
+                    <button type="button" class="btn btn-secondary" id="test-sheet-btn" onclick="testGoogleSheet()"
+                        style="padding: 0 15px; white-space: nowrap;">Test Connection</button>
+                </div>
+                <div id="sheet-test-results"
+                    style="margin-top: 10px; display: none; padding: 10px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; overflow-x: auto;">
+                </div>
             </div>
             <div class="form-group">
                 <label for="google-sheet-embed-url">Public Embed URL (Optional)</label>
