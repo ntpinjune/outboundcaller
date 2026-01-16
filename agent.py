@@ -1074,7 +1074,7 @@ async def entrypoint(ctx: JobContext):
         except Exception:
             logger.warning("Could not parse job metadata")
     
-    logger.info(f"Agent starting for: {phone_number}")
+    logger.info(f"[CALL START] RowID: {dial_info.get('row_id', 'unknown')}, Phone: {phone_number}, Room: {ctx.room.name}, JobID: {ctx.job.id if ctx.job else 'unknown'}")
     await start_call_recording(ctx, phone_number, ctx.room.name)
     
     customer_name = dial_info.get("name", "Test User").strip()

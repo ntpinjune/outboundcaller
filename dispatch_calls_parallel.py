@@ -15,6 +15,11 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
+# Load environment variables from .env.local if it exists
+# This ensures env vars are available before config is loaded or overridden
+# WE USE override=True to ensure that changes in .env.local take effect immediately
+load_dotenv(dotenv_path=".env.local", override=True)
+
 # Import from existing dispatch_calls.py
 from dispatch_calls import (
     get_google_sheets_service,
@@ -33,9 +38,6 @@ from dispatch_calls import (
     CALL_COMPLETION_CHECK_INTERVAL,
     MAX_WAIT_TIME,
 )
-
-# Load environment variables
-load_dotenv(dotenv_path=".env.local")
 
 # Parallel dialing configuration
 MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "3"))  # Default to 3 for simplicity
