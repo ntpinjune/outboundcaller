@@ -1198,9 +1198,15 @@ function setupEventSource() {
         if (type === 'error') div.style.color = '#ff4444';
         if (type === 'success') div.style.color = '#00ff00';
         if (type === 'highlight') div.style.fontWeight = 'bold';
+        if (type === 'info') div.style.color = '#17a2b8';
 
         liveLog.appendChild(div);
-        liveLog.scrollTop = liveLog.scrollHeight;
+
+        // Auto-scroll if checkbox is checked
+        const autoScroll = document.getElementById('auto-scroll-log');
+        if (!autoScroll || autoScroll.checked) {
+            liveLog.scrollTop = liveLog.scrollHeight;
+        }
     };
 
     eventSource.onmessage = (event) => {
@@ -1220,6 +1226,14 @@ function setupEventSource() {
                     appendLog(`❌ Failed ${payload.phone_number}: ${payload.error}`, 'error');
                 } else if (eventType === 'call_completed') {
                     appendLog(`🏁 Completed ${payload.phone_number} (Status: ${payload.status})`, 'info');
+                } else if (eventType === 'status_update') {
+                    // Update global status text instead of logging every time
+                    const statusEl = document.getElementById('parallel-dispatch-status');
+                    if (statusEl) {
+                        statusEl.textContent = `Active Calls: ${payload.active_calls_count} | Processed: ${payload.processed_calls}/${payload.total_calls}`;
+                    }
+                } else if (eventType === 'batch_started') {
+                    appendLog(`📦 Starting Batch ${payload.batch_num}/${payload.total_batches} (${payload.batch_size} calls)...`, 'highlight');
                 } else {
                     // Generic event
                     appendLog(JSON.stringify(payload));
@@ -1249,8 +1263,14 @@ function setupEventSource() {
 
     eventSource.onerror = (err) => {
         console.error('EventSource error:', err);
-        // Don't close immediately on error, browser will retry. 
-        // Only close if it's a permanent failure or if we want to stop.
+        // Display error in log
+        appendLog('⚠️ SSE connection interrupted. Attempting to reconnect...', 'error');
+
+        // Browser handles basic reconnection for EventSource, but we can help it
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+            console.log('EventSource closed unexpectedly, restarting in 3s...');
+            setTimeout(setupEventSource, 3000);
+        }
     };
 }
 
@@ -1414,6 +1434,18 @@ document.addEventListener('DOMContentLoaded', () => {
             checkbox.checked = true;
             toggleAutoRefresh(); // Start the timer
         }
+    }
+
+    const autoScrollCheckbox = document.getElementById('auto-scroll-log');
+    if (autoScrollCheckbox) {
+        const savedState = localStorage.getItem('autoScrollLog');
+        if (savedState === 'false') {
+            autoScrollCheckbox.checked = false;
+        }
+
+        autoScrollCheckbox.addEventListener('change', (e) => {
+            localStorage.setItem('autoScrollLog', e.target.checked);
+        });
     }
 
     // Initialize prompt history

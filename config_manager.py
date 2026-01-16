@@ -137,11 +137,11 @@ def load_config() -> Dict[str, Any]:
                 file_config = json.load(f)
                 # Deep merge with defaults
                 config = _deep_merge(config, file_config)
-                logger.info(f"✅ Loaded configuration from {CONFIG_FILE}")
+                logger.info(f"[SUCCESS] Loaded configuration from {CONFIG_FILE}")
         except Exception as e:
-            logger.warning(f"⚠️  Failed to load {CONFIG_FILE}: {e}. Using defaults and env vars.")
+            logger.warning(f"[WARNING] Failed to load {CONFIG_FILE}: {e}. Using defaults and env vars.")
     else:
-        logger.info(f"ℹ️  {CONFIG_FILE} not found. Using defaults and env vars.")
+        logger.info(f"[INFO] {CONFIG_FILE} not found. Using defaults and env vars.")
     
     # Override with environment variables (env vars take precedence)
     config = _apply_env_overrides(config)
@@ -158,10 +158,10 @@ def save_config(config: Dict[str, Any]) -> bool:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(safe_config, f, indent=2, ensure_ascii=False)
         
-        logger.info(f"✅ Configuration saved to {CONFIG_FILE}")
+        logger.info(f"[SUCCESS] Configuration saved to {CONFIG_FILE}")
         return True
     except Exception as e:
-        logger.error(f"❌ Failed to save configuration: {e}")
+        logger.error(f"[ERROR] Failed to save configuration: {e}")
         return False
 
 

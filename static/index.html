@@ -645,7 +645,14 @@
             </div>
 
             <div id="live-log-container" style="display: none; margin-top: 20px;">
-                <h4>🔴 Live Activity</h4>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <h4>🔴 Live Activity</h4>
+                    <label
+                        style="display: flex; align-items: center; cursor: pointer; user-select: none; font-size: 0.85em;">
+                        <input type="checkbox" id="auto-scroll-log" checked style="margin-right: 5px;">
+                        Auto-scroll
+                    </label>
+                </div>
                 <div id="live-log" style="
                         background: #1e1e1e; 
                         color: #00ff00; 

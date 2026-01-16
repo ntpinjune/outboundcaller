@@ -12,6 +12,7 @@ import httpx
 from twilio.rest import Client as TwilioClient
 import uuid
 from typing import Any, Optional
+import time
 
 # Import config manager
 try:
@@ -19,7 +20,7 @@ try:
     CONFIG_MANAGER_AVAILABLE = True
 except ImportError:
     CONFIG_MANAGER_AVAILABLE = False
-    print("⚠️  config_manager module not found. Using defaults.")
+    print("[WARN] config_manager module not found. Using defaults.")
 
 # Langfuse for observability
 try:
@@ -65,7 +66,7 @@ try:
 except (ImportError, AttributeError, Exception) as e:
     CHATTERBOX_TTS_AVAILABLE = False
     # Use print instead of logger since logger is initialized later
-    print(f"ℹ️  Chatterbox TTS not available: {e}. Install httpx if you want to use it.")
+    print(f"[INFO] Chatterbox TTS not available: {e}. Install httpx if you want to use it.")
 
 # Try to import dispatch_calls for Google Sheets integration
 try:
@@ -73,7 +74,7 @@ try:
     DISPATCH_AVAILABLE = True
 except (ImportError, Exception):
     DISPATCH_AVAILABLE = False
-    print("⚠️  dispatch_calls module not found or import failed. Google Sheets testing will be disabled.")
+    print("[WARN] dispatch_calls module not found or import failed. Google Sheets testing will be disabled.")
 
 # Try to import Piper TTS (optional)
 try:
@@ -86,7 +87,7 @@ try:
         OPENAI_TTS_AVAILABLE = True
     except (ImportError, AttributeError):
         OPENAI_TTS_AVAILABLE = False
-        print("ℹ️  OpenAI TTS plugin not available. Install livekit-plugins-openai to use it.")
+        print("[INFO] OpenAI TTS plugin not available. Install livekit-plugins-openai to use it.")
     
     # First, try to import from installed piper-tts package (recommended - has pre-built C extensions)
     try:
@@ -170,7 +171,7 @@ try:
     CONFIG_MANAGER_AVAILABLE = True
 except ImportError:
     CONFIG_MANAGER_AVAILABLE = False
-    logger.info("ℹ️  config_manager not available. Using environment variables only.")
+    logger.info("[INFO] config_manager not available. Using environment variables only.")
 
 # out-bound trunk ID will be loaded dynamically in entrypoint
 
@@ -189,13 +190,13 @@ if LANGFUSE_AVAILABLE:
                 secret_key=langfuse_secret_key,
                 host=langfuse_host,
             )
-            logger.info("✅ Langfuse initialized for observability")
+            logger.info("[SUCCESS] Langfuse initialized for observability")
         except Exception as e:
-            logger.warning(f"Failed to initialize Langfuse: {e}")
+            logger.warning(f"[WARNING] Failed to initialize Langfuse: {e}")
     else:
-        logger.info("ℹ️  Langfuse keys not found. Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable observability")
+        logger.info("[INFO] Langfuse keys not found. Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to enable observability")
 else:
-    logger.info("ℹ️  Langfuse not available. Install with: pip install langfuse")
+    logger.info("[INFO] Langfuse not available. Install with: pip install langfuse")
 
 
 def setup_langfuse_telemetry():
@@ -209,10 +210,10 @@ def setup_langfuse_telemetry():
         from livekit.agents.telemetry import set_tracer_provider
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor, BatchSpanProcessor
         import base64
     except ImportError as e:
-        logger.warning(f"OpenTelemetry packages not available: {e}. Langfuse OpenTelemetry tracing disabled.")
+        logger.warning(f"[WARNING] OpenTelemetry packages not available: {e}. Langfuse OpenTelemetry tracing disabled.")
         return
     
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
@@ -231,12 +232,18 @@ def setup_langfuse_telemetry():
         
         # Create and configure tracer provider
         trace_provider = TracerProvider()
-        trace_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        # Use BatchSpanProcessor with a larger delay to avoid QuotaStatusExceeded (429) errors
+        # Increased schedule_delay_millis to 10 seconds (default is 5s)
+        trace_provider.add_span_processor(BatchSpanProcessor(
+            OTLPSpanExporter(), 
+            schedule_delay_millis=10000,
+            max_export_batch_size=512
+        ))
         set_tracer_provider(trace_provider)
         
-        logger.info("✅ Langfuse OpenTelemetry tracing enabled for LiveKit Agents")
+        logger.info("[SUCCESS] Langfuse OpenTelemetry tracing enabled for LiveKit Agents")
     except Exception as e:
-        logger.warning(f"Failed to setup Langfuse OpenTelemetry tracing: {e}")
+        logger.warning(f"[WARNING] Failed to setup Langfuse OpenTelemetry tracing: {e}")
 
 
 
@@ -271,7 +278,7 @@ class TracingSTT(stt.STT):
             if span:
                 try:
                     span.end(metadata={"duration_ms": duration})
-                    logger.info(f"📊 STT Latency: {duration:.2f}ms")
+                    logger.info(f"[STATS] STT Latency: {duration:.2f}ms")
                 except: pass
 
     def stream(self, *, language: str | None = None, conn_options: Any | None = None) -> stt.SpeechStream:
@@ -315,7 +322,7 @@ class TracingSpeechStream(stt.SpeechStream):
                     duration = (end_time - self._start_time).total_seconds() * 1000
                     try:
                         self._span.end(metadata={"duration_ms": duration})
-                        logger.info(f"📊 STT Stream Latency (approx): {duration:.2f}ms")
+                        logger.info(f"[STATS] STT Stream Latency (approx): {duration:.2f}ms")
                     except: pass
                 self._span = None # Reset for next utterance
                 self._start_time = None
@@ -371,7 +378,7 @@ class TracingLLMStream(llm.LLMStream):
                         name="llm_ttft",
                         metadata={"duration_ms": ttft}
                     )
-                    logger.info(f"📊 LLM TTFT: {ttft:.2f}ms")
+                    logger.info(f"[STATS] LLM TTFT: {ttft:.2f}ms")
                 except: pass
                 self._ttft_recorded = True
             return chunk
@@ -380,7 +387,7 @@ class TracingLLMStream(llm.LLMStream):
                 total_duration = (datetime.datetime.now() - self._start_time).total_seconds() * 1000
                 try:
                     self._span.end(metadata={"total_duration_ms": total_duration})
-                    logger.info(f"📊 LLM Total Generation: {total_duration:.2f}ms")
+                    logger.info(f"[STATS] LLM Total Generation: {total_duration:.2f}ms")
                 except: pass
             raise
 
@@ -410,6 +417,9 @@ class TracingTTS(tts.TTS):
             stream = self._tts.synthesize(text, conn_options=conn_options)
             return TracingTTSStream(stream, self._langfuse, span, start_time)
         except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.error(f"🛑 [RATE LIMIT] TTS Provider ({self.label}) is rate limiting: {e}")
+                logger.error("👉 TIP: Reduce MAX_CONCURRENT_CALLS in .env.local or upgrade your TTS plan.")
             if span: span.end(level="ERROR", status_message=str(e))
             raise
 
@@ -434,7 +444,7 @@ class TracingTTSStream(tts.ChunkedStream):
                         name="tts_ttfa",
                         metadata={"duration_ms": ttfa}
                     )
-                    logger.info(f"📊 TTS Time-to-First-Audio: {ttfa:.2f}ms")
+                    logger.info(f"[STATS] TTS Time-to-First-Audio: {ttfa:.2f}ms")
                 except: pass
                 self._ttf_audio = True
             return frame
@@ -457,10 +467,15 @@ class VoicemailDetector:
     
     def __init__(self, agent_instance):
         self.agent = agent_instance
+        self.session = None  # Will be set in entrypoint
         self.detected = False
         self.hangup_task = None
         self.recent_transcripts = []  # Keep last few transcripts for pattern matching
         self.max_recent = 5  # Keep last 5 transcripts
+        
+    def set_session(self, session):
+        """Set the agent session reference for immediate closure."""
+        self.session = session
         
         # Voicemail detection patterns (case-insensitive)
         # These patterns are matched against individual transcript segments
@@ -486,18 +501,28 @@ class VoicemailDetector:
             r"mailbox cannot accept",
             r"finished recording",
             r"you may hang up",
+            r"voice mailbox",
+            r"leave a message",
+            r"leave a detailed message",
+            r"leave a detailed voice message",
+            r"detailed voice message",
+            r"leave a deep", # Caught from logs
             
             # "You've reached" patterns (very common)
             r"you've reached",
             r"you have reached",
             r"you reached",
+            r"you've reached the office",
             
             # Business voicemail patterns
             r"thank you for calling",
             r"thanks for calling",
+            r"you for calling",
             r"please leave your name",
             r"we'll get back to you",
             r"we will get back to you",
+            r"at the beep",
+            r"after the beep",
             r"return your call",
             r"i'll return your call",
             r"i will return your call",
@@ -506,6 +531,8 @@ class VoicemailDetector:
             r"brief message",
             r"helping other clients",
             r"currently helping",
+            r"we are sorry",
+            r"no one available",
             
             # Personal voicemail patterns
             r"this is.*please leave",
@@ -529,6 +556,10 @@ class VoicemailDetector:
             r"voice message system",
             r"dial.*for assistance",
             r"press.*for",
+            r"for more options",
+            r"to speak with",
+            r"for the next available",
+            r"if you are a new customer",
             
             # Number patterns (voicemail often reads numbers)
             r"message for.*\d+",
@@ -540,6 +571,7 @@ class VoicemailDetector:
             r"contact page",
             r"send a fax",
             r"press one",
+            r"please press one",
             r"press two",
             r"press three",
             r"press four",
@@ -556,7 +588,6 @@ class VoicemailDetector:
             r"to cancel",
             r"to send this message",
             r"delivery options",
-            r"for the fast.*response",
             r"leave a message here",
             r"if you're calling",
             r"if you are calling",
@@ -567,13 +598,18 @@ class VoicemailDetector:
             r"record your message after the tone",
             r"is not available",
             r"please leave a detailed message",
+            r"if you know your party's extension",
+            r"please enter it now",
+            r"leave a.*message",
+            r"you have reached a voicemail",
+            r"forwarded to the voicemail",
         ]
         
         # Compile patterns for faster matching
         import re
         self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.voicemail_patterns]
         
-        logger.info("✅ Voicemail detector initialized with pattern matching")
+        logger.info("[SUCCESS] Voicemail detector initialized with pattern matching")
     
     def check_transcript(self, transcript_text: str) -> bool:
         """Check if a transcript segment indicates voicemail.
@@ -595,7 +631,7 @@ class VoicemailDetector:
         transcript_lower = transcript_text.lower()
         for pattern in self.compiled_patterns:
             if pattern.search(transcript_lower):
-                logger.warning(f"🎯 Voicemail pattern detected: '{pattern.pattern}' in transcript: '{transcript_text[:100]}'")
+                logger.warning(f"[VOICEMAIL] Voicemail pattern detected: '{pattern.pattern}' in transcript: '{transcript_text[:100]}'")
                 self.detected = True
                 return True
         
@@ -604,7 +640,7 @@ class VoicemailDetector:
         combined_text = " ".join(self.recent_transcripts)
         for pattern in self.compiled_patterns:
             if pattern.search(combined_text):
-                logger.warning(f"🎯 Voicemail pattern detected in combined transcripts: '{pattern.pattern}' in: '{combined_text[:150]}'")
+                logger.warning(f"[VOICEMAIL] Voicemail pattern detected in combined transcripts: '{pattern.pattern}' in: '{combined_text[:150]}'")
                 self.detected = True
                 return True
         
@@ -617,7 +653,9 @@ class VoicemailDetector:
         ]
         indicator_count = sum(1 for indicator in voicemail_indicators if indicator in combined_text)
         if indicator_count >= 3 and len(combined_text) > 20:  # At least 3 indicators and meaningful text
-            logger.warning(f"🎯 Multiple voicemail indicators detected ({indicator_count}): '{combined_text[:150]}'")
+            matched_indicators = [ind for ind in voicemail_indicators if ind in combined_text]
+            logger.warning(f"[VOICEMAIL] Fuzzy detection matches: {matched_indicators}")
+            logger.warning(f"[VOICEMAIL] Multiple voicemail indicators detected ({indicator_count}): '{combined_text[:150]}'")
             self.detected = True
             return True
         
@@ -632,23 +670,36 @@ class VoicemailDetector:
         if self.hangup_task and not self.hangup_task.done():
             return
         
-        logger.info(f"📞 Voicemail detected for {self.agent.participant.identity if self.agent.participant else 'unknown'} - hanging up IMMEDIATELY")
+        logger.info(f"[VOICEMAIL] Voicemail detected for {self.agent.participant.identity if self.agent.participant else 'unknown'} - hanging up IMMEDIATELY")
         
         async def do_hangup():
             try:
                 # Mark call end time
                 self.agent.call_end_time = datetime.datetime.now()
                 
-                # Initiate hangup as quickly as possible (fire and forget sheet update)
-                # This ensures the user doesn't hear any weird silence or agent artifacts
+                # 1. STOP THE SESSION IMMEDIATELY (prevents agent from starting to talk)
+                if self.session:
+                    try:
+                        logger.info("[VOICEMAIL] Aborting agent session/speech...")
+                        await self.session.aclose(reason="voicemail")
+                    except Exception as e:
+                        logger.debug(f"Error closing session: {e}")
+                
+                # 2. Initiate hangup (fire and forget sheet update)
                 asyncio.create_task(self.agent.send_call_results_to_sheets("voicemail"))
                 
-                # Hang up immediately
+                # 3. Hang up the actual SIP call
+                logger.info(f"[CALL] Triggering immediate hangup for {self.agent.participant.identity if self.agent.participant else 'unknown'}")
                 await self.agent.hangup("voicemail", send_results=False)
-                logger.debug("✅ Call hung up successfully after voicemail detection")
+                logger.debug("[SUCCESS] Call hung up successfully after voicemail detection")
             except Exception as e:
-                logger.error(f"❌ Error handling voicemail detection: {e}")
-                # Try to hang up anyway if possible
+                # We expect 404 if room is already deleting, so just log as debug
+                if "not_found" in str(e).lower() or "404" in str(e):
+                    logger.debug(f"[INFO] Voicemail hangup note: Room already closing ({e})")
+                else:
+                    logger.error(f"[ERROR] Error handling voicemail detection: {e}")
+                
+                # Final attempt to ensure local state is clean
                 try:
                     await self.agent.hangup("voicemail", send_results=False)
                 except:
@@ -671,8 +722,10 @@ class OutboundCaller(Agent):
         tomorrow_date = tomorrow.strftime("%A, %B %d, %Y")
         today_date = today.strftime("%A, %B %d, %Y")
         
-        # Get current time in PST
-        now_pst = datetime.datetime.now() - timedelta(hours=8)  # Approximate PST offset
+        # Get current time in PST (UTC-8)
+        # Using a more robust way to handle the offset
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_pst = now_utc - timedelta(hours=8)
         current_time = now_pst.strftime("%I:%M %p")
         
         # Brief instructions for the Agent framework
@@ -722,6 +775,10 @@ class OutboundCaller(Agent):
         # Last detected user speech (for robust interruption)
         self.last_user_speech_time = None
         self.last_user_speech_text = None
+        
+        # Interim transcript tracking for forced commits
+        self._last_stt_interim = ""
+        self._last_stt_interim_time = 0
     
     async def stt_node(self, audio, model_settings):
         """Official LiveKit hook to intercept STT output - captures user speech."""
@@ -758,21 +815,46 @@ class OutboundCaller(Agent):
                     # Try to determine if it's final from other attributes
                     is_final = not getattr(event, 'is_interim', False)
                 
-                if transcript_text and isinstance(transcript_text, str) and transcript_text.strip() and is_final:
-                    # Do NOT append to self.transcript here to avoid duplicates with conversation_item_added
-                    # self.transcript.append(...) 
+                # Store interim text for backup commit if call ends abruptly
+                if not is_final and transcript_text and isinstance(transcript_text, str):
+                    self._last_stt_interim = transcript_text.strip()
+                    self._last_stt_interim_time = time.time()
                     
-                    logger.info(f"📝 [STT_NODE] Fast track user transcript: {transcript_text.strip()}")
+                    # Check for voicemail patterns IMMEDIATELY on interims for faster hangup
+                    if getattr(self, 'voicemail_detector', None) and self.voicemail_detector.check_transcript(self._last_stt_interim):
+                        asyncio.create_task(self.voicemail_detector.handle_voicemail_detection())
+
+                if transcript_text and isinstance(transcript_text, str) and transcript_text.strip() and is_final:
+                    # Clear backup since we have a final
+                    self._last_stt_interim = ""
+                    # Capture user transcript for reporting
+                    text_to_add = transcript_text.strip()
+                    
+                    # Simple duplicate check - don't add if same text + speaker added in last 5 seconds
+                    is_duplicate = False
+                    for existing in reversed(self.transcript[-5:]):
+                        if existing.get("speaker") == "Customer" and existing.get("text") == text_to_add:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        self.transcript.append({
+                            "speaker": "Customer",
+                            "text": text_to_add,
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "is_final": True
+                        })
+                        logger.info(f"[TRANSCRIPT] [STT_NODE] Captured customer transcript: {text_to_add[:80]}...")
                     
                     # Update robust tracking flag
                     try:
                         self.last_user_speech_time = datetime.datetime.now()
-                        self.last_user_speech_text = transcript_text.strip()
+                        self.last_user_speech_text = text_to_add
                     except: pass
                     
                     # Check for voicemail patterns IMMEDIATELY (Fastest path)
                     if getattr(self, 'voicemail_detector', None) and self.voicemail_detector.check_transcript(transcript_text.strip()):
-                        logger.warning(f"🚨 Voicemail detected via STT_NODE! Hanging up immediately...")
+                        logger.warning("[VOICEMAIL] Voicemail detected via STT_NODE! Hanging up immediately...")
                         asyncio.create_task(self.voicemail_detector.handle_voicemail_detection())
                 
                 yield event
@@ -789,11 +871,10 @@ class OutboundCaller(Agent):
         from livekit.agents._exceptions import APIStatusError, APIConnectionError
         
         try:
-            # Apply LLM temperature from config if set
-            # Get temperature from config manager (LLM_TEMPERATURE is defined in entrypoint scope, not accessible here)
+            # Get temperature from config manager
             try:
                 from config_manager import get_config_value
-                llm_temp = float(get_config_value("agent.llm_temperature", "1.0"))
+                llm_temp = float(get_config_value("agent.llm_temperature", 1.0))
             except:
                 llm_temp = 1.0  # Default fallback
             
@@ -834,7 +915,7 @@ class OutboundCaller(Agent):
             
             # Check if it's a quota/rate limit error
             if error_code == 429 or 'quota' in str(e).lower() or 'insufficient_quota' in error_type:
-                logger.error(f"❌ OpenAI API quota exceeded or rate limited: {e}")
+                logger.error(f"[ERROR] OpenAI API quota exceeded or rate limited: {e}")
                 logger.error("   The agent cannot generate responses. Please:")
                 logger.error("   1. Check your OpenAI billing at: https://platform.openai.com/account/billing")
                 logger.error("   2. Upgrade your plan or add payment method")
@@ -843,7 +924,7 @@ class OutboundCaller(Agent):
                 # Try to hang up gracefully if we have a session
                 try:
                     if hasattr(self, '_agent_session') and self._agent_session:
-                        logger.warning("⚠️  Hanging up call due to API quota error")
+                        logger.warning("[WARNING] Hanging up call due to API quota error")
                         await self.hangup("failed", send_results=True)
                 except Exception as hangup_error:
                     logger.error(f"Failed to hang up gracefully: {hangup_error}")
@@ -852,7 +933,7 @@ class OutboundCaller(Agent):
                 raise
             else:
                 # Other API errors - log and re-raise
-                logger.error(f"❌ LLM API error: {e}")
+                logger.error(f"[ERROR] LLM API error: {e}")
                 raise
     
     async def tts_node(self, text, model_settings):
@@ -937,7 +1018,7 @@ class OutboundCaller(Agent):
                 },
                 user_id=self.dial_info.get("phone_number", "unknown"),
             )
-            logger.info(f"📊 Langfuse trace initialized: {self.trace_id}")
+            logger.info(f"[STATS] Langfuse trace initialized: {self.trace_id}")
         except Exception as e:
             logger.error(f"Failed to initialize Langfuse trace: {e}")
             self.langfuse_trace = None
@@ -980,6 +1061,27 @@ class OutboundCaller(Agent):
     def set_participant(self, participant: rtc.RemoteParticipant):
         self.participant = participant
 
+    async def finalize_transcripts(self):
+        """Commit any pending interim transcripts before closing."""
+        if hasattr(self, '_last_stt_interim') and self._last_stt_interim.strip():
+            text_to_add = self._last_stt_interim.strip()
+            # Duplicate check
+            is_duplicate = False
+            for existing in reversed(self.transcript[-5:]):
+                if existing.get("speaker") == "Customer" and existing.get("text") == text_to_add:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                self.transcript.append({
+                    "speaker": "Customer",
+                    "text": text_to_add,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"[TRANSCRIPT] Committed pending interim user speech: {text_to_add[:80]}...")
+            self._last_stt_interim = ""
+
     def format_transcript(self) -> str:
         """Format transcript entries into readable text."""
         lines = []
@@ -1004,18 +1106,18 @@ class OutboundCaller(Agent):
                 session = getattr(self, '_agent_session', None)
             
             if session is None:
-                logger.warning("📝 No session available for transcript extraction")
+                logger.warning("[WARNING] No session available for transcript extraction")
                 if self.transcript:
                     return self.format_transcript()
                 return "No transcript available"
             
             # Method 1: Try session.history (official LiveKit method - most reliable)
             if hasattr(session, 'history') and session.history:
-                logger.debug(f"📝 Found session.history: {type(session.history)}")
+                logger.debug(f"[TRANSCRIPT] Found session.history: {type(session.history)}")
                 try:
                     history_items = session.history
                     if isinstance(history_items, list) and len(history_items) > 0:
-                        logger.debug(f"📝 Found {len(history_items)} items in session.history")
+                        logger.debug(f"[TRANSCRIPT] Found {len(history_items)} items in session.history")
                         for idx, item in enumerate(history_items):
                             # Extract role and content
                             role = None
@@ -1060,21 +1162,21 @@ class OutboundCaller(Agent):
                             
                             if content_text.strip():
                                 transcript_lines.append(f"{speaker}: {content_text.strip()}")
-                                logger.debug(f"📝 Added from history {idx+1}: {speaker} - {content_text.strip()[:50]}...")
+                                logger.debug(f"[TRANSCRIPT] Added from history {idx+1}: {speaker} - {content_text.strip()[:50]}...")
                         
                         if transcript_lines:
-                            logger.info(f"✅ Extracted transcript from session.history ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
+                            logger.info(f"[SUCCESS] Extracted transcript from session.history ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
                             return "\n".join(transcript_lines)
                 except Exception as e:
-                    logger.debug(f"📝 Error accessing session.history: {e}")
+                    logger.debug(f"[TRANSCRIPT] Error accessing session.history: {e}")
             
             # Method 2: Try to get from chat_ctx (LLM conversation history)
             if hasattr(session, 'chat_ctx') and session.chat_ctx:
                 chat_ctx = session.chat_ctx
-                logger.info(f"📝 chat_ctx available, type: {type(chat_ctx)}")
+                logger.info(f"[TRANSCRIPT] chat_ctx available, type: {type(chat_ctx)}")
                 if hasattr(chat_ctx, 'items'):
                     items_count = len(chat_ctx.items) if hasattr(chat_ctx.items, '__len__') else 'unknown'
-                    logger.info(f"📝 chat_ctx.items available, count: {items_count}")
+                    logger.info(f"[TRANSCRIPT] chat_ctx.items available, count: {items_count}")
                     for idx, item in enumerate(chat_ctx.items):
                         if isinstance(item, llm.ChatMessage):
                             role = item.role
@@ -1102,24 +1204,24 @@ class OutboundCaller(Agent):
                             
                             if content_text.strip():
                                 transcript_lines.append(f"{speaker}: {content_text.strip()}")
-                                logger.info(f"📝 Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
+                                logger.info(f"[TRANSCRIPT] Added message {idx+1}: {speaker} - {content_text.strip()[:50]}... ({len(content_text)} chars)")
             
                     if transcript_lines:
-                        logger.info(f"✅ Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
+                        logger.info(f"[SUCCESS] Extracted transcript from chat_ctx.items ({len(transcript_lines)} messages, {sum(len(line) for line in transcript_lines)} total chars)")
                         return "\n".join(transcript_lines)
                 else:
-                    logger.warning("📝 chat_ctx.items not available")
+                    logger.warning("[WARNING] chat_ctx.items not available")
             
             # Fallback: Use real-time transcriptions if available
             if self.transcript:
-                logger.info(f"✅ Using manual transcript entries ({len(self.transcript)} entries)")
+                logger.info(f"[SUCCESS] Using manual transcript entries ({len(self.transcript)} entries)")
                 return self.format_transcript()
             
-            logger.warning("⚠️  Could not extract transcript from conversation history")
+            logger.warning("[WARNING] Could not extract transcript from conversation history")
             return "No transcript available"
             
         except Exception as e:
-            logger.error(f"❌ Error extracting transcript from conversation: {e}")
+            logger.error(f"[ERROR] Error extracting transcript from conversation: {e}")
             import traceback
             logger.error(traceback.format_exc())
             # Fallback to real-time transcriptions
@@ -1186,11 +1288,11 @@ class OutboundCaller(Agent):
             async with httpx.AsyncClient() as client:
                 response = await client.post(webhook_url, json=full_payload, headers=headers, timeout=10.0)
                 if response.status_code >= 200 and response.status_code < 300:
-                    logger.info(f"✅ Webhook sent successfully to {webhook_url}")
+                    logger.info(f"[SUCCESS] Webhook sent successfully to {webhook_url}")
                 else:
-                    logger.warning(f"⚠️  Webhook failed with status {response.status_code}: {response.text}")
+                    logger.warning(f"[WARNING] Webhook failed with status {response.status_code}: {response.text}")
         except Exception as e:
-            logger.error(f"❌ Error sending webhook: {e}")
+            logger.error(f"[ERROR] Error sending webhook: {e}")
 
     async def send_call_results_to_sheets(self, call_status: str, failure_reason: str = None):
         """Update Google Sheets directly with call results (no Make.com needed)."""
@@ -1226,7 +1328,7 @@ class OutboundCaller(Agent):
         
         # First, try to get transcript from real-time tracking (most accurate)
         realtime_transcript = self.format_transcript()
-        logger.info(f"📝 Real-time transcript entries: {len(self.transcript)}, formatted: {len(realtime_transcript)} chars")
+        logger.info(f"[TRANSCRIPT] Real-time transcript entries: {len(self.transcript)}, formatted: {len(realtime_transcript)} chars")
         
         # Then, try to get from conversation history (more complete, includes context)
         conversation_transcript = ""
@@ -1241,10 +1343,10 @@ class OutboundCaller(Agent):
         # Otherwise use real-time transcript
         if conversation_transcript and len(conversation_transcript) > 20:
             transcript_text = conversation_transcript
-            logger.info(f"📝 Using conversation history transcript ({len(transcript_text)} characters)")
+            logger.info(f"[TRANSCRIPT] Using conversation history transcript ({len(transcript_text)} characters)")
         elif realtime_transcript and len(realtime_transcript) > 10:
             transcript_text = realtime_transcript
-            logger.info(f"📝 Using real-time transcript ({len(transcript_text)} characters)")
+            logger.info(f"[TRANSCRIPT] Using real-time transcript ({len(transcript_text)} characters)")
         else:
             # Fallback: combine both if available
             if realtime_transcript:
@@ -1253,7 +1355,7 @@ class OutboundCaller(Agent):
                 transcript_text = conversation_transcript
             else:
                 transcript_text = "No transcript available"
-                logger.warning("⚠️  No transcript data available from any source")
+                logger.warning("[WARNING] No transcript data available from any source")
                 logger.warning(f"   Real-time entries: {len(self.transcript)}, Real-time formatted: {len(realtime_transcript)}, Conversation: {len(conversation_transcript)}")
         
         # Log what we're sending to Google Sheets for debugging
@@ -1363,16 +1465,27 @@ class OutboundCaller(Agent):
         # Mark call end time and send results if not already sent
         if send_results and not self.call_end_time:
             self.call_end_time = datetime.datetime.now()
+            # Ensure any pending interim speech is committed
+            await self.finalize_transcripts()
             await self.send_call_results_to_sheets(call_status, failure_reason)
         elif not self.call_end_time:
             self.call_end_time = datetime.datetime.now()
+            await self.finalize_transcripts()
 
         job_ctx = get_job_context()
-        await job_ctx.api.room.delete_room(
-            api.DeleteRoomRequest(
-                room=job_ctx.room.name,
+        try:
+            await job_ctx.api.room.delete_room(
+                api.DeleteRoomRequest(
+                    room=job_ctx.room.name,
+                )
             )
-        )
+        except Exception as e:
+            # Ignore 404 / Not Found errors - means room is already gone or being deleted
+            if "not_found" in str(e).lower() or "404" in str(e):
+                logger.debug(f"[INFO] Hangup note: Room {job_ctx.room.name} already closed or not found.")
+            else:
+                logger.error(f"❌ Error during hangup/delete_room: {e}")
+                raise
 
     @function_tool()
     async def transfer_call(self, ctx: RunContext, reason: str = ""):
@@ -2018,6 +2131,9 @@ async def entrypoint(ctx: JobContext):
     
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect()
+    
+    # Event to keep entrypoint alive until call is finished
+    shutdown_event = asyncio.Event()
 
     # Parse metadata - handle Playground (empty/invalid) vs Dispatch (populated)
     dial_info = {}
@@ -3141,7 +3257,7 @@ Trigger endCall."""
                     return result
                 
                 stt_instance.transcribe = wrapped_transcribe
-                logger.info("✅ Wrapped STT transcribe method BEFORE session creation")
+                logger.info("[OK] Wrapped STT transcribe method BEFORE session creation")
         except Exception as e:
             logger.warning(f"⚠️  Could not wrap STT transcribe method: {e}")
         
@@ -3158,7 +3274,7 @@ Trigger endCall."""
     if stt_instance is not None and hasattr(stt_instance, 'set_transcript_callback'):
         try:
             stt_instance.set_transcript_callback(track_user_transcript)
-            logger.info("✅ Set transcript callback on STT wrapper")
+            logger.info("[OK] Set transcript callback on STT wrapper")
         except Exception as e:
             logger.warning(f"⚠️  Could not set STT transcript callback: {e}")
     
@@ -3325,7 +3441,7 @@ Trigger endCall."""
     # Formula: min_interruption_duration = 2.0 * (1.0 - interruption_sensitivity)
     min_interruption_duration = 2.0 * (1.0 - INTERRUPTION_SENSITIVITY)
     min_interruption_duration = max(0.0, min(2.0, min_interruption_duration))  # Clamp to 0.0-2.0
-    logger.info(f"✅ Interruption sensitivity: {INTERRUPTION_SENSITIVITY} (min_interruption_duration: {min_interruption_duration:.2f}s)")
+    logger.info(f"[OK] Interruption sensitivity: {INTERRUPTION_SENSITIVITY} (min_interruption_duration: {min_interruption_duration:.2f}s)")
     
     # Wrap LLM and TTS with Langfuse Tracing if available
     if langfuse:
@@ -3333,24 +3449,24 @@ Trigger endCall."""
         if llm_instance:
             try:
                 llm_instance = TracingLLM(llm_instance, langfuse)
-                logger.info("✅ LLM wrapped with Langfuse Tracing")
+                logger.info("[OK] LLM wrapped with Langfuse Tracing")
             except Exception as e:
-                logger.warning(f"⚠️  Could not wrap LLM: {e}")
+                logger.warning(f"[WARN] Could not wrap LLM: {e}")
         
         # Wrap TTS if it exists (only for non-Realtime models)
         if tts_instance:
             try:
                 tts_instance = TracingTTS(tts_instance, langfuse)
-                logger.info("✅ TTS wrapped with Langfuse Tracing")
+                logger.info("[OK] TTS wrapped with Langfuse Tracing")
             except Exception as e:
-                logger.warning(f"⚠️  Could not wrap TTS: {e}")
+                logger.warning(f"[WARN] Could not wrap TTS: {e}")
 
     # Create VAD instance with optimized settings
     vad_instance = silero.VAD.load(
-        min_silence_duration=0.2,
+        min_silence_duration=0.1,
         min_speech_duration=0.05,
     )
-    logger.info(f"✅ VAD initialized with min_silence_duration=0.2, min_speech_duration=0.05")
+    logger.info(f"[OK] VAD initialized with min_silence_duration=0.1, min_speech_duration=0.05")
 
     session = AgentSession(
         vad=vad_instance,
@@ -3362,9 +3478,35 @@ Trigger endCall."""
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,  # Higher = wait longer for user to continue
         # Configure interruption sensitivity
         allow_interruptions=True,  # Always allow interruptions
-        min_interruption_duration=0.5,  # Force faster interruption detection (0.5s instead of 1.0s)
+        min_interruption_duration=0.2,  # Force faster interruption detection (0.2s instead of 0.5s)
         min_interruption_words=0,  # No minimum words required
+        # Ultra-low latency optimizations
+        preemptive_generation=True, # Start synthesis before user finish speaking
     )
+
+    # --- Transcript & Event Listeners ---
+    @session.on("user_transcript")
+    def _on_user_transcript(transcript: stt.SpeechEvent):
+        if transcript.is_final:
+            text = transcript.alternatives[0].text.strip()
+            if text:
+                agent.transcript.append({
+                    "speaker": "Customer",
+                    "text": text,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "is_final": True
+                })
+                logger.info(f"[EVENT] Captured customer transcript: {text[:80]}...")
+
+    @session.on("agent_transcript")
+    def _on_agent_transcript(transcript: tts.AudioChunk):
+        # AudioChunk doesn't have text, but VoicePipelineAgent emits agent_transcript events 
+        # for LLM responses. If using VoicePipelineAgent, it provides the text.
+        # But here we are using AgentSession directly. 
+        # Actually, for AgentSession, we might need to listen to different events
+        # or rely on our tts_node. Let's stick to user_transcript for now
+        # and keep tts_node as it's already working for agent speech.
+        pass
 
     # --- Metrics & Usage Collection ---
     usage_collector = metrics.UsageCollector()
@@ -3374,11 +3516,11 @@ Trigger endCall."""
         # Log metrics to LiveKit Cloud (enabled by default)
         # Also collect for local summary
         usage_collector.collect(ev.metrics)
-        logger.debug(f"📊 Metrics collected: {ev.metrics}")
+        logger.debug(f"[STATS] Metrics collected: {ev.metrics}")
 
     async def log_usage():
         summary = usage_collector.get_summary()
-        logger.info(f"📋 Session Usage Summary: {summary}")
+        logger.info(f"[STATS] Session Usage Summary: {summary}")
     
     ctx.add_shutdown_callback(log_usage)
     # ----------------------------------
@@ -3410,7 +3552,7 @@ Trigger endCall."""
         # Get latest SIP trunk ID from config
         outbound_trunk_id = config.get("integrations", {}).get("sip_outbound_trunk_id") or os.getenv("SIP_OUTBOUND_TRUNK_ID")
         
-        logger.info(f"📞 Dialing {phone_number} via SIP trunk {outbound_trunk_id}...")
+        logger.info(f"[CALL] Dialing {phone_number} via SIP trunk {outbound_trunk_id}...")
         for retry_attempt in range(max_sip_retries + 1):
             try:
                 await ctx.api.sip.create_sip_participant(
@@ -3437,18 +3579,18 @@ Trigger endCall."""
                     "disconnected" in str(sip_error).lower() or
                     "connection" in str(sip_error).lower()
                 ):
-                    logger.warning(f"⚠️  SIP connection error (attempt {retry_attempt + 1}/{max_sip_retries + 1}): {sip_error}. Retrying in {sip_retry_delay}s...")
+                    logger.warning(f"[WARN] SIP connection error (attempt {retry_attempt + 1}/{max_sip_retries + 1}): {sip_error}. Retrying in {sip_retry_delay}s...")
                     await asyncio.sleep(sip_retry_delay)
                     sip_retry_delay *= 2  # Exponential backoff
                 else:
                     # Non-retryable error or max retries reached
-                    logger.error(f"❌ Failed to create SIP participant after {retry_attempt + 1} attempts: {sip_error}")
+                    logger.error(f"[ERROR] Failed to create SIP participant after {retry_attempt + 1} attempts: {sip_error}")
                     raise
         
         if not sip_participant_created:
             raise RuntimeError("Failed to create SIP participant after all retry attempts")
     else:
-        logger.info("🌐 Web/Test mode detected - skipping SIP dialing. Waiting for user to join room...")
+        logger.info("[OFFLINE] Web/Test mode detected - skipping SIP dialing. Waiting for user to join room...")
         sip_participant_created = True  # Pretend we created it so we proceed to wait logic
     
     try:
@@ -3456,7 +3598,7 @@ Trigger endCall."""
         try:
             await asyncio.wait_for(session_started, timeout=30.0)
         except asyncio.TimeoutError:
-            logger.error("❌ Session start timed out after 30 seconds")
+            logger.error("[ERROR] Session start timed out after 30 seconds")
             raise RuntimeError("Session start timed out")
         
         # wait for participant join with timeout
@@ -3466,7 +3608,7 @@ Trigger endCall."""
                 timeout=60.0  # 60 second timeout for participant to join
             )
         except asyncio.TimeoutError:
-            logger.error(f"❌ Participant {participant_identity} did not join within 60 seconds")
+            logger.error(f"[ERROR] Participant {participant_identity} did not join within 60 seconds")
             raise RuntimeError(f"Participant join timeout for {participant_identity}")
         logger.info(f"participant joined: {participant.identity}")
 
@@ -3484,7 +3626,8 @@ Trigger endCall."""
         
         # Initialize voicemail detector
         agent.voicemail_detector = VoicemailDetector(agent)
-        logger.info("✅ Voicemail detector initialized")
+        agent.voicemail_detector.set_session(session)
+        logger.info("[OK] Voicemail detector initialized and session linked")
         
         # OFFICIAL METHOD: Subscribe to conversation_item_added event
         # This is the recommended way to track all conversation items (user and agent)
@@ -3493,7 +3636,7 @@ Trigger endCall."""
             """Official LiveKit method to capture conversation items."""
             track_conversation_item(item)
         
-        logger.info("✅ Subscribed to conversation_item_added events (official method)")
+        logger.info("[OK] Subscribed to conversation_item_added events (official method)")
         
         # Redundant transcript capture methods removed.
         # - Voicemail detection is handled in OutboundCaller.stt_node (fast path)
@@ -3514,10 +3657,16 @@ Trigger endCall."""
                 logger.debug(f"Failed to log call start to Langfuse: {e}")
         
         # Wrap session.generate_reply to capture LLM interactions for Langfuse
+        # AND to prevent generation if voicemail is detected
         original_generate_reply = session.generate_reply
         
         async def wrapped_generate_reply(*args, **kwargs):
-            """Wrap generate_reply to log LLM interactions to Langfuse."""
+            """Wrap generate_reply to log LLM interactions and check for voicemail."""
+            # CHECK FOR VOICEMAIL FIRST
+            if agent.voicemail_detector and agent.voicemail_detector.detected:
+                logger.info("[VOICEMAIL] Skipping reply generation - voicemail detected")
+                return None
+                
             if agent.langfuse_trace:
                 try:
                     # Capture input (user message or context)
@@ -3531,34 +3680,35 @@ Trigger endCall."""
                     response = await original_generate_reply(*args, **kwargs)
                     
                     # Capture output (agent response)
-                    output_text = ""
-                    if hasattr(response, 'text'):
-                        output_text = response.text
-                    elif isinstance(response, str):
-                        output_text = response
-                    elif hasattr(response, 'content'):
-                        output_text = response.content
+                    # Note: response is often a stream, so we might not be able to log it fully here
+                    # unless we wrap the stream too. But the base system handles transcript logging.
                     
                     # Log to Langfuse as generation
+                    # We only log the fact that generation was triggered if we don't have the text yet
                     agent._log_to_langfuse("generation", {
-                        "input": input_text[:1000] if input_text else "No input captured",  # Limit length
-                        "output": output_text[:1000] if output_text else "No output captured",
-                        "function_calls": [],
-                        "tokens": {}
+                        "input": input_text[:1000] if input_text else "No input captured",
+                        "output": "Streaming response started",
+                        "metadata": {"job_id": agent.session_id}
                     })
                     
                     return response
                 except Exception as e:
+                    if "429" in str(e) or "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                        logger.error(f"🛑 [RATE LIMIT] LLM Provider is rate limiting: {e}")
+                        logger.error("👉 TIP: Reduce MAX_CONCURRENT_CALLS in .env.local or check API quotas.")
                     logger.debug(f"Failed to log LLM generation to Langfuse: {e}")
-                    # Still return the response even if logging fails
                     return await original_generate_reply(*args, **kwargs)
             else:
-                # No Langfuse trace, just call original
-                return await original_generate_reply(*args, **kwargs)
+                try:
+                    return await original_generate_reply(*args, **kwargs)
+                except Exception as e:
+                    if "429" in str(e) or "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                        logger.error(f"🛑 [RATE LIMIT] LLM Provider is rate limiting: {e}")
+                    raise
         
         # Replace the method
         session.generate_reply = wrapped_generate_reply
-        logger.info("✅ Wrapped session.generate_reply for Langfuse LLM tracking")
+        logger.info("[OK] Wrapped session.generate_reply for Langfuse LLM tracking")
         
         # Note: Transcripts are captured from:
         # 1. LiveKit STT transcription events (real-time audio transcription)
@@ -3581,7 +3731,7 @@ Trigger endCall."""
                         if participant:
                             # Check if participant is still in room
                             if participant not in ctx.room.remote_participants.values():
-                                logger.info("📝 Participant no longer in room - sending transcript...")
+                                logger.info("[TRANSCRIPT] Participant no longer in room - sending transcript...")
                                 break
                     except Exception:
                         # Participant might be None or invalid
@@ -3590,21 +3740,21 @@ Trigger endCall."""
                     # Check if session is closed
                     try:
                         if hasattr(session, 'closed') and session.closed:
-                            logger.info("📝 Session closed - sending transcript...")
+                            logger.info("[TRANSCRIPT] Session closed - sending transcript...")
                             break
                         if hasattr(session, '_closed') and session._closed:
-                            logger.info("📝 Session _closed - sending transcript...")
+                            logger.info("[TRANSCRIPT] Session _closed - sending transcript...")
                             break
                     except Exception:
                         pass
             except asyncio.CancelledError:
-                logger.info("📝 Monitor cancelled - sending transcript...")
+                logger.info("[TRANSCRIPT] Monitor cancelled - sending transcript...")
             except Exception as e:
                 logger.debug(f"Monitor error: {e}")
             
             # Send transcript
             if not agent.call_end_time:
-                logger.info("📝 Sending transcript to Google Sheets...")
+                logger.info("[TRANSCRIPT] Sending transcript to Google Sheets...")
                 try:
                     # Extract transcript from conversation history
                     transcript_from_history = ""
@@ -3612,13 +3762,14 @@ Trigger endCall."""
                         try:
                             transcript_from_history = agent.get_transcript_from_conversation(agent._agent_session)
                             if transcript_from_history and len(transcript_from_history) > 0:
-                                logger.info(f"📝 Extracted {len(transcript_from_history)} characters from conversation history")
+                                logger.info(f"[EVENT] Extracted {len(transcript_from_history)} characters from conversation history")
                         except Exception as e:
-                            logger.warning(f"⚠️  Could not extract transcript from conversation: {e}")
+                            logger.warning(f"[WARN] Could not extract transcript from conversation: {e}")
                     
                     # Also check real-time transcriptions
+                    await agent.finalize_transcripts()  # Redundant but safe
                     realtime_transcript = agent.format_transcript()
-                    logger.info(f"📝 Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
+                    logger.info(f"[TRANSCRIPT] Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
                     
                     # Send results (send_call_results_to_sheets will combine both sources)
                     if agent.appointment_scheduled:
@@ -3630,9 +3781,9 @@ Trigger endCall."""
                     
                     await agent.send_call_results_to_sheets(call_status)
                     agent.call_end_time = datetime.datetime.now()
-                    logger.info(f"✅ Transcript sent to Google Sheets (status: {call_status})")
+                    logger.info(f"[OK] Transcript sent to Google Sheets (status: {call_status})")
                 except Exception as e:
-                    logger.error(f"❌ Error sending transcript: {e}")
+                    logger.error(f"[ERROR] Error sending transcript: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
         
@@ -3640,7 +3791,7 @@ Trigger endCall."""
         async def send_transcript_on_end():
             """Send transcript when call ends."""
             if not agent.call_end_time:
-                logger.info("📝 Call ended - extracting and sending transcript...")
+                logger.info("[EVENT] Call ended - extracting and sending transcript...")
                 try:
                     # Extract transcript from conversation history
                     transcript_from_history = ""
@@ -3648,13 +3799,13 @@ Trigger endCall."""
                         try:
                             transcript_from_history = agent.get_transcript_from_conversation(agent._agent_session)
                             if transcript_from_history and len(transcript_from_history) > 0:
-                                logger.info(f"📝 Extracted {len(transcript_from_history)} characters from conversation history")
+                                logger.info(f"[EVENT] Extracted {len(transcript_from_history)} characters from conversation history")
                         except Exception as e:
-                            logger.warning(f"⚠️  Could not extract transcript from conversation: {e}")
+                            logger.warning(f"[WARN] Could not extract transcript from conversation: {e}")
                     
                     # Also check real-time transcriptions
                     realtime_transcript = agent.format_transcript()
-                    logger.info(f"📝 Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
+                    logger.info(f"[EVENT] Real-time transcript entries: {len(agent.transcript)}, formatted: {len(realtime_transcript)} chars")
                     
                     # Send results
                     if agent.appointment_scheduled:
@@ -3666,22 +3817,22 @@ Trigger endCall."""
                     
                     await agent.send_call_results_to_sheets(call_status)
                     agent.call_end_time = datetime.datetime.now()
-                    logger.info(f"✅ Transcript sent to Google Sheets (status: {call_status})")
+                    logger.info(f"[OK] Transcript sent to Google Sheets (status: {call_status})")
                 except Exception as e:
-                    logger.error(f"❌ Error sending transcript: {e}")
+                    logger.error(f"[X] Error sending transcript: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
         
         # Subscribe to participant disconnect event (most reliable)
         def on_participant_disconnected_event(participant_disconnected: rtc.RemoteParticipant):
             """Handle participant disconnect."""
-            logger.info(f"📝 Participant {participant_disconnected.identity} disconnected - sending transcript...")
+            logger.info(f"[EVENT] Participant {participant_disconnected.identity} disconnected - sending transcript...")
             # Run cleanup synchronously to ensure it happens
             asyncio.create_task(cleanup_and_shutdown())
 
         async def cleanup_and_shutdown():
             """Perform cleanup and shut down the agent."""
-            logger.info("🛑 Starting graceful shutdown...")
+            logger.info("[STOP] Starting graceful shutdown...")
             try:
                 await send_transcript_on_end()
             except Exception as e:
@@ -3691,21 +3842,23 @@ Trigger endCall."""
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
             
-            logger.info("👋 Shutting down job context...")
+            logger.info("[STOP] Shutting down job context...")
+            # Set shutdown event to allow entrypoint to exit
+            shutdown_event.set()
             ctx.shutdown()
         
         # Subscribe to room disconnected (fallback if participant disconnect isn't caught)
         def on_room_disconnected_event(event):
             """Handle room disconnect."""
-            logger.info("📝 Room disconnected - ensuring cleanup...")
+            logger.info("[EVENT] Room disconnected - ensuring cleanup...")
             asyncio.create_task(cleanup_and_shutdown())
 
         try:
             ctx.room.on("participant_disconnected", on_participant_disconnected_event)
             ctx.room.on("disconnected", on_room_disconnected_event)
-            logger.info("✅ Subscribed to disconnect events")
+            logger.info("[OK] Subscribed to disconnect events")
         except Exception as e:
-            logger.warning(f"⚠️  Could not subscribe to disconnect events: {e}")
+            logger.warning(f"[WARN] Could not subscribe to disconnect events: {e}")
             
         # Register a shutdown callback as final safety net
         ctx.add_shutdown_callback(lambda: asyncio.create_task(cleanup_and_shutdown()))
@@ -3753,7 +3906,7 @@ Trigger endCall."""
                     if idle_duration >= IDLE_TIME_SECONDS and reminder_count < REMINDER_FREQUENCY:
                         # Send reminder
                         reminder_count += 1
-                        logger.info(f"⏰ Idle for {idle_duration:.1f}s - sending reminder {reminder_count}/{REMINDER_FREQUENCY}")
+                        logger.info(f"[IDLE] Idle for {idle_duration:.1f}s - sending reminder {reminder_count}/{REMINDER_FREQUENCY}")
                         try:
                             await session.generate_reply(
                                 instructions="Say only: 'Hello? Are you there?' Then wait for their response. Keep it brief."
@@ -3764,12 +3917,12 @@ Trigger endCall."""
                     
                     # If max reminders reached and still idle, log warning (let existing timeout handle hangup)
                     if reminder_count >= REMINDER_FREQUENCY and idle_duration >= (IDLE_TIME_SECONDS * 2):
-                        logger.warning(f"⚠️  Max reminders ({REMINDER_FREQUENCY}) sent, still idle - letting existing timeout handle hangup")
+                        logger.warning(f"[WARN] Max reminders ({REMINDER_FREQUENCY}) sent, still idle - letting existing timeout handle hangup")
             
-            logger.info(f"✅ Idle reminder monitoring configured: {IDLE_TIME_SECONDS}s idle time, {REMINDER_FREQUENCY} reminder(s)")
+            logger.info(f"[OK] Idle reminder monitoring configured: {IDLE_TIME_SECONDS}s idle time, {REMINDER_FREQUENCY} reminder(s)")
         
         # Wait for user to speak first, then say "Hello?" if quiet, then hang up if no response
-        logger.info(f"📞 Waiting {INITIAL_SILENCE_WAIT} seconds for user to speak first...")
+        logger.info(f"[CALL] Waiting {INITIAL_SILENCE_WAIT} seconds for user to speak first...")
         user_first_spoke = False
         greeting_sent_time = None
         silence_timeout_task = None
@@ -3787,7 +3940,7 @@ Trigger endCall."""
             def on_speech_started(evt):
                 if not user_speech_event.is_set():
                     user_speech_event.set()
-                    logger.info("✅ VAD detected speech start during initial wait")
+                    logger.info("[OK] VAD detected speech start during initial wait")
             
             # Subscribe to speech started event
             session.on("input_speech_started", on_speech_started)
@@ -3802,7 +3955,7 @@ Trigger endCall."""
                     # 1. Check VAD event
                     if user_speech_event.is_set():
                         user_first_spoke = True
-                        logger.info("✅ User speech detected (VAD Event) - skipping initial greeting wait")
+                        logger.info("[OK] User speech detected (VAD Event) - skipping initial greeting wait")
                         return
 
                     # 2. Check Transcripts (Backup in case VAD missed or race condition)
@@ -3810,7 +3963,7 @@ Trigger endCall."""
                     if hasattr(agent, 'last_user_speech_time') and agent.last_user_speech_time and \
                        agent.call_start_time and agent.last_user_speech_time > agent.call_start_time:
                         user_first_spoke = True
-                        logger.info(f"✅ User speech detected (Robust Flag) - skipping initial greeting wait. Text: {getattr(agent, 'last_user_speech_text', 'unknown')}")
+                        logger.info(f"[OK] User speech detected (Robust Flag) - skipping initial greeting wait. Text: {getattr(agent, 'last_user_speech_text', 'unknown')}")
                         return
 
                     user_transcripts = [
@@ -3820,7 +3973,7 @@ Trigger endCall."""
                     ]
                     if user_transcripts:
                         user_first_spoke = True
-                        logger.info(f"✅ User speech detected (Transcript) - skipping initial greeting wait: {' '.join(user_transcripts)}")
+                        logger.info(f"[OK] User speech detected (Transcript) - skipping initial greeting wait: {' '.join(user_transcripts)}")
                         return
                     
                     # 3. Check if call ended or participant left
@@ -3835,7 +3988,7 @@ Trigger endCall."""
             
             # Phase 2: User didn't speak in 5 seconds - agent says "Hello?"
             if not user_first_spoke and not hello_sent:
-                logger.info(f"⏱️  No user speech detected after {INITIAL_SILENCE_WAIT} seconds - agent will say 'Hello?'")
+                logger.info(f"[TIMEOUT] No user speech detected after {INITIAL_SILENCE_WAIT} seconds - agent will say 'Hello?'")
                 hello_sent = True
                 
                 # Record transcript count before greeting to detect new speech after
@@ -3849,7 +4002,7 @@ Trigger endCall."""
                         instructions="Say ONLY this: 'Hello?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
                     )
                     greeting_sent_time = datetime.datetime.now()
-                    logger.info("📞 Agent said 'Hello?' - waiting for response...")
+                    logger.info("[CALL] Agent said 'Hello?' - waiting for response...")
                     
                     # Start silence timeout monitor after "Hello?" is sent
                     silence_timeout_task = asyncio.create_task(monitor_silence_timeout())
@@ -3937,11 +4090,16 @@ Trigger endCall."""
             except Exception as e:
                 logger.debug(f"Silence monitor error: {e}")
         
-        # Silence timeout will be started by wait_for_user_greeting after greeting is sent
-        
-        # Wait for monitor to complete (will finish when participant disconnects)
+        # Silence timeout will be started by wait_for_user_greeting        # Monitor the silence timeout and wait for shutdown event
         try:
-            await monitor_task
+            # wait_for_user_greeting handles the initial interaction phase
+            # It returns when either the user speaks or the agent says "Hello?" and starts monitor_silence_timeout
+            await wait_for_user_greeting()
+            
+            # Keep entrypoint alive until room is closed or participant disconnects
+            logger.info("[ENTRYPOINT] Interaction phase ended, waiting for shutdown_event...")
+            await shutdown_event.wait()
+            logger.info("[ENTRYPOINT] shutdown_event received, exiting.")
         except asyncio.CancelledError:
             pass
         finally:

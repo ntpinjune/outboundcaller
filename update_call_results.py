@@ -120,7 +120,14 @@ def update_call_results(service, call_data: Dict[str, Any]):
                         if len(row) > phone_idx:
                             sheet_phone = normalize_for_comparison(row[phone_idx])
                             # Check for exact match or suffix match (to handle missing country codes)
-                            if sheet_phone == search_phone or (len(search_phone) >= 10 and len(sheet_phone) >= 10 and search_phone in sheet_phone) or (len(sheet_phone) >= 10 and sheet_phone in search_phone):
+                            # A suffix match of 10 digits handles most US numbers with or without +1
+                            if not sheet_phone: continue
+                            
+                            is_match = (sheet_phone == search_phone) or \
+                                      (len(search_phone) >= 10 and sheet_phone.endswith(search_phone[-10:])) or \
+                                      (len(sheet_phone) >= 10 and search_phone.endswith(sheet_phone[-10:]))
+                            
+                            if is_match:
                                 row_number = i
                                 break
         

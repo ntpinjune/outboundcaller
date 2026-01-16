@@ -670,6 +670,7 @@ def dispatch_parallel_calls():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # Merge stderr into stdout
                 text=True,
+                encoding="utf-8",
                 bufsize=1,  # Line buffered
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
                 env=env

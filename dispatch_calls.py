@@ -255,9 +255,17 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
             if is_pending or is_no_answer_retry:
                 # Ensure phone number exists
                 if phone_number:
-                    name = row[name_idx].strip() if name_idx and len(row) > name_idx and row[name_idx].strip() else "Customer"
-                    appointment_time = row[appointment_idx].strip() if appointment_idx and len(row) > appointment_idx and row[appointment_idx].strip() else ""
-                    business_name = row[business_name_idx].strip() if business_name_idx is not None and len(row) > business_name_idx and row[business_name_idx].strip() else ""
+                    name = "Customer"
+                    if name_idx is not None and len(row) > name_idx and row[name_idx].strip():
+                        name = row[name_idx].strip()
+                    
+                    appointment_time = ""
+                    if appointment_idx is not None and len(row) > appointment_idx and row[appointment_idx].strip():
+                        appointment_time = row[appointment_idx].strip()
+                    
+                    business_name = ""
+                    if business_name_idx is not None and len(row) > business_name_idx and row[business_name_idx].strip():
+                        business_name = row[business_name_idx].strip()
                     
                     # Get current retry count
                     current_retry_count = 0

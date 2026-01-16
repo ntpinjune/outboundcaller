@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import asyncio
+import signal
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -29,6 +30,8 @@ from dispatch_calls import (
     LIVEKIT_API_KEY,
     LIVEKIT_API_SECRET,
     LIVEKIT_URL,
+    CALL_COMPLETION_CHECK_INTERVAL,
+    MAX_WAIT_TIME,
 )
 
 # Load environment variables
@@ -56,9 +59,11 @@ def emit_ui_event(event_type: str, data: Dict[str, Any]):
             "timestamp": datetime.now().isoformat(),
             "data": data
         }
+        import sys
         print(json.dumps(event), flush=True)
+        sys.stdout.flush() # Extra flush for terminal safety
     except Exception as e:
-        logger.error(f"Failed to emit UI event: {e}")
+        logger.error(f"[ERROR] Failed to emit UI event: {e}")
 
 
 # Thread pool for synchronous operations
@@ -74,7 +79,7 @@ sheets_api_semaphore = None
 def signal_handler(sig, frame):
     """Handle termination signals."""
     global keep_running
-    logger.info("🛑 Received termination signal! Stopping dispatcher...")
+    logger.info("[STOP] Received termination signal! Stopping dispatcher...")
     keep_running = False
 
 # Register signal handlers
@@ -82,11 +87,13 @@ try:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 except Exception as e:
-    logger.warning(f"⚠️  Could not register signal handlers: {e}")
+    logger.warning(f"[WARNING] Could not register signal handlers: {e}")
 
 
-# Track active calls
+# Track active calls and dispatch pacing
 active_calls: Dict[int, Dict[str, Any]] = {}
+_last_dispatch_time: float = 0
+_dispatch_pacing_lock = asyncio.Lock()
 
 
 async def update_sheet_cell_safe(service, row_number: int, column: str, value: str, max_retries: int = 5):
@@ -114,7 +121,7 @@ async def update_sheet_cell_safe(service, row_number: int, column: str, value: s
                         get_google_sheets_service
                     )
                 except Exception as e:
-                    logger.error(f"❌ Failed to build Google Sheets service: {e}")
+                    logger.error(f"[ERROR] Failed to build Google Sheets service: {e}")
                     return False
 
             for attempt in range(max_retries):
@@ -135,7 +142,7 @@ async def update_sheet_cell_safe(service, row_number: int, column: str, value: s
                 except asyncio.TimeoutError:
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2.0  # Exponential backoff: 2s, 4s, 6s, 8s
-                        logger.warning(f"⚠️  Timeout updating {column} for row {row_number} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                        logger.warning(f"[WARNING] Timeout updating {column} for row {row_number} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
                     else:
@@ -151,16 +158,16 @@ async def update_sheet_cell_safe(service, row_number: int, column: str, value: s
                         if attempt < max_retries - 1:
                             wait_time = (attempt + 1) * 2.0  # Exponential backoff: 2s, 4s, 6s, 8s
                             error_type = "SSL" if is_ssl_error else "Timeout"
-                            logger.warning(f"⚠️  {error_type} error updating {column} for row {row_number} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                            logger.warning(f"[WARNING] {error_type} error updating {column} for row {row_number} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
                             await asyncio.sleep(wait_time)
                             continue
                         else:
                             error_type = "SSL" if is_ssl_error else "Timeout"
-                            logger.error(f"❌ {error_type} error updating {column} for row {row_number} after {max_retries} attempts: {e}")
+                            logger.error(f"[ERROR] {error_type} error updating {column} for row {row_number} after {max_retries} attempts: {e}")
                             return False
                     else:
                         # Non-retryable error, don't retry
-                        logger.error(f"❌ Error updating {column} for row {row_number}: {e}")
+                        logger.error(f"[ERROR] Error updating {column} for row {row_number}: {e}")
                         return False
             return False
 
@@ -205,7 +212,7 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
         logger.info(f"🔍 [{row_number}] dispatch_to_livekit_cli returned job_id: {job_id}")
         
         if job_id:
-            logger.info(f"✅ [{row_number}] Dispatched call to {phone_number}")
+            logger.info(f"[SUCCESS] [{row_number}] Dispatched call to {phone_number}")
             emit_ui_event("call_dispatched", {
                 "row_number": row_number,
                 "phone_number": phone_number,
@@ -227,9 +234,9 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
                     "Last Called",
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 )
-                logger.debug(f"📝 [{row_number}] Updated sheet: Status=Dispatched")
+                logger.debug(f"[TRANSCRIPT] [{row_number}] Updated sheet: Status=Dispatched")
             except Exception as e:
-                logger.warning(f"⚠️  [{row_number}] Failed to update sheet with Dispatched status: {e}")
+                logger.warning(f"[WARNING] [{row_number}] Failed to update sheet with Dispatched status: {e}")
             
             # Track active call
             active_calls[row_number] = {
@@ -246,7 +253,7 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
                 "job_id": job_id
             }
         else:
-            logger.error(f"❌ [{row_number}] Failed to dispatch call to {phone_number}")
+            logger.error(f"[ERROR] [{row_number}] Failed to dispatch call to {phone_number}")
             emit_ui_event("call_failed", {
                 "row_number": row_number,
                 "phone_number": phone_number,
@@ -306,8 +313,11 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
 
 async def monitor_call_status(service, row_number: int, phone_number: str):
     """Monitor a single call's status until completion."""
-    max_checks = 60  # Max 10 minutes (60 checks * 10 seconds)
+    # Use MAX_WAIT_TIME and CALL_COMPLETION_CHECK_INTERVAL from dispatch_calls.py
+    max_checks = MAX_WAIT_TIME // CALL_COMPLETION_CHECK_INTERVAL
     check_count = 0
+    
+    logger.info(f"⏳ [{row_number}] Monitoring call to {phone_number} (max {MAX_WAIT_TIME}s)...")
     
     while check_count < max_checks:
         await asyncio.sleep(CALL_COMPLETION_CHECK_INTERVAL)
@@ -325,8 +335,9 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
             
             if status:
                 status_lower = status.lower()
-                if status_lower in ["completed", "voicemail", "failed", "no answer"]:
-                    logger.info(f"✅ [{row_number}] Call to {phone_number} completed with status: {status}")
+                # Consider call finished if status is one of these terminal states
+                if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up"]:
+                    logger.info(f"[SUCCESS] [{row_number}] Call to {phone_number} completed with status: {status}")
                     emit_ui_event("call_completed", {
                         "row_number": row_number,
                         "phone_number": phone_number,
@@ -336,12 +347,14 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
                     return True
                 elif status_lower == "dispatched":
                     # Still in progress
+                    if check_count % 6 == 0: # Log every minute
+                        logger.debug(f"⏳ [{row_number}] Call to {phone_number} still in progress...")
                     continue
         except Exception as e:
             logger.debug(f"Error checking status for row {row_number}: {e}")
     
     # Timeout
-    logger.warning(f"⏱️  [{row_number}] Call to {phone_number} monitoring timed out")
+    logger.warning(f"[TIMEOUT] [{row_number}] Call to {phone_number} monitoring timed out after {MAX_WAIT_TIME}s")
     active_calls.pop(row_number, None)
     return False
 
@@ -354,67 +367,84 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
     logger.info(f"[CONFIG] Call start delay: {CALL_START_DELAY}s")
     
     if not PARALLEL_DIALING_ENABLED:
-        logger.warning("⚠️  Parallel dialing is disabled. Set PARALLEL_DIALING_ENABLED=true")
+        logger.warning("[WARNING] Parallel dialing is disabled. Set PARALLEL_DIALING_ENABLED=true")
         return
     
     # Semaphore to limit concurrent dispatches
     # This ensures only MAX_CONCURRENT_CALLS are dispatched at once
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
     
+    results = []
+
+    async def status_update_loop():
+        """Periodic status updates for the UI."""
+        while keep_running:
+            try:
+                emit_ui_event("status_update", {
+                    "active_calls_count": len(active_calls),
+                    "total_calls": total,
+                    "processed_calls": len(results),
+                    "timestamp": datetime.datetime.now().isoformat()
+                })
+            except Exception as e:
+                logger.debug(f"Error in status_update_loop: {e}")
+            await asyncio.sleep(5)
+    
     async def dispatch_with_limit(row_data: Dict[str, Any], index: int):
-        """Dispatch a call with concurrency limit."""
+        """Dispatch a call with concurrency limit and strict pacing."""
+        global _last_dispatch_time
+        
         async with semaphore:
-            # Stagger call starts to avoid overwhelming the system and API rate limits
-            if index > 0:
-                delay = CALL_START_DELAY * (index % MAX_CONCURRENT_CALLS)
-                await asyncio.sleep(delay)
+            # Enforce strict pacing between any two dispatches
+            async with _dispatch_pacing_lock:
+                now = asyncio.get_event_loop().time()
+                time_since_last = now - _last_dispatch_time
+                if time_since_last < CALL_START_DELAY:
+                    wait_time = CALL_START_DELAY - time_since_last
+                    logger.info(f"⏳ Pacing: Waiting {wait_time:.1f}s before next dispatch...")
+                    await asyncio.sleep(wait_time)
+                
+                _last_dispatch_time = asyncio.get_event_loop().time()
+            
+            row_number = row_data["row_number"]
+            phone_number = row_data["phone_number"]
+            active_slots = MAX_CONCURRENT_CALLS - semaphore._value
+            logger.info(f"🚀 [{row_number}] Dispatching to {phone_number} (Active slots: {active_slots}/{MAX_CONCURRENT_CALLS})")
             
             # Dispatch the call
             result = await dispatch_call_async(service, row_data)
             
-            # Hold semaphore for minimum call duration to prevent too many active calls
-            # This ensures we don't dispatch too many calls that all run simultaneously
+            # CRITICAL: Wait for the call to actually finish before releasing the semaphore slot
             if result.get("success"):
-                # Wait minimum time before releasing semaphore (simulates call being active)
-                # This prevents dispatching 20 calls all at once
-                min_hold_time = 20.0  # Hold semaphore for 20 seconds (typical call start time)
-                await asyncio.sleep(min_hold_time)
+                logger.info(f"⏳ [{row_number}] Call active - holding slot until completion...")
+                await monitor_call_status(service, row_number, phone_number)
             
             return result
     
-    # Process calls in batches to maintain true concurrency limit
-    # Instead of dispatching all at once, dispatch MAX_CONCURRENT_CALLS, wait, then next batch
-    results = []
-    for batch_start in range(0, total, MAX_CONCURRENT_CALLS):
-        batch_end = min(batch_start + MAX_CONCURRENT_CALLS, total)
-        batch = pending_rows[batch_start:batch_end]
-        batch_num = (batch_start // MAX_CONCURRENT_CALLS) + 1
-        total_batches = (total + MAX_CONCURRENT_CALLS - 1) // MAX_CONCURRENT_CALLS
-        
-        if not keep_running:
-            logger.info("🛑 Stopping dispatch loop (signal received)")
-            break
-            
-        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} calls)...")
-        
-        # Dispatch this batch with semaphore limit
-        batch_tasks = [
-            dispatch_with_limit(row_data, batch_start + idx)
-            for idx, row_data in enumerate(batch)
-        ]
-        
-        logger.debug(f"🔍 Starting asyncio.gather for batch {batch_num}...")
-        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        logger.debug(f"🔍 Finished asyncio.gather for batch {batch_num}")
-        results.extend(batch_results)
-        
-        # Wait between batches to ensure previous calls have time to start
-        if batch_end < total:
+    # Start status update loop
+    status_task = asyncio.create_task(status_update_loop())
+    
+    try:
+        # Create a list of tasks for all rows
+        # They will naturally start in order, and the semaphore will limit concurrency
+        tasks = []
+        for idx, row_data in enumerate(pending_rows):
             if not keep_running:
                 break
-            wait_time = CALL_START_DELAY * MAX_CONCURRENT_CALLS
-            logger.info(f"⏳ Waiting {wait_time}s before next batch...")
-            await asyncio.sleep(wait_time)
+            tasks.append(dispatch_with_limit(row_data, idx))
+        
+        # Monitor all tasks
+        logger.debug(f"🔍 Waiting for {len(tasks)} tasks to complete...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Flatten results if needed (already flat from gather)
+        logger.debug("🔍 All dispatch tasks finished")
+    finally:
+        # Cancel status update loop
+        status_task.cancel()
+        try:
+            await status_task
+        except asyncio.CancelledError:
+            pass
     
     # Process results
     successful = 0
@@ -429,12 +459,12 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
         else:
             failed += 1
     
-    logger.info(f"\n📊 Dispatch Summary:")
+    logger.info(f"\n[STATS] Dispatch Summary:")
     logger.info(f"   Total: {total}")
-    logger.info(f"   ✅ Successful: {successful}")
-    logger.info(f"   ❌ Failed: {failed}")
-    logger.info(f"   🔄 Active: {len(active_calls)}")
-    logger.info(f"\n✅ All calls dispatched! The agent will update Google Sheets automatically when calls complete.")
+    logger.info(f"   [SUCCESS] Successful: {successful}")
+    logger.info(f"   [ERROR] Failed: {failed}")
+    logger.info(f"   [SYNC] Active: {len(active_calls)}")
+    logger.info(f"\n[SUCCESS] All calls dispatched! The agent will update Google Sheets automatically when calls complete.")
     logger.info(f"   (No need to monitor - each agent instance updates its own row when done)")
 
 
@@ -461,9 +491,9 @@ async def main_async():
                 executor,
                 get_google_sheets_service
             )
-            logger.info("✅ Google Sheets authentication successful")
+            logger.info("[SUCCESS] Google Sheets authentication successful")
         except Exception as e:
-            logger.error(f"❌ Failed to authenticate with Google Sheets: {e}")
+            logger.error(f"[ERROR] Failed to authenticate with Google Sheets: {e}")
             return
         
         # Read pending rows
@@ -477,6 +507,10 @@ async def main_async():
         if not pending_rows:
             logger.info("No pending calls to dispatch")
             return
+        
+        # CRITICAL: Sort rows by row_number to ensure we go strictly "down the rows"
+        pending_rows.sort(key=lambda x: x.get("row_number", 0))
+        logger.info(f"Ordered {len(pending_rows)} rows for sequential-parallel dispatch")
         
         # Process calls in parallel
         await process_calls_parallel(service, pending_rows)
