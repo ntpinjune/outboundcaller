@@ -651,7 +651,7 @@ def wait_for_call_completion(service, row_number: int, phone_number: str) -> boo
     if not WAIT_FOR_CALL_COMPLETION:
         return True  # Don't wait if disabled
     
-    logger.info(f"⏳ Waiting for call to {phone_number} to complete...")
+    logger.info(f"Waiting for call to {phone_number} to complete...")
     start_time = time.time()
     check_count = 0
     
@@ -660,7 +660,7 @@ def wait_for_call_completion(service, row_number: int, phone_number: str) -> boo
         
         # Check if we've exceeded max wait time
         if elapsed > MAX_WAIT_TIME:
-            logger.warning(f"⏱️  Max wait time ({MAX_WAIT_TIME}s) exceeded for {phone_number}")
+            logger.warning(f"Max wait time ({MAX_WAIT_TIME}s) exceeded for {phone_number}")
             return False
         
         # Check status in Google Sheet
@@ -671,14 +671,14 @@ def wait_for_call_completion(service, row_number: int, phone_number: str) -> boo
             status_lower = status.lower()
             # Call is complete if status changed from "Dispatched"
             if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up"]:
-                logger.info(f"✅ Call to {phone_number} completed with status: {status} (waited {int(elapsed)}s)")
+                logger.info(f"Call to {phone_number} completed with status: {status} (waited {int(elapsed)}s)")
                 if status_lower == "voicemail":
-                    logger.info(f"📞 Voicemail detected - moving to next call in list")
+                    logger.info(f"Voicemail detected - moving to next call in list")
                 return True
             elif status_lower == "dispatched":
                 # Still in progress
                 if check_count % 6 == 0:  # Log every 6 checks (every minute if checking every 10s)
-                    logger.info(f"⏳ Call to {phone_number} still in progress... ({int(elapsed)}s elapsed)")
+                    logger.info(f"Call to {phone_number} still in progress... ({int(elapsed)}s elapsed)")
         
         # Wait before next check
         time.sleep(CALL_COMPLETION_CHECK_INTERVAL)
@@ -692,9 +692,9 @@ def process_calls(service, pending_rows: List[Dict[str, Any]]):
     
     logger.info(f"Starting to process {total} calls...")
     if WAIT_FOR_CALL_COMPLETION:
-        logger.info(f"⏳ Will wait for each call to complete before starting next (checks every {CALL_COMPLETION_CHECK_INTERVAL}s)")
+        logger.info(f"Will wait for each call to complete before starting next (checks every {CALL_COMPLETION_CHECK_INTERVAL}s)")
     else:
-        logger.info(f"⚡ Will dispatch all calls quickly (not waiting for completion)")
+        logger.info(f"Will dispatch all calls quickly (not waiting for completion)")
     
     for idx, row_data in enumerate(pending_rows, 1):
         phone_number = row_data["phone_number"]
@@ -725,13 +725,13 @@ def process_calls(service, pending_rows: List[Dict[str, Any]]):
         
         if job_id:
             successful += 1
-            logger.info(f"✓ Call dispatched successfully. Job ID: {job_id}")
+            print(f"[OK] Call to {phone_number} successfully dispatched via CLI (Job ID: {job_id})")
             
             # Wait for call to complete before next (if enabled)
             if WAIT_FOR_CALL_COMPLETION and idx < total:
                 call_completed = wait_for_call_completion(service, row_number, phone_number)
                 if not call_completed:
-                    logger.warning(f"⚠️  Call to {phone_number} may still be in progress, but moving to next call")
+                    logger.warning(f"Call to {phone_number} may still be in progress, but moving to next call")
             
             # Short delay before next call (even if waiting for completion)
             if idx < total:
@@ -742,7 +742,7 @@ def process_calls(service, pending_rows: List[Dict[str, Any]]):
                     logger.info(f"Call completed, proceeding to next...")
         else:
             failed += 1
-            logger.error(f"✗ Failed to dispatch call")
+            logger.error(f"Failed to dispatch call")
             update_sheet_cell(service, row_number, "Status", "Failed")
             update_sheet_cell(service, row_number, "Outcome Details", "Dispatch Failed")
     
@@ -757,9 +757,9 @@ def main():
     logger.info("=" * 60)
     logger.info("LiveKit Call Dispatcher")
     if USE_LOCAL_AGENT:
-        logger.info("📍 Mode: LOCAL AGENT (ensure 'python agent.py dev' is running)")
+        logger.info("Mode: LOCAL AGENT (ensure 'python agent.py dev' is running)")
     else:
-        logger.info("☁️  Mode: CLOUD AGENT")
+        logger.info("Mode: CLOUD AGENT")
     logger.info("=" * 60)
     
     # Validate environment variables
@@ -771,14 +771,13 @@ def main():
     if not LIVEKIT_URL:
         logger.error("Missing LIVEKIT_URL in .env.local")
         return
-    
-    # Get Google Sheets service
+        print("[SUCCESS] Connected to Google Sheets from cache")
     try:
         logger.info("Authenticating with Google Sheets...")
         service = get_google_sheets_service()
-        logger.info("✓ Google Sheets authentication successful")
+        logger.info("Google Sheets authentication successful")
     except Exception as e:
-        logger.error(f"✗ Failed to authenticate with Google Sheets: {e}")
+        logger.error(f"Failed to authenticate with Google Sheets: {e}")
         return
     
     # Read pending rows

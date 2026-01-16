@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env.local if it exists
 # This ensures env vars are available before config is loaded or overridden
-load_dotenv(dotenv_path=".env.local")
+# WE USE override=True to ensure that changes in .env.local take effect immediately
+load_dotenv(dotenv_path=".env.local", override=True)
 
 logger = logging.getLogger("config-manager")
 
@@ -117,11 +118,6 @@ CONFIG_SCHEMA = {
         "webhook_url": "",
         "webhook_secret": "",
     },
-    "observability": {
-        "langfuse_public_key": "",
-        "langfuse_secret_key": "",
-        "langfuse_base_url": "https://cloud.langfuse.com",
-    },
     "system_prompt": "",  # Will be loaded from agent.py default or config
 }
 
@@ -130,21 +126,22 @@ def load_config() -> Dict[str, Any]:
     """Load configuration from config.json, falling back to defaults and env vars."""
     config = CONFIG_SCHEMA.copy()
     
-    # Try to load from config.json
+    # 1. First apply environment variables (these act as the next level of defaults)
+    # This includes .env.local which is loaded at the top of the file
+    config = _apply_env_overrides(config)
+    
+    # 2. Then try to load from config.json (these are user overrides from the UI)
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 file_config = json.load(f)
-                # Deep merge with defaults
+                # Deep merge so config.json wins for non-empty fields
                 config = _deep_merge(config, file_config)
                 logger.info(f"[SUCCESS] Loaded configuration from {CONFIG_FILE}")
         except Exception as e:
             logger.warning(f"[WARNING] Failed to load {CONFIG_FILE}: {e}. Using defaults and env vars.")
     else:
-        logger.info(f"[INFO] {CONFIG_FILE} not found. Using defaults and env vars.")
-    
-    # Override with environment variables (env vars take precedence)
-    config = _apply_env_overrides(config)
+        logger.info(f"[INFO] {CONFIG_FILE} not found. Using defaults.")
     
     return config
 
@@ -158,7 +155,7 @@ def save_config(config: Dict[str, Any]) -> bool:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(safe_config, f, indent=2, ensure_ascii=False)
         
-        logger.info(f"[SUCCESS] Configuration saved to {CONFIG_FILE}")
+        logger.info(f"[OK] Configuration saved to {CONFIG_FILE}")
         return True
     except Exception as e:
         logger.error(f"[ERROR] Failed to save configuration: {e}")
@@ -189,13 +186,16 @@ def get_config_value(path: str, default: Any = None) -> Any:
 
 
 def _deep_merge(base: Dict, override: Dict) -> Dict:
-    """Deep merge two dictionaries."""
+    """Deep merge two dictionaries, favoring non-empty values from override."""
     result = base.copy()
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
         else:
-            result[key] = value
+            # Only override if the new value is not empty, OR if it's a type we want to persist even if empty (like False or 0)
+            # This prevents sanitized fields (API keys set to "") in config.json from overwriting env vars
+            if value != "" or result.get(key) is None:
+                result[key] = value
     return result
 
 
@@ -333,9 +333,7 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         try: config["voice_settings"]["input_min_characters"] = int(os.getenv("INPUT_MIN_CHARACTERS"))
         except: pass
 
-    # Observability
-    if os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST"):
-        config["observability"]["langfuse_base_url"] = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST")
+
     
     return config
 
@@ -353,9 +351,6 @@ def _sanitize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "integrations.gcp_credentials",
         "integrations.twilio_account_sid",
         "integrations.twilio_auth_token",
-        "observability.langfuse_public_key",
-        "observability.langfuse_public_key",
-        "observability.langfuse_secret_key",
         "integrations.webhook_secret",
     ]
     
