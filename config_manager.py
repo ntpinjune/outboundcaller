@@ -29,6 +29,7 @@ CONFIG_SCHEMA = {
         "elevenlabs_voice_id": "6AUOG2nbfr0yFEeI0784",
         "elevenlabs_api_key": "", # Optional override for API Key
         "cartesia_voice_id": "f786b574-daa5-4673-aa0c-cbe3e8534c02",
+        "cartesia_model_id": "sonic-english",
         "cartesia_api_key": "", # Optional override for API Key
         "cartesia_speed": "1.0",
         "cartesia_emotion": [], # List of emotions e.g. ["positivity:high", "curiosity"]

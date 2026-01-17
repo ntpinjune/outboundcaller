@@ -36,6 +36,7 @@ from livekit.agents import (
     llm,
     stt,
     tts,
+    metrics,
     WorkerOptions,
     RoomInputOptions,
 )
@@ -66,6 +67,14 @@ try:
 except (ImportError, Exception):
     DISPATCH_AVAILABLE = False
     print("[WARN] dispatch_calls module not found or import failed. Google Sheets testing will be disabled.")
+
+# Import call history for local observability
+try:
+    from call_history import save_call, CallRecord, update_call_status
+    CALL_HISTORY_AVAILABLE = True
+except ImportError:
+    CALL_HISTORY_AVAILABLE = False
+    print("[INFO] call_history module not available. Local observability disabled.")
 
 # Try to import Piper TTS (optional)
 try:
@@ -432,6 +441,8 @@ class OutboundCaller(Agent):
         name: str,
         appointment_time: str,
         dial_info: dict[str, Any],
+        audio_s3_url: str = "",
+        egress_id: str = "",
     ):
         # Get current date and tomorrow's date (like the example code)
         today = datetime.datetime.now()
@@ -488,9 +499,20 @@ class OutboundCaller(Agent):
         self.last_user_speech_time = None
         self.last_user_speech_text = None
         
-        # Interim transcript tracking for forced commits
+        # Audio recording info
+        self.audio_s3_url = audio_s3_url
+        self.egress_id = egress_id
+
+        self.stt_stream = None
+        self.speech_handle = None
         self._last_stt_interim = ""
         self._last_stt_interim_time = 0
+        
+        # Recording/Egress tracking
+        self.egress_id = ""
+        self.audio_s3_url = ""
+        self.room_name = ""
+        self.session_id = ""
     
     async def stt_node(self, audio, model_settings):
         """Official LiveKit hook to intercept STT output - captures user speech."""
@@ -954,6 +976,12 @@ class OutboundCaller(Agent):
         except Exception:
             pass
 
+    def get_transcript_json(self) -> str:
+        """Return transcript as a JSON string with metadata (timestamps)."""
+        # Filter for final entries only
+        final_entries = [t for t in self.transcript if t.get("is_final", True)]
+        return json.dumps(final_entries)
+
     async def hangup(self, call_status: str = "completed", send_results: bool = True, failure_reason: str = None):
         """Helper function to hang up the call by deleting the room."""
         if send_results and not self.call_end_time:
@@ -963,6 +991,37 @@ class OutboundCaller(Agent):
         elif not self.call_end_time:
             self.call_end_time = datetime.datetime.now()
             await self.finalize_transcripts()
+        
+        # Save to local call history database for self-hosted observability
+        if CALL_HISTORY_AVAILABLE:
+            try:
+                duration = 0
+                if self.call_start_time and self.call_end_time:
+                    duration = int((self.call_end_time - self.call_start_time).total_seconds())
+                
+                # Check config to see if we should save JSON transcript or plain text
+                # For now, default to JSON so we can support the advanced player
+                transcript_data = self.get_transcript_json()
+                
+                record = CallRecord(
+                    room_id=self.room_name or "",
+                    phone_number=self.dial_info.get("phone_number", ""),
+                    name=self.name,
+                    status=call_status,
+                    duration_seconds=duration,
+                    transcript=transcript_data, # Save as JSON string
+                    audio_url=getattr(self, 'audio_s3_url', '') or "",  # Use S3 URL if egress was started
+                    created_at=self.call_start_time.isoformat() if self.call_start_time else datetime.datetime.now().isoformat(),
+                    metadata=json.dumps({
+                        "failure_reason": failure_reason,
+                        "session_id": self.session_id,
+                        "appointment_time": self.appointment_time
+                    })
+                )
+                save_call(record)
+                logger.info(f"[OK] Call saved to local history: {self.room_name}")
+            except Exception as e:
+                logger.error(f"[ERROR] Failed to save call to history: {e}")
 
         job_ctx = get_job_context()
         try:
@@ -973,6 +1032,11 @@ class OutboundCaller(Agent):
             else:
                 logger.error(f"[ERROR] Error during hangup/delete_room: {e}")
                 raise
+        
+        # CRITICAL: Call ctx.shutdown() to ensure telemetry/observability data is uploaded
+        # This triggers the proper cleanup of OpenTelemetry spans and trace uploads
+        logger.info("[SHUTDOWN] Signaling job context shutdown for telemetry upload...")
+        job_ctx.shutdown()
 
     @function_tool()
     async def transfer_call(self, ctx: RunContext, reason: str = ""):
@@ -1030,26 +1094,89 @@ class OutboundCaller(Agent):
 
 
 async def start_call_recording(ctx: JobContext, phone_number: str, room_name: str) -> Optional[str]:
-    """Start egress recording for the call."""
+    """
+    Start audio-only egress recording for the call to S3.
+    Returns the egress_id or None if recording couldn't be started.
+    """
     try:
+        from livekit.protocol.egress import (
+            RoomCompositeEgressRequest,
+            EncodedFileOutput,
+            EncodedFileType,
+            S3Upload,
+            AudioMixingMode,
+        )
+        
         aws_bucket = os.getenv("AWS_BUCKET_NAME")
-        if not aws_bucket:
-            return None
+        aws_region = os.getenv("AWS_REGION", "us-east-2")
+        aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        
+        if not all([aws_bucket, aws_access_key, aws_secret_key]):
+            logger.warning("[RECORDING] AWS credentials not configured, skipping recording")
+            return None, None
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         phone_clean = phone_number.replace("+", "").replace("-", "").replace(" ", "")
-        filename = f"calls/{phone_clean}_{timestamp}.ogg"
+        # Use .ogg format for good compression and quality
+        filepath = f"calls/{phone_clean}_{room_name}_{timestamp}.ogg"
         
-        logger.info(f"[RECORDING] Starting S3 recording: s3://{aws_bucket}/{filename}")
+        logger.info(f"[RECORDING] Starting S3 audio recording: s3://{aws_bucket}/{filepath}")
         
-        livekit_url = os.getenv("LIVEKIT_URL", "").replace("wss://", "https://").replace("ws://", "http://")
-        lkapi = api.LiveKitAPI(url=livekit_url, api_key=os.getenv("LIVEKIT_API_KEY"), api_secret=os.getenv("LIVEKIT_API_SECRET"))
-        # Egress logic omitted for brevity in restoration, assume it works if credentials present
-        await lkapi.aclose()
-        return "EG_RECORDING_STARTED"
+        # Configure S3 upload
+        s3_upload = S3Upload(
+            access_key=aws_access_key,
+            secret=aws_secret_key,
+            region=aws_region,
+            bucket=aws_bucket,
+            filepath=filepath,
+        )
+        
+        # Configure file output for audio
+        file_output = EncodedFileOutput(
+            file_type=EncodedFileType.OGG,  # Opus codec, good for speech
+            filepath=filepath,
+            s3=s3_upload,
+        )
+        
+        # Create egress request - audio only with dual channel (agent separate from customer)
+        egress_request = RoomCompositeEgressRequest(
+            room_name=room_name,
+            audio_only=True,
+            audio_mixing=AudioMixingMode.DUAL_CHANNEL,  # Left=agent, Right=others
+            file=file_output,
+        )
+        
+        # Get LiveKit API
+        livekit_url = os.getenv("LIVEKIT_URL", "")
+        if livekit_url.startswith("wss://"):
+            livekit_url = livekit_url.replace("wss://", "https://")
+        elif livekit_url.startswith("ws://"):
+            livekit_url = livekit_url.replace("ws://", "http://")
+        
+        lkapi = api.LiveKitAPI(
+            url=livekit_url,
+            api_key=os.getenv("LIVEKIT_API_KEY"),
+            api_secret=os.getenv("LIVEKIT_API_SECRET")
+        )
+        
+        try:
+            egress_info = await lkapi.egress.start_room_composite_egress(egress_request)
+            egress_id = egress_info.egress_id
+            s3_url = f"s3://{aws_bucket}/{filepath}"
+            logger.info(f"[RECORDING] Egress started successfully: {egress_id}")
+            logger.info(f"[RECORDING] Audio will be saved to: {s3_url}")
+            
+            return egress_id, s3_url
+        finally:
+            await lkapi.aclose()
+            
+    except ImportError as e:
+        logger.warning(f"[RECORDING] Egress protocol not available: {e}")
+        return None, None
     except Exception as e:
         logger.error(f"[ERROR] Failed to start call recording: {e}")
-        return None
+        return None, None
 
 
 def _get_noise_cancellation_filter(mode: str):
@@ -1058,8 +1185,26 @@ def _get_noise_cancellation_filter(mode: str):
 
 
 async def entrypoint(ctx: JobContext):
+    """Main entry point for outbound calls. Has global exception handling to ensure observability data is always uploaded."""
     logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect()
+    
+    # Track if shutdown was called to avoid double-shutdown
+    _shutdown_called = False
+    
+    def ensure_shutdown():
+        """Ensure ctx.shutdown() is called exactly once for telemetry upload."""
+        nonlocal _shutdown_called
+        if not _shutdown_called:
+            _shutdown_called = True
+            logger.info("[SHUTDOWN] Ensuring telemetry upload...")
+            try:
+                ctx.shutdown()
+            except Exception as e:
+                logger.warning(f"[SHUTDOWN] Error during shutdown: {e}")
+    
+    # Store ensure_shutdown in ctx for use in exception handlers throughout the code
+    ctx._ensure_shutdown = ensure_shutdown
     
     shutdown_event = asyncio.Event()
     dial_info = {}
@@ -1075,7 +1220,9 @@ async def entrypoint(ctx: JobContext):
             logger.warning("Could not parse job metadata")
     
     logger.info(f"[CALL START] RowID: {dial_info.get('row_id', 'unknown')}, Phone: {phone_number}, Room: {ctx.room.name}, JobID: {ctx.job.id if ctx.job else 'unknown'}")
-    await start_call_recording(ctx, phone_number, ctx.room.name)
+    
+    # Start recording and capture returns
+    egress_id, audio_s3_url = await start_call_recording(ctx, phone_number, ctx.room.name)
     
     customer_name = dial_info.get("name", "Test User").strip()
     appointment_time = dial_info.get("appointment_time", "")
@@ -1104,6 +1251,8 @@ async def entrypoint(ctx: JobContext):
         name=customer_name,
         appointment_time=appointment_time,
         dial_info=dial_info,
+        audio_s3_url=audio_s3_url or "",
+        egress_id=egress_id or ""
     )
     
     # Store business name in agent for later use
@@ -1821,6 +1970,7 @@ Trigger endCall."""
         # OpenAI Voice
         OPENAI_VOICE = get_config_value("agent.openai_voice", "alloy")
         CARTESIA_VOICE_ID = get_config_value("agent.cartesia_voice_id", None)
+        CARTESIA_MODEL_ID = get_config_value("agent.cartesia_model_id", "sonic-english")
         CARTESIA_API_KEY = get_config_value("agent.cartesia_api_key", None)
         CARTESIA_SPEED = float(get_config_value("agent.cartesia_speed", "1.0"))
         CARTESIA_EMOTION = get_config_value("agent.cartesia_emotion", [])
@@ -1845,6 +1995,7 @@ Trigger endCall."""
         # OpenAI Voice
         OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
         CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID")
+        CARTESIA_MODEL_ID = os.getenv("CARTESIA_MODEL_ID", "sonic-english")
         CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
         CARTESIA_SPEED = float(os.getenv("CARTESIA_SPEED", "1.0"))
         CARTESIA_EMOTION = [e.strip() for e in os.getenv("CARTESIA_EMOTION", "").split(",") if e.strip()]
@@ -2217,7 +2368,8 @@ Trigger endCall."""
         # Use Cartesia TTS
         cartesia_args = {
             "speed": CARTESIA_SPEED,
-            "emotion": CARTESIA_EMOTION
+            "emotion": CARTESIA_EMOTION,
+            "model": CARTESIA_MODEL_ID
         }
         if CARTESIA_VOICE_ID:
             cartesia_args["voice"] = CARTESIA_VOICE_ID
@@ -2225,7 +2377,7 @@ Trigger endCall."""
             cartesia_args["api_key"] = CARTESIA_API_KEY
             
         tts_instance = cartesia.TTS(**cartesia_args)
-        logger.info(f"✅ Cartesia TTS instance created with voice: {CARTESIA_VOICE_ID}, speed: {CARTESIA_SPEED}, emotion: {CARTESIA_EMOTION}")
+        logger.info(f"✅ Cartesia TTS instance created with voice: {CARTESIA_VOICE_ID}, model: {CARTESIA_MODEL_ID}, speed: {CARTESIA_SPEED}")
     elif USE_PIPER:
         # Use Piper TTS from local-livekit-plugins package (CPU only)
         from pathlib import Path
@@ -2384,6 +2536,21 @@ Trigger endCall."""
         )
     )
 
+    # Set up UsageCollector to capture real-time metrics (TTFT, TTFB, token usage, turn latency)
+    usage_collector = metrics.UsageCollector()
+    
+    @session.on("metrics_collected")
+    def on_metrics_collected(ev):
+        """Capture real-time metrics for observability."""
+        usage_collector.collect(ev.metrics)
+        # Log key metrics for debugging
+        if hasattr(ev.metrics, 'ttft') and ev.metrics.ttft:
+            logger.debug(f"[METRICS] TTFT: {ev.metrics.ttft:.3f}s")
+        if hasattr(ev.metrics, 'tokens_used'):
+            logger.debug(f"[METRICS] Tokens used: {ev.metrics.tokens_used}")
+    
+    logger.info("[OK] UsageCollector initialized for metrics capture")
+
     # `create_sip_participant` starts dialing the user
     # Add retry logic for network errors (ServerDisconnectedError, etc.)
     max_sip_retries = 2
@@ -2499,6 +2666,27 @@ Trigger endCall."""
         
         # Track call start time
         agent.call_start_time = datetime.datetime.now()
+        
+        # Start audio recording with Egress (saves to S3)
+        try:
+            egress_id = await start_call_recording(ctx, phone_number, ctx.room.name)
+            if egress_id:
+                agent.egress_id = egress_id
+                # Construct the S3 URL for later use
+                aws_bucket = os.getenv("AWS_BUCKET_NAME", "")
+                aws_region = os.getenv("AWS_REGION", "us-east-2")
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                phone_clean = phone_number.replace("+", "").replace("-", "").replace(" ", "")
+                agent.audio_s3_url = f"s3://{aws_bucket}/calls/{phone_clean}_{ctx.room.name}_{timestamp}.ogg"
+                logger.info(f"[RECORDING] Call recording started: {egress_id}")
+            else:
+                agent.egress_id = ""
+                agent.audio_s3_url = ""
+                logger.info("[RECORDING] No recording started (AWS not configured)")
+        except Exception as rec_error:
+            logger.warning(f"[RECORDING] Could not start recording: {rec_error}")
+            agent.egress_id = ""
+            agent.audio_s3_url = ""
         
         # Initialize voicemail detector
         agent.voicemail_detector = VoicemailDetector(agent)

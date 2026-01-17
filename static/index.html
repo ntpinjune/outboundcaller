@@ -616,33 +616,36 @@
                 parallel. This runs in the background.</p>
 
             <div class="form-group" style="margin-top: 15px; display: flex; gap: 10px;">
-                <button class="btn btn-secondary" onclick="previewPendingCalls()">👁️ Preview Pending Calls</button>
+                <a href="/call_history.html" target="_blank" class="btn btn-secondary"
+                    style="background-color: #17a2b8; text-decoration: none; display: flex; align-items: center; justify-content: center;">
+                    📊 View Call History
+                </a>
                 <button class="btn btn-primary" onclick="startParallelDispatch()" style="background-color: #6f42c1;">🚀
                     Start Parallel Dispatcher</button>
                 <button class="btn btn-primary" onclick="stopParallelDispatch()" style="background-color: #dc3545;">🛑
                     Stop Dispatcher</button>
             </div>
 
-            <div id="preview-container" style="display: none; margin-top: 15px;">
-                <h4>Pending Calls (<span id="preview-count">0</span>)</h4>
-                <div
-                    style="overflow-x: auto; max-height: 300px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px;">
-                    <table style="width: 100%; border-collapse: collapse; font-size: 0.9em;">
-                        <thead style="background: #f8f9fa; position: sticky; top: 0;">
-                            <tr>
-                                <th style="padding: 8px; text-align: left; border-bottom: 2px solid #ddd;">Row</th>
-                                <th style="padding: 8px; text-align: left; border-bottom: 2px solid #ddd;">Name</th>
-                                <th style="padding: 8px; text-align: left; border-bottom: 2px solid #ddd;">Phone
-                                </th>
-                                <th style="padding: 8px; text-align: left; border-bottom: 2px solid #ddd;">Status
-                                </th>
-                            </tr>
-                        </thead>
-                        <tbody id="preview-table-body">
-                        </tbody>
-                    </table>
+            <!-- Reset Voicemail Rows Section -->
+            <div
+                style="margin-top: 25px; padding: 15px; background: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6;">
+                <h4 style="margin-bottom: 12px; color: #495057;">🔄 Reset Voicemail Rows</h4>
+                <p style="font-size: 0.85em; color: #666; margin-bottom: 12px;">
+                    Find all rows with Status="voicemail", clear their data (except Phone and Business name), and reset
+                    to "Pending".
+                </p>
+                <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                    <input type="text" id="reset-sheet-id" placeholder="Google Sheet ID (leave empty for default)"
+                        style="flex: 1; min-width: 250px; padding: 8px;">
+                    <button class="btn btn-primary" onclick="resetVoicemailRows()" style="background-color: #fd7e14;">
+                        🔄 Reset Voicemail Rows
+                    </button>
                 </div>
+                <div id="reset-voicemail-status"
+                    style="margin-top: 10px; display: none; padding: 10px; border-radius: 4px;"></div>
             </div>
+
+
 
             <div id="live-log-container" style="display: none; margin-top: 20px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
@@ -668,34 +671,7 @@
 
             <div id="parallel-dispatch-status" class="test-call-status"></div>
 
-            <div id="embedded-sheet-container" style="margin-top: 25px;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                    <h4>📋 Live Spreadsheet View</h4>
-                    <a id="google-sheet-link" href="#" target="_blank" class="btn btn-secondary"
-                        style="display: none; font-size: 0.8em; padding: 4px 10px;">
-                        ↗️ Open in New Tab
-                    </a>
-                </div>
 
-                <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 10px;">
-                    <label style="display: flex; align-items: center; cursor: pointer; user-select: none;">
-                        <input type="checkbox" id="auto-refresh-sheet" onchange="toggleAutoRefresh()"
-                            style="margin-right: 8px;">
-                        Auto-refresh (30s)
-                    </label>
-                    <span id="refresh-status" style="font-size: 0.85em; color: #666; display: none;">Refreshing in <span
-                            id="refresh-countdown">30</span>s...</span>
-                </div>
-
-                <p class="help-text" style="margin-bottom: 10px;">Use the button above to edit. The view below is
-                    read-only.</p>
-                <div
-                    style="position: relative; padding-bottom: 75%; height: 0; overflow: hidden; border: 1px solid #ddd; border-radius: 4px;">
-                    <iframe id="google-sheet-frame"
-                        style="position: absolute; top:0; left: 0; width: 100%; height: 100%;" frameborder="0">
-                    </iframe>
-                </div>
-            </div>
         </div>
 
         <hr style="margin: 30px 0; border: 1px solid #e0e0e0;">

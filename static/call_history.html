@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Call History - Outbound Caller</title>
+    <!-- WaveSurfer.js -->
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/timeline.min.js"></script>
+    <script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/hover.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0f0f1a;
+            --bg-secondary: #000000;
+            --bg-card: #111111;
+            --text-primary: #e8e8e8;
+            --text-secondary: #888888;
+            --accent: #6366f1;
+            --accent-hover: #818cf8;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --border: #222222;
+            --user-color: #3b82f6;
+            --agent-color: #a855f7;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 1rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            background: linear-gradient(90deg, var(--accent), #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 1rem;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+
+        .nav-links a:hover,
+        .nav-links a.active {
+            color: var(--text-primary);
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+        }
+
+        /* Stats Cards - Compact */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.1rem;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .stat-card.total .stat-value {
+            color: var(--accent);
+        }
+
+        .stat-card.completed .stat-value {
+            color: var(--success);
+        }
+
+        .stat-card.voicemail .stat-value {
+            color: var(--warning);
+        }
+
+        .stat-card.failed .stat-value {
+            color: var(--error);
+        }
+
+        /* Filters */
+        .filters {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .filter-group label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .filter-group select,
+        .filter-group input {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.5rem;
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            min-width: 140px;
+        }
+
+        button.btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 0.5rem 1rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        button.btn:hover {
+            background: var(--accent-hover);
+        }
+
+        button.btn-secondary {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: #ccc;
+        }
+
+        button.btn-secondary:hover {
+            border-color: #666;
+            color: white;
+        }
+
+        /* Call List */
+        .call-list {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .call-item {
+            border-bottom: 1px solid var(--border);
+        }
+
+        .call-item:last-child {
+            border-bottom: none;
+        }
+
+        .call-header {
+            display: grid;
+            grid-template-columns: 40px 1.5fr 1fr 120px 100px 90px;
+            gap: 1rem;
+            padding: 0.75rem 1rem;
+            cursor: pointer;
+            align-items: center;
+            font-size: 0.9rem;
+            transition: background 0.15s;
+        }
+
+        .call-header:hover {
+            background: #1a1a1a;
+        }
+
+        .call-header.active {
+            background: #1a1a1a;
+            border-left: 3px solid var(--accent);
+        }
+
+        .call-phone {
+            font-family: monospace;
+            color: var(--text-primary);
+        }
+
+        .call-name {
+            color: var(--text-secondary);
+        }
+
+        .call-date {
+            color: #666;
+            font-size: 0.85rem;
+        }
+
+        .status-badge {
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            font-weight: 600;
+            text-align: center;
+            width: fit-content;
+        }
+
+        .status-completed {
+            background: rgba(34, 197, 94, 0.15);
+            color: var(--success);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+
+        .status-voicemail {
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--warning);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .status-failed {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--error);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        .status-pending {
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+        }
+
+        /* Expanded Details */
+        .call-details {
+            display: none;
+            background: #050505;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .call-item.expanded .call-details {
+            display: block;
+            animation: slideDown 0.2s ease-out;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-5px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Player & Transcript Layout */
+        .player-container {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        /* Waveform */
+        .waveform-wrapper {
+            background: #111;
+            padding: 1rem;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+
+        .player-controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .play-btn {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: 1px solid var(--border);
+            background: #222;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        .play-btn:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .time-display {
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        /* Transcript */
+        .transcript-container {
+            background: #0a0a0a;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            height: 400px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .transcript-header {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #111;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .transcript-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            letter-spacing: 0.05em;
+        }
+
+        .scroller {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            scroll-behavior: smooth;
+        }
+
+        .msg-row {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.25rem;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+
+        .msg-row:hover {
+            opacity: 1;
+        }
+
+        .msg-row.active {
+            opacity: 1;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 4px;
+            padding: 0.25rem -0.25rem;
+            margin-left: -0.25rem;
+            margin-right: -0.25rem;
+        }
+
+        .msg-time {
+            font-family: monospace;
+            font-size: 0.75rem;
+            color: #555;
+            min-width: 45px;
+            padding-top: 0.3rem;
+            cursor: pointer;
+        }
+
+        .msg-time:hover {
+            color: var(--accent);
+            text-decoration: underline;
+        }
+
+        .msg-content {
+            flex: 1;
+        }
+
+        .msg-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .speaker-name {
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .speaker-agent {
+            color: var(--agent-color);
+        }
+
+        .speaker-user {
+            color: var(--user-color);
+        }
+
+        .msg-text {
+            font-size: 0.9rem;
+            color: #ddd;
+            line-height: 1.5;
+            cursor: pointer;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0f0f1a;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+
+        .loading-spinner {
+            display: inline-block;
+            width: 1rem;
+            height: 1rem;
+            border: 2px solid #555;
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .empty-state {
+            padding: 3rem;
+            text-align: center;
+            color: #555;
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .pagination button {
+            padding: 0.4rem 0.8rem;
+        }
+
+        .pagination .current {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Call History - Audio & Insights</h1>
+            <nav class="nav-links">
+                <a href="/">Dashboard</a>
+                <a href="/call-history.html" class="active">Call History</a>
+            </nav>
+        </header>
+
+        <div class="stats-grid" id="stats">
+            <div class="stat-card total">
+                <div class="stat-value" id="stat-total">-</div>
+                <div class="stat-label">Total</div>
+            </div>
+            <div class="stat-card completed">
+                <div class="stat-value" id="stat-completed">-</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card voicemail">
+                <div class="stat-value" id="stat-voicemail">-</div>
+                <div class="stat-label">Voicemail</div>
+            </div>
+            <div class="stat-card failed">
+                <div class="stat-value" id="stat-failed">-</div>
+                <div class="stat-label">Failed</div>
+            </div>
+        </div>
+
+        <div class="filters">
+            <div class="filter-group">
+                <label>Status</label>
+                <select id="filter-status">
+                    <option value="">All Statuses</option>
+                    <option value="completed">Completed</option>
+                    <option value="voicemail">Voicemail</option>
+                    <option value="failed">Failed</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>Phone Number</label>
+                <input type="text" id="filter-phone" placeholder="Search phone...">
+            </div>
+            <div class="filter-group">
+                <button class="btn" onclick="loadCalls()">Search</button>
+            </div>
+            <div class="filter-group" style="margin-left: auto;">
+                <button class="btn btn-secondary" onclick="refreshData()">Refresh Data</button>
+            </div>
+        </div>
+
+        <div class="call-list" id="call-list">
+            <div class="empty-state">Loading calls...</div>
+        </div>
+
+        <div class="pagination" id="pagination"></div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let currentPage = 0;
+        const limit = 20;
+        let totalCalls = 0;
+        let activeWaveSurfer = null; // Track active player instance
+
+        // Format duration (MM:SS)
+        function formatDuration(seconds) {
+            if (!seconds) return '0:00';
+            const m = Math.floor(seconds / 60);
+            const s = Math.floor(seconds % 60);
+            return `${m}:${s.toString().padStart(2, '0')}`;
+        }
+
+        // Parse date
+        function formatDate(iso) {
+            if (!iso) return '-';
+            return new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        // Fetch Stats
+        async function loadStats() {
+            try {
+                const res = await fetch(`${API_BASE}/api/calls/stats`);
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('stat-total').textContent = data.stats.total;
+                    document.getElementById('stat-completed').textContent = data.stats.completed;
+                    document.getElementById('stat-voicemail').textContent = data.stats.voicemail;
+                    document.getElementById('stat-failed').textContent = (data.stats.failed + (data.stats.no_answer || 0) + (data.stats.busy || 0));
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        // Fetch Calls
+        async function loadCalls() {
+            const listEl = document.getElementById('call-list');
+            listEl.innerHTML = '<div class="empty-state"><div class="loading-spinner"></div> Loading...</div>';
+
+            const status = document.getElementById('filter-status').value;
+            const phone = document.getElementById('filter-phone').value;
+
+            try {
+                const params = new URLSearchParams({ limit, offset: currentPage * limit });
+                if (status) params.append('status', status);
+                if (phone) params.append('phone', phone);
+
+                const res = await fetch(`${API_BASE}/api/calls?${params}`);
+                const data = await res.json();
+
+                if (data.success) {
+                    totalCalls = data.total;
+                    renderList(data.calls);
+                    renderPagination();
+                } else {
+                    listEl.innerHTML = `<div class="empty-state">Error: ${data.error}</div>`;
+                }
+            } catch (e) {
+                listEl.innerHTML = `<div class="empty-state">Connection Error</div>`;
+            }
+        }
+
+        // Render Call List
+        function renderList(calls) {
+            const listEl = document.getElementById('call-list');
+            if (!calls.length) {
+                listEl.innerHTML = '<div class="empty-state">No calls found.</div>';
+                return;
+            }
+
+            let html = '';
+            // Header Row
+            html += `
+                <div class="call-header" style="cursor: default; background: #111; border-bottom: 2px solid #222; font-weight: 600; color: #fff;">
+                    <div></div>
+                    <div>Phone & ID</div>
+                    <div>Customer Name</div>
+                    <div>Date</div>
+                    <div>Duration</div>
+                    <div>Status</div>
+                </div>
+            `;
+
+            calls.forEach(call => {
+                html += `
+                    <div class="call-item" id="call-${call.room_id}">
+                        <div class="call-header" onclick="toggleCall('${call.room_id}')">
+                            <div class="expand-icon" id="icon-${call.room_id}">▶</div>
+                            <div>
+                                <div class="call-phone">${call.phone_number}</div>
+                                <div style="font-size: 0.75rem; color: #555;">${call.room_id.substring(0, 8)}...</div>
+                            </div>
+                            <div class="call-name">${call.name || 'Unknown'}</div>
+                            <div class="call-date">${formatDate(call.created_at)}</div>
+                            <div style="font-family: monospace; color: #888;">${formatDuration(call.duration_seconds)}</div>
+                            <div class="status-badge status-${call.status}">${call.status}</div>
+                        </div>
+                        <div class="call-details" id="details-${call.room_id}">
+                            <!-- Content injected via JS on expand -->
+                        </div>
+                    </div>
+                `;
+            });
+            listEl.innerHTML = html;
+        }
+
+        // Toggle Expand
+        async function toggleCall(roomId) {
+            const detailsEl = document.getElementById(`details-${roomId}`);
+            const itemEl = document.getElementById(`call-${roomId}`);
+            const iconEl = document.getElementById(`icon-${roomId}`);
+
+            const isExpanded = itemEl.classList.contains('expanded');
+
+            // Collapse all others (optional - cleaner UI)
+            document.querySelectorAll('.call-item.expanded').forEach(el => {
+                if (el.id !== `call-${roomId}`) {
+                    el.classList.remove('expanded');
+                    el.querySelector('.expand-icon').textContent = '▶';
+                    // Destroy player if exists
+                    // We can optimize this later
+                }
+            });
+
+            if (isExpanded) {
+                itemEl.classList.remove('expanded');
+                iconEl.textContent = '▶';
+                // Stop audio if playing
+                if (activeWaveSurfer) { activeWaveSurfer.pause(); }
+            } else {
+                itemEl.classList.add('expanded');
+                iconEl.textContent = '▼';
+
+                // Load details if empty
+                if (!detailsEl.innerHTML.trim()) {
+                    detailsEl.innerHTML = '<div class="loading-spinner"></div> Loading details...';
+
+                    // Fetch full call object from memory (we have it in current page data)
+                    // But to be safe, let's just re-fetch or use what we have.
+                    // Actually, we can just find it in the global context if we stored it, 
+                    // but simplest is to just render from the data we just fetched.
+                    // NOTE: API `/api/calls` returns full objects, so we can just use that data.
+                    // But we don't have it stored in a map. Let's fix that.
+                    // Creating a temporary fetch to clean this up.
+
+                    const res = await fetch(`${API_BASE}/api/calls?limit=1&room_id=${roomId}`); // Hacky filter, but we actually just need to access the data.
+                    // Since API doesn't support room_id filter, let's just use what we have.
+                    // I will modify loadCalls to store calls in a global map.
+
+                    // Actually, let's just implement a get_call endpoint or just assume it's in the list.
+                    // For now, I will just re-fetch the list logic locally or attach data to DOM.
+                    // Let's attach data to DOM element to be easy.
+                }
+            }
+        }
+
+        // Re-implement loadCalls to store data
+        let callsData = {};
+
+        // Override the previous loadCalls to assume we use the global callsData
+        const originalLoadCalls = loadCalls;
+        loadCalls = async function () {
+            const listEl = document.getElementById('call-list');
+            listEl.innerHTML = '<div class="empty-state"><div class="loading-spinner"></div> Loading...</div>';
+
+            const status = document.getElementById('filter-status').value;
+            const phone = document.getElementById('filter-phone').value;
+
+            try {
+                const params = new URLSearchParams({ limit, offset: currentPage * limit });
+                if (status) params.append('status', status);
+                if (phone) params.append('phone', phone);
+
+                const res = await fetch(`${API_BASE}/api/calls?${params}`);
+                const data = await res.json();
+
+                if (data.success) {
+                    totalCalls = data.total;
+                    callsData = {};
+                    data.calls.forEach(c => callsData[c.room_id] = c);
+                    renderList(data.calls);
+                    renderPagination();
+                } else {
+                    listEl.innerHTML = `<div class="empty-state">Error: ${data.error}</div>`;
+                }
+            } catch (e) {
+                listEl.innerHTML = `<div class="empty-state">Connection Error</div>`;
+            }
+        }
+
+        // Updated Toggle with Data Access
+        toggleCall = function (roomId) {
+            const detailsEl = document.getElementById(`details-${roomId}`);
+            const itemEl = document.getElementById(`call-${roomId}`);
+            const iconEl = document.getElementById(`icon-${roomId}`);
+            const call = callsData[roomId];
+
+            if (itemEl.classList.contains('expanded')) {
+                itemEl.classList.remove('expanded');
+                iconEl.textContent = '▶';
+                if (activeWaveSurfer) {
+                    try { activeWaveSurfer.destroy(); } catch (e) { }
+                    activeWaveSurfer = null;
+                }
+            } else {
+                // Collapse others
+                document.querySelectorAll('.call-item.expanded').forEach(el => {
+                    el.classList.remove('expanded');
+                    el.querySelector('.expand-icon').textContent = '▶';
+                });
+                if (activeWaveSurfer) {
+                    try { activeWaveSurfer.destroy(); } catch (e) { }
+                }
+
+                itemEl.classList.add('expanded');
+                iconEl.textContent = '▼';
+
+                renderCallDetails(detailsEl, call);
+            }
+        }
+
+        // Render the Player and Transcript
+        function renderCallDetails(container, call) {
+            // Check if audio exists
+            const hasAudio = call.audio_url && call.audio_url.length > 0;
+            const audioUrl = hasAudio ? `${API_BASE}/api/calls/${call.room_id}/audio` : null;
+
+            // Parse transcript
+            let transcript = [];
+            let isJson = false;
+            try {
+                if (call.transcript && call.transcript.startsWith('[')) {
+                    transcript = JSON.parse(call.transcript);
+                    isJson = true;
+                } else if (call.transcript) {
+                    // Legacy plain text
+                    transcript = [{ text: call.transcript, speaker: 'system', timestamp: call.created_at }];
+                }
+            } catch (e) {
+                transcript = [];
+            }
+
+            container.innerHTML = `
+                <div class="player-container">
+                    ${hasAudio ? `
+                    <div class="waveform-wrapper">
+                        <div class="player-controls">
+                            <div class="play-btn" id="play-${call.room_id}">▶</div>
+                            <div class="time-display" id="time-${call.room_id}">0:00 / ${formatDuration(call.duration_seconds)}</div>
+                        </div>
+                        <div id="waveform-${call.room_id}"></div>
+                        <div id="timeline-${call.room_id}"></div>
+                    </div>
+                    ` : '<div style="padding:1rem; background:#111; border-radius:8px;">No audio recording available.</div>'}
+
+                    <div class="transcript-container">
+                        <div class="transcript-header">
+                            <div class="transcript-title">💬 Transcript</div>
+                            ${isJson && hasAudio ? '<div style="font-size:0.75rem; color:#666;">Synced with audio</div>' : ''}
+                        </div>
+                        <div class="scroller" id="transcript-scroll-${call.room_id}">
+                            ${renderTranscriptItems(transcript, call.created_at, isJson)}
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            if (hasAudio) {
+                initWaveSurfer(call.room_id, audioUrl, transcript, call.created_at, isJson);
+            }
+        }
+
+        // Generate Transcript HTML
+        function renderTranscriptItems(items, startTimeIso, isJson) {
+            if (!items || items.length === 0) return '<div style="padding:1rem; color:#666; font-style:italic;">No transcript available.</div>';
+
+            if (!isJson) {
+                return `<div style="white-space: pre-wrap; color:#ccc;">${items[0].text}</div>`;
+            }
+
+            const startTime = new Date(startTimeIso).getTime();
+
+            return items.map((item, idx) => {
+                const itemTime = new Date(item.timestamp).getTime();
+                // Relative seconds from start of call
+                // Note: If transcript timestamp is earlier than call start, default to 0
+                let relSeconds = Math.max(0, (itemTime - startTime) / 1000);
+
+                // If the first item is excessively late (e.g. 10s), adjust or keep as is? 
+                // Usually relative to the FIRST transcript item is better for sync if audio starts then.
+                // But audio usually starts at call start. Let's stick to call start.
+
+                // Format relative time
+                const timeLabel = formatDuration(relSeconds);
+                const speakerClass = item.speaker.toLowerCase() === 'user' ? 'speaker-user' : 'speaker-agent';
+                const speakerName = item.speaker.toLowerCase() === 'user' ? 'User' : 'Agent';
+
+                return `
+                    <div class="msg-row" id="msg-${idx}" data-time="${relSeconds}">
+                        <div class="msg-time" onclick="seekTo(${relSeconds})">${timeLabel}</div>
+                        <div class="msg-content">
+                            <div class="msg-header">
+                                <span class="speaker-name ${speakerClass}">${speakerName}</span>
+                            </div>
+                            <div class="msg-text" onclick="seekTo(${relSeconds})">${item.text}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // WaveSurfer Logic
+        function initWaveSurfer(roomId, audioUrl, transcript, startTimeIso, isJson) {
+            const wavesurfer = WaveSurfer.create({
+                container: `#waveform-${roomId}`,
+                waveColor: '#4f4f4f',
+                progressColor: '#6366f1',
+                cursorColor: '#a855f7',
+                barWidth: 2,
+                barGap: 1,
+                barRadius: 2,
+                height: 60,
+                url: audioUrl,
+                plugins: [
+                    WaveSurfer.Timeline.create({
+                        container: `#timeline-${roomId}`,
+                        primaryFontColor: '#888',
+                        secondaryFontColor: '#444',
+                        fontSize: 10,
+                    }),
+                    WaveSurfer.Hover.create({
+                        lineColor: '#a855f7',
+                        lineWidth: 2,
+                        labelBackground: '#555',
+                        labelColor: '#fff',
+                        labelSize: '11px',
+                    }),
+                ],
+            })
+
+            activeWaveSurfer = wavesurfer;
+
+            const playBtn = document.getElementById(`play-${roomId}`);
+            const timeDisplay = document.getElementById(`time-${roomId}`);
+
+            playBtn.addEventListener('click', () => wavesurfer.playPause());
+
+            wavesurfer.on('play', () => playBtn.textContent = '⏸');
+            wavesurfer.on('pause', () => playBtn.textContent = '▶');
+
+            wavesurfer.on('timeupdate', (currentTime) => {
+                const duration = wavesurfer.getDuration();
+                timeDisplay.textContent = `${formatDuration(currentTime)} / ${formatDuration(duration)}`;
+
+                // Sync Transcript
+                if (isJson) {
+                    syncTranscript(roomId, currentTime, transcript, startTimeIso);
+                }
+            });
+
+            wavesurfer.on('ready', () => {
+                timeDisplay.textContent = `0:00 / ${formatDuration(wavesurfer.getDuration())}`;
+            });
+
+            // Global seek function needed for onclick in HTML strings
+            window.seekTo = (seconds) => {
+                if (activeWaveSurfer) {
+                    activeWaveSurfer.setTime(seconds);
+                    activeWaveSurfer.play();
+                }
+            };
+        }
+
+        function syncTranscript(roomId, currentTime, transcript, startTimeIso) {
+            // Simple logic: Highlight the line that started most recently before currentTime
+            // But we already pre-calculated relative seconds in HTML data-time? NO, we did that in render.
+            // Let's grab the DOM elements.
+
+            const scroller = document.getElementById(`transcript-scroll-${roomId}`);
+            const rows = scroller.querySelectorAll('.msg-row');
+
+            let activeIdx = -1;
+
+            // Find active row
+            for (let i = 0; i < rows.length; i++) {
+                const rowTime = parseFloat(rows[i].dataset.time);
+                if (rowTime <= currentTime) {
+                    activeIdx = i;
+                } else {
+                    break;
+                }
+            }
+
+            // Update classes
+            rows.forEach((row, idx) => {
+                if (idx === activeIdx) {
+                    if (!row.classList.contains('active')) {
+                        row.classList.add('active');
+                        // Auto scroll
+                        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                } else {
+                    row.classList.remove('active');
+                }
+            });
+        }
+
+        function renderPagination() {
+            const el = document.getElementById('pagination');
+            const totalPages = Math.ceil(totalCalls / limit);
+            if (totalPages <= 1) { el.innerHTML = ''; return; }
+
+            let html = `
+                <button class="btn btn-secondary" onclick="setPage(${currentPage - 1})" ${currentPage === 0 ? 'disabled' : ''}>Prev</button>
+                <button class="btn btn-secondary" style="background:transparent; border:none; color:#fff; cursor:default;">Page ${currentPage + 1} of ${totalPages}</button>
+                <button class="btn btn-secondary" onclick="setPage(${currentPage + 1})" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>Next</button>
+            `;
+            el.innerHTML = html;
+        }
+
+        function setPage(p) {
+            if (p < 0) return;
+            currentPage = p;
+            loadCalls();
+        }
+
+        function refreshData() {
+            loadStats();
+            loadCalls();
+        }
+
+        // Init
+        refreshData();
+        setInterval(refreshData, 30000);
+
+    </script>
+</body>
+
+</html>

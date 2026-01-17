@@ -1544,3 +1544,39 @@ function clearPromptHistory() {
         loadPromptHistory();
     }
 }
+
+// Reset voicemail rows to pending
+async function resetVoicemailRows() {
+    const sheetId = document.getElementById('reset-sheet-id').value.trim();
+    const statusDiv = document.getElementById('reset-voicemail-status');
+
+    // Show loading state
+    statusDiv.style.display = 'block';
+    statusDiv.style.background = '#e2e3e5';
+    statusDiv.style.color = '#383d41';
+    statusDiv.innerHTML = '⏳ Finding and resetting voicemail rows...';
+
+    try {
+        const response = await fetch(`${API_BASE}/api/reset-voicemail-rows`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sheet_id: sheetId || null })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            statusDiv.style.background = '#d4edda';
+            statusDiv.style.color = '#155724';
+            statusDiv.innerHTML = `✅ <strong>Success!</strong> Reset ${data.rows_reset} voicemail rows to "Pending".<br><small>Cells updated: ${data.cells_updated}</small>`;
+        } else {
+            statusDiv.style.background = '#f8d7da';
+            statusDiv.style.color = '#721c24';
+            statusDiv.innerHTML = `❌ <strong>Error:</strong> ${data.error || 'Unknown error'}`;
+        }
+    } catch (error) {
+        statusDiv.style.background = '#f8d7da';
+        statusDiv.style.color = '#721c24';
+        statusDiv.innerHTML = `❌ <strong>Error:</strong> ${error.message}`;
+    }
+}

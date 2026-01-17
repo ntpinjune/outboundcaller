@@ -7,7 +7,7 @@ Provides a REST API and web interface for configuring the agent without code cha
 import os
 import json
 import logging
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from typing import Dict, Any, Optional
 import subprocess
@@ -26,6 +26,14 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from dispatch_calls import get_google_sheets_service, read_pending_rows
 
 from config_manager import load_config, save_config, get_config_value, load_system_prompt, get_effective_system_prompt
+
+# Import call history for observability
+try:
+    from call_history import get_call_history, CallRecord, get_calls, get_call
+    CALL_HISTORY_AVAILABLE = True
+except ImportError:
+    CALL_HISTORY_AVAILABLE = False
+    logger.warning("Call history module not available")
 
 
 # Setup logging
@@ -886,6 +894,279 @@ def _deep_merge(base: Dict, override: Dict) -> Dict:
         else:
             result[key] = value
     return result
+
+
+# ===== Call History API Endpoints =====
+
+@app.route('/call-history')
+def call_history_page():
+    """Serve the call history dashboard page."""
+    return send_from_directory(app.static_folder, 'call_history.html')
+
+
+@app.route('/api/calls', methods=['GET'])
+def list_calls():
+    """List call history with optional filtering."""
+    if not CALL_HISTORY_AVAILABLE:
+        return jsonify({"error": "Call history not available"}), 503
+    
+    try:
+        limit = int(request.args.get('limit', 50))
+        offset = int(request.args.get('offset', 0))
+        status = request.args.get('status')
+        phone = request.args.get('phone')
+        
+        calls = get_calls(
+            limit=limit,
+            offset=offset,
+            status=status if status else None,
+            phone_number=phone if phone else None
+        )
+        
+        call_history = get_call_history()
+        total = call_history.get_call_count(status=status if status else None)
+        
+        return jsonify({
+            "success": True,
+            "calls": [c.to_dict() for c in calls],
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        })
+    except Exception as e:
+        logger.error(f"Error listing calls: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/calls/<room_id>', methods=['GET'])
+def get_call_details(room_id):
+    """Get details of a single call."""
+    if not CALL_HISTORY_AVAILABLE:
+        return jsonify({"error": "Call history not available"}), 503
+    
+    try:
+        call = get_call(room_id)
+        if call:
+            return jsonify({
+                "success": True,
+                "call": call.to_dict()
+            })
+        else:
+            return jsonify({"success": False, "error": "Call not found"}), 404
+    except Exception as e:
+        logger.error(f"Error getting call details: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/calls/<room_id>/audio', methods=['GET'])
+def stream_call_audio(room_id):
+    """Stream audio file for a call (from S3 or local storage)."""
+    if not CALL_HISTORY_AVAILABLE:
+        return jsonify({"error": "Call history not available"}), 503
+    
+    try:
+        logger.info(f"Requesting audio for room_id: '{room_id}'")
+        call = get_call(room_id)
+        logger.info(f"Call lookup result: {call}")
+        if call:
+            logger.info(f"Call audio_url: '{call.audio_url}'")
+            
+        if not call or not call.audio_url:
+            logger.warning(f"Audio not found for room_id: {room_id}")
+            return jsonify({"error": "Audio not found"}), 404
+        
+        # If it's an S3 URL, generate a presigned URL
+            # Proxy the audio to avoid CORS issues
+            try:
+                import boto3
+                from botocore.config import Config
+            except ImportError:
+                return jsonify({"error": "boto3 not installed. Run 'pip install boto3'"}), 500
+            
+            # Parse S3 URL
+            if call.audio_url.startswith('s3://'):
+                # s3://bucket/key format
+                parts = call.audio_url[5:].split('/', 1)
+                bucket = parts[0]
+                key = parts[1] if len(parts) > 1 else ''
+            else:
+                # HTTPS URL format
+                # https://bucket.s3.region.amazonaws.com/key
+                from urllib.parse import urlparse
+                parsed = urlparse(call.audio_url)
+                bucket = parsed.netloc.split('.')[0]
+                key = parsed.path.lstrip('/')
+            
+            try:
+                s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
+                
+                # Get object stream
+                s3_response = s3_client.get_object(Bucket=bucket, Key=key)
+                
+                def generate():
+                    for chunk in s3_response['Body'].iter_chunks():
+                        yield chunk
+                
+                return Response(
+                    stream_with_context(generate()),
+                    mimetype=s3_response.get('ContentType', 'audio/ogg'),
+                    headers={"Content-Disposition": f"inline; filename={key.split('/')[-1] or 'recording.ogg'}"}
+                )
+            except Exception as e:
+                logger.error(f"Error streaming from S3: {e}")
+                return jsonify({"error": f"Failed to stream from S3: {str(e)}"}), 500
+        
+        # If it's a local file, serve it directly
+        elif os.path.exists(call.audio_url):
+            from flask import send_file
+            return send_file(call.audio_url, mimetype='audio/wav')
+        
+        # If it's already a full URL, redirect
+        elif call.audio_url.startswith('http'):
+            from flask import redirect
+            return redirect(call.audio_url)
+        
+        else:
+            return jsonify({"error": "Audio file not accessible"}), 404
+            
+    except Exception as e:
+        logger.error(f"Error streaming audio: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/calls/stats', methods=['GET'])
+def call_stats():
+    """Get call statistics."""
+    if not CALL_HISTORY_AVAILABLE:
+        return jsonify({"error": "Call history not available"}), 503
+    
+    try:
+        call_history = get_call_history()
+        return jsonify({
+            "success": True,
+            "stats": {
+                "total": call_history.get_call_count(),
+                "completed": call_history.get_call_count(status="completed"),
+                "voicemail": call_history.get_call_count(status="voicemail"),
+                "failed": call_history.get_call_count(status="failed"),
+                "no_answer": call_history.get_call_count(status="no_answer"),
+                "busy": call_history.get_call_count(status="busy")
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting call stats: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/reset-voicemail-rows', methods=['POST'])
+def reset_voicemail_rows():
+    """Reset voicemail rows to Pending status, clearing data except phone and business name."""
+    try:
+        data = request.get_json() or {}
+        sheet_id = data.get('sheet_id')
+        
+        # Use provided sheet_id or fall back to config/env
+        if not sheet_id:
+            config = load_config()
+            sheet_id = config.get("integrations", {}).get("google_sheet_id") or os.getenv("GOOGLE_SHEET_ID")
+        
+        if not sheet_id:
+            return jsonify({"success": False, "error": "No Google Sheet ID provided or configured"}), 400
+        
+        sheet_name = os.getenv("GOOGLE_SHEET_NAME", "la-orange-county-landscapers-full-template")
+        
+        # Get Google Sheets service
+        service = get_google_sheets_service()
+        
+        # Read all data from sheet
+        range_name = f"{sheet_name}!A:M"
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=range_name,
+        ).execute()
+        
+        values = result.get("values", [])
+        
+        if not values:
+            return jsonify({"success": False, "error": "No data found in sheet"}), 404
+        
+        # Find Status column index
+        headers = values[0]
+        try:
+            status_idx = headers.index("Status")
+        except ValueError:
+            return jsonify({"success": False, "error": "'Status' column not found in headers"}), 400
+        
+        # Find voicemail rows
+        voicemail_rows = []
+        for row_num, row in enumerate(values[1:], start=2):
+            if len(row) > status_idx:
+                status = row[status_idx].strip().lower()
+                if status == "voicemail":
+                    phone = row[0] if len(row) > 0 else ""
+                    business = row[9] if len(row) > 9 else ""
+                    voicemail_rows.append({
+                        "row_num": row_num,
+                        "phone": phone,
+                        "business": business,
+                    })
+        
+        if not voicemail_rows:
+            return jsonify({"success": True, "rows_reset": 0, "cells_updated": 0, "message": "No voicemail rows found"})
+        
+        # Build batch update - keep Phone (col 0) and Business name (col 9), clear rest, set Status to Pending
+        batch_data = []
+        for row_info in voicemail_rows:
+            row_num = row_info["row_num"]
+            phone = row_info["phone"]
+            business = row_info["business"]
+            
+            # Build new row: 13 columns (A-M)
+            new_row = [
+                phone,     # A - Phone_number (keep)
+                "",        # B - Name (clear)
+                "Pending", # C - Status (set to Pending)
+                "",        # D - Appointment Scheduled (clear)
+                "",        # E - Appointment Time Scheduled (clear)
+                "",        # F - Appointment Email (clear)
+                "",        # G - Transcript (clear)
+                "",        # H - Call Duration (clear)
+                "",        # I - Last Called (clear)
+                business,  # J - Business name (keep)
+                "",        # K - Room Name (clear)
+                "",        # L - Session ID (clear)
+                "",        # M - Outcome Details (clear)
+            ]
+            
+            range_to_update = f"{sheet_name}!A{row_num}:M{row_num}"
+            batch_data.append({
+                "range": range_to_update,
+                "values": [new_row]
+            })
+        
+        # Execute batch update
+        body = {
+            "valueInputOption": "RAW",
+            "data": batch_data
+        }
+        
+        result = service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body=body
+        ).execute()
+        
+        cells_updated = result.get('totalUpdatedCells', 0)
+        logger.info(f"Reset {len(voicemail_rows)} voicemail rows to Pending ({cells_updated} cells updated)")
+        
+        return jsonify({
+            "success": True,
+            "rows_reset": len(voicemail_rows),
+            "cells_updated": cells_updated
+        })
+        
+    except Exception as e:
+        logger.error(f"Error resetting voicemail rows: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 def run_server(host=HOST, port=PORT, debug=False):

@@ -3,6 +3,7 @@ from libc.stdint cimport int32_t
 from collections.abc import Mapping
 from enum import Enum
 
+from av.sidedata.encparams import VideoEncParams
 from av.sidedata.motionvectors import MotionVectors
 
 
@@ -49,6 +50,8 @@ class Type(Enum):
 cdef SideData wrap_side_data(Frame frame, int index):
     if frame.ptr.side_data[index].type == lib.AV_FRAME_DATA_MOTION_VECTORS:
         return MotionVectors(_cinit_bypass_sentinel, frame, index)
+    elif frame.ptr.side_data[index].type == lib.AV_FRAME_DATA_VIDEO_ENC_PARAMS:
+        return VideoEncParams(_cinit_bypass_sentinel, frame, index)
     else:
         return SideData(_cinit_bypass_sentinel, frame, index)
 
@@ -63,7 +66,7 @@ cdef int get_display_rotation(Frame frame):
 cdef class SideData(Buffer):
     def __init__(self, sentinel, Frame frame, int index):
         if sentinel is not _cinit_bypass_sentinel:
-            raise RuntimeError("cannot manually instatiate SideData")
+            raise RuntimeError("cannot manually instantiate SideData")
         self.frame = frame
         self.ptr = frame.ptr.side_data[index]
         self.metadata = wrap_dictionary(self.ptr.metadata)
