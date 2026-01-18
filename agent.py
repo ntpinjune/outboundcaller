@@ -1148,15 +1148,8 @@ class OutboundCaller(Agent):
             phone = self.dial_info.get("phone_number", "Unknown Phone")
             business = self.dial_info.get("business_name", "Unknown Business")
             
-            # Send Slack notification (Hot Lead)
-            slack_msg = (
-                f"🔥 *HOT LEAD - CALLBACK REQUIRED* 🔥\n\n"
-                f"*Client Phone:* {phone}\n"
-                f"*Business:* {business}\n"
-                f"*Client Email:* {email}\n"
-                f"*Proposed Time:* {dateTime}\n"
-                f"*Status:* Booking \"failed\" intentionally - Call them back!"
-            )
+            # Send Slack notification (Hot Lead - just phone number)
+            slack_msg = f"🔥 HOT LEAD: {phone}"
             asyncio.create_task(self.send_slack_notification(slack_msg))
             
             # Set appointment scheduled to true so we track it as a conversion internally
@@ -1287,6 +1280,46 @@ async def start_call_recording(ctx: JobContext, phone_number: str, room_name: st
 def _get_noise_cancellation_filter(mode: str):
     """Get noise cancellation filter based on mode."""
     return None # Simplified for restoration
+
+
+def prewarm(proc):
+    """Prewarm function to preload models before handling calls.
+    
+    This significantly reduces the latency on the first call by loading
+    models (especially Silero VAD) ahead of time.
+    """
+    logger.info("🔥 Pre-warming models for low-latency first call...")
+    
+    # Preload Silero VAD (the main latency culprit on first call)
+    try:
+        silero.VAD.load()
+        logger.info("✅ Silero VAD model preloaded")
+    except Exception as e:
+        logger.warning(f"⚠️  Could not prewarm Silero VAD: {e}")
+    
+    # Preload Deepgram STT (establish connection pool)
+    try:
+        deepgram.STT()
+        logger.info("✅ Deepgram STT initialized")
+    except Exception as e:
+        logger.warning(f"⚠️  Could not prewarm Deepgram STT: {e}")
+    
+    # Preload Cartesia TTS (establish connection)
+    try:
+        cartesia.TTS()
+        logger.info("✅ Cartesia TTS initialized")
+    except Exception as e:
+        logger.warning(f"⚠️  Could not prewarm Cartesia TTS: {e}")
+    
+    # Preload Groq LLM (establish connection)
+    try:
+        groq.LLM()
+        logger.info("✅ Groq LLM initialized")
+    except Exception as e:
+        logger.warning(f"⚠️  Could not prewarm Groq LLM: {e}")
+    
+    logger.info("🔥 Prewarm complete - all models ready!")
+
 
 
 async def entrypoint(ctx: JobContext):
@@ -2459,6 +2492,7 @@ Persona: Local peer, friendly, and authentic. Add filler words (um, uh, and like
         min_interruption_words=0,  # No minimum words required
         # Ultra-low latency optimizations
         preemptive_generation=True, # Start synthesis before user finish speaking
+        # Note: fnc_ctx removed in livekit-agents 1.3.x - tools are registered via Agent class
     )
 
     # --- Transcription & Event Listeners ---
@@ -2665,16 +2699,14 @@ Persona: Local peer, friendly, and authentic. Add filler words (um, uh, and like
         
         # Start audio recording with Egress (saves to S3)
         try:
-            egress_id = await start_call_recording(ctx, phone_number, ctx.room.name)
-            if egress_id:
-                agent.egress_id = egress_id
-                # Construct the S3 URL for later use
-                aws_bucket = os.getenv("AWS_BUCKET_NAME", "")
-                aws_region = os.getenv("AWS_REGION", "us-east-2")
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                phone_clean = phone_number.replace("+", "").replace("-", "").replace(" ", "")
-                agent.audio_s3_url = f"s3://{aws_bucket}/calls/{phone_clean}_{ctx.room.name}_{timestamp}.ogg"
-                logger.info(f"[RECORDING] Call recording started: {egress_id}")
+            # start_call_recording returns a tuple (egress_id, s3_url)
+            egress_result = await start_call_recording(ctx, phone_number, ctx.room.name)
+            
+            if egress_result and egress_result[0]:
+                agent.egress_id = egress_result[0]
+                agent.audio_s3_url = egress_result[1]
+                logger.info(f"[RECORDING] Call recording started: {agent.egress_id}")
+                logger.info(f"[RECORDING] Audio URL: {agent.audio_s3_url}")
             else:
                 agent.egress_id = ""
                 agent.audio_s3_url = ""
@@ -3019,7 +3051,7 @@ Persona: Local peer, friendly, and authentic. Add filler words (um, uh, and like
                 
                 try:
                     await session.generate_reply(
-                        instructions="Say ONLY this: 'Hello?' Then STOP COMPLETELY and wait for their response. Do not say anything else until they respond."
+                        instructions="Say ONLY: 'Hello?' in a friendly tone. Then STOP and wait for their response."
                     )
                     greeting_sent_time = datetime.datetime.now()
                     logger.info("[CALL] Agent said 'Hello?' - waiting for response...")
@@ -3239,6 +3271,7 @@ if __name__ == "__main__":
                 cli.run_app(
                     WorkerOptions(
                         entrypoint_fnc=entrypoint,
+                        prewarm_fnc=prewarm,
                         agent_name="outbound-caller-dev",
                         num_idle_processes=3,
                     )
@@ -3257,6 +3290,7 @@ if __name__ == "__main__":
         cli.run_app(
             WorkerOptions(
                 entrypoint_fnc=entrypoint,
+                prewarm_fnc=prewarm,
                 agent_name="outbound-caller-dev",
             )
         )

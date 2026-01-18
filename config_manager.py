@@ -156,6 +156,8 @@ def save_config(config: Dict[str, Any]) -> bool:
         
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(safe_config, f, indent=2, ensure_ascii=False)
+            f.flush()  # Flush Python buffer
+            os.fsync(f.fileno())  # Force OS to write to disk
         
         logger.info(f"[OK] Configuration saved to {CONFIG_FILE}")
         return True

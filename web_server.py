@@ -1023,12 +1023,35 @@ def stream_call_audio(room_id):
                 if not bucket or not key:
                     raise ValueError(f"Could not parse S3 URL: {call.audio_url}")
 
-                s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
+                # Get credentials from env or config
+                aws_region = os.getenv("AWS_REGION") or config.get("integrations", {}).get("aws_region") or "us-east-1"
+                aws_access_key = os.getenv("AWS_ACCESS_KEY_ID") or config.get("integrations", {}).get("aws_access_key_id")
+                aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY") or config.get("integrations", {}).get("aws_secret_access_key")
+
+                s3_client = boto3.client(
+                    's3', 
+                    config=Config(signature_version='s3v4'),
+                    region_name=aws_region,
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret
+                )
+                logger.info(f"Attempting to fetch S3 object. Region: {aws_region}, Bucket: {bucket}, Key: {key}")
                 try:
                     s3_response = s3_client.get_object(Bucket=bucket, Key=key)
                 except s3_client.exceptions.NoSuchKey:
-                    logger.warning(f"S3 Key not found: {key}")
-                    return jsonify({"error": "Audio file not found in S3"}), 404
+                    logger.warning(f"S3 Key not found: {key} in bucket {bucket}")
+                    # Debug: List object in the bucket to see what's there
+                    try:
+                        objects = s3_client.list_objects_v2(Bucket=bucket, Prefix="calls/", MaxKeys=5)
+                        if 'Contents' in objects:
+                            keys = [obj['Key'] for obj in objects['Contents']]
+                            logger.info(f"Available keys in calls/: {keys}")
+                        else:
+                            logger.info("No objects found in calls/ prefix")
+                    except Exception as list_err:
+                        logger.error(f"Failed to list objects: {list_err}")
+                        
+                    return jsonify({"error": f"Audio file not found in S3 (Key: {key})"}), 404
                 except Exception as e:
                     # Generic boto3 error (permission, connection, etc)
                     logger.error(f"S3 Client Error: {e}")
