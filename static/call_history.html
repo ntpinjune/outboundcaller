@@ -903,9 +903,22 @@
                         labelSize: '11px',
                     }),
                 ],
-            })
+            });
 
             activeWaveSurfer = wavesurfer;
+
+            // Handle Errors (e.g. 404)
+            wavesurfer.on('error', (e) => {
+                console.error("WaveSurfer Error:", e);
+                const container = document.getElementById(`waveform-${roomId}`);
+                if (container && container.parentElement) {
+                    // Replace the entire player container with error message
+                    container.parentElement.innerHTML = `<div style="padding:1rem; background:rgba(239, 68, 68, 0.1); border:1px solid rgba(239, 68, 68, 0.3); border-radius:8px; color:#ff8888; text-align:center;">
+                        Audio unavailable or corrupted. <br>
+                        <span style="font-size:0.8em; color:#aaa;">${e.message || "File not found"}</span>
+                     </div>`;
+                }
+            });
 
             const playBtn = document.getElementById(`play-${roomId}`);
             const timeDisplay = document.getElementById(`time-${roomId}`);

@@ -524,7 +524,52 @@ function populateForm(config) {
         setValue('voice-speed', config.agent.voice_speed || config.agent.tts_speed || 1.0);
         setValue('voice-volume', Math.round((config.agent.voice_volume || config.agent.piper_volume || 1.0) * 100));
         setValue('llm-temperature', config.agent.llm_temperature || 1.0);
-        setValue('background-sound', config.agent.background_sound || '');
+        setValue('llm-temperature', config.agent.llm_temperature || 1.0);
+
+        // Background Sound Logic
+        const bgSound = config.agent.background_sound || '';
+        const bgSoundSelect = document.getElementById('background-sound');
+
+        if (bgSoundSelect) {
+            // Check if value is in options (none, office, etc.)
+            let found = false;
+            for (let i = 0; i < bgSoundSelect.options.length; i++) {
+                if (bgSoundSelect.options[i].value === bgSound) {
+                    bgSoundSelect.selectedIndex = i;
+                    found = true;
+                    break;
+                }
+            }
+
+            // If not found (and not empty), it's likely a custom file that we treat as 'custom'
+            // OR if background_sound_url is set
+            const bgSoundUrl = config.voice_settings && config.voice_settings.background_sound_url;
+
+            if (!found && ((bgSound && bgSound !== '') || bgSoundUrl)) {
+                bgSoundSelect.value = 'custom';
+                // Show custom input
+                toggleCustomSoundUpload();
+                // Set path value
+                const customPath = bgSoundUrl || (bgSound.includes('/') ? bgSound : '');
+                if (document.getElementById('custom-sound-path')) {
+                    document.getElementById('custom-sound-path').value = customPath;
+                }
+            } else {
+                bgSoundSelect.value = bgSound;
+                toggleCustomSoundUpload();
+            }
+        }
+
+        // Background Volume
+        if (config.voice_settings && config.voice_settings.background_sound_volume !== undefined) {
+            const vol = Math.round(config.voice_settings.background_sound_volume * 100);
+            setValue('background-sound-volume', vol);
+            if (document.getElementById('background-sound-volume-value')) {
+                document.getElementById('background-sound-volume-value').textContent = vol + '%';
+            }
+        } else {
+            setValue('background-sound-volume', 10);
+        }
 
         // Noise Cancellation Mode
         const noiseCancelMode = config.agent.noise_cancellation_mode || 'bvc_telephony';
@@ -743,6 +788,65 @@ function updateEmbeddedSheet(value) {
     }
 }
 
+// Toggle custom sound upload UI
+function toggleCustomSoundUpload() {
+    const select = document.getElementById('background-sound');
+    const uploadDiv = document.getElementById('custom-sound-upload');
+    if (select && uploadDiv) {
+        if (select.value === 'custom') {
+            uploadDiv.style.display = 'block';
+        } else {
+            uploadDiv.style.display = 'none';
+        }
+    }
+}
+
+// Upload background sound
+async function uploadBackgroundSound() {
+    const fileInput = document.getElementById('sound-file-input');
+    const status = document.getElementById('upload-status');
+    const pathInput = document.getElementById('custom-sound-path');
+
+    if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+        if (status) status.textContent = "Please select a file first.";
+        return;
+    }
+
+    const file = fileInput.files[0];
+    const formData = new FormData();
+    formData.append('file', file);
+
+    if (status) status.textContent = "Uploading...";
+
+    try {
+        const response = await fetch('/api/upload-background-sound', {
+            method: 'POST',
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            if (status) {
+                status.textContent = `Uploaded: ${result.filename}`;
+                status.style.color = 'green';
+            }
+            if (pathInput) pathInput.value = result.path;
+        } else {
+            if (status) {
+                status.textContent = `Error: ${result.error}`;
+                status.style.color = 'red';
+            }
+        }
+    } catch (e) {
+        console.error("Upload error:", e);
+        if (status) {
+            status.textContent = `Upload failed: ${e.message}`;
+            status.style.color = 'red';
+        }
+    }
+}
+
 // Save configuration
 async function saveConfig() {
     try {
@@ -778,6 +882,7 @@ async function saveConfig() {
                 voice_speed: parseFloat(getValue('voice-speed') || getValue('tts-speed') || 1.0),
                 voice_volume: parseFloat(getValue('voice-volume') || 100) / 100, // Convert from percentage
                 llm_temperature: parseFloat(getValue('llm-temperature') || getValue('agent-llm-temperature') || 1.0),
+                // Background Sound Logic
                 background_sound: getValue('background-sound') || '',
                 noise_cancellation_mode: document.querySelector('input[name="noise-cancellation"]:checked')?.value || 'bvc_telephony',
                 // Agent Behavior
@@ -790,6 +895,9 @@ async function saveConfig() {
                 style_exaggeration: parseFloat(getValue('style-exaggeration')),
                 optimize_streaming_latency: parseInt(getValue('optimize-streaming-latency')),
                 use_speaker_boost: getCheckbox('use-speaker-boost'),
+                // New logic for background sound URL/Volume
+                background_sound_url: (getValue('background-sound') === 'custom') ? getValue('custom-sound-path') : '',
+                background_sound_volume: parseFloat(getValue('background-sound-volume') || 10) / 100,
             },
             call_behavior: {
                 initial_greeting_delay: parseFloat(getValue('initial-greeting-delay')),

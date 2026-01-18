@@ -16,7 +16,11 @@ from datetime import datetime
 import base64
 import hmac
 import hashlib
+import base64
+import hmac
+import hashlib
 import requests
+from werkzeug.utils import secure_filename
 
 
 # Import from dispatch_calls
@@ -39,6 +43,9 @@ except ImportError:
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("web-server")
+
+# Ensure static/sounds directory exists
+os.makedirs(os.path.join(os.path.dirname(__file__), 'static', 'sounds'), exist_ok=True)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app)  # Enable CORS for all routes
@@ -975,33 +982,57 @@ def stream_call_audio(room_id):
             logger.warning(f"Audio not found for room_id: {room_id}")
             return jsonify({"error": "Audio not found"}), 404
         
-        # If it's an S3 URL, generate a presigned URL
-            # Proxy the audio to avoid CORS issues
+        if not call or not call.audio_url:
+            logger.warning(f"Audio not found for room_id: {room_id}")
+            return jsonify({"error": "Audio not found"}), 404
+        
+        # Helper to stream local file
+        if os.path.exists(call.audio_url):
+            from flask import send_file
+            return send_file(call.audio_url, mimetype='audio/wav')
+
+        # If it's an S3 URL, try to parse and stream
+        if call.audio_url.startswith('s3://') or 's3.amazonaws.com' in call.audio_url or 's3.' in call.audio_url:
             try:
                 import boto3
                 from botocore.config import Config
-            except ImportError:
-                return jsonify({"error": "boto3 not installed. Run 'pip install boto3'"}), 500
-            
-            # Parse S3 URL
-            if call.audio_url.startswith('s3://'):
-                # s3://bucket/key format
-                parts = call.audio_url[5:].split('/', 1)
-                bucket = parts[0]
-                key = parts[1] if len(parts) > 1 else ''
-            else:
-                # HTTPS URL format
-                # https://bucket.s3.region.amazonaws.com/key
                 from urllib.parse import urlparse
-                parsed = urlparse(call.audio_url)
-                bucket = parsed.netloc.split('.')[0]
-                key = parsed.path.lstrip('/')
-            
-            try:
-                s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
                 
-                # Get object stream
-                s3_response = s3_client.get_object(Bucket=bucket, Key=key)
+                bucket = None
+                key = None
+                
+                if call.audio_url.startswith('s3://'):
+                    parts = call.audio_url[5:].split('/', 1)
+                    bucket = parts[0]
+                    key = parts[1] if len(parts) > 1 else ''
+                else:
+                    # Generic URL parsing
+                    parsed = urlparse(call.audio_url)
+                    # Handle virtual-hosted style: bucket.s3.region.amazonaws.com
+                    if parsed.netloc.endswith('amazonaws.com') and parsed.netloc.startswith('s3'):
+                        # path style? s3.region...
+                         path_parts = parsed.path.lstrip('/').split('/', 1)
+                         if len(path_parts) > 1:
+                             bucket = path_parts[0]
+                             key = path_parts[1]
+                    else:
+                        # Assume virtual host: bucket.s3...
+                         bucket = parsed.netloc.split('.')[0]
+                         key = parsed.path.lstrip('/')
+                
+                if not bucket or not key:
+                    raise ValueError(f"Could not parse S3 URL: {call.audio_url}")
+
+                s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
+                try:
+                    s3_response = s3_client.get_object(Bucket=bucket, Key=key)
+                except s3_client.exceptions.NoSuchKey:
+                    logger.warning(f"S3 Key not found: {key}")
+                    return jsonify({"error": "Audio file not found in S3"}), 404
+                except Exception as e:
+                    # Generic boto3 error (permission, connection, etc)
+                    logger.error(f"S3 Client Error: {e}")
+                    raise e 
                 
                 def generate():
                     for chunk in s3_response['Body'].iter_chunks():
@@ -1013,15 +1044,19 @@ def stream_call_audio(room_id):
                     headers={"Content-Disposition": f"inline; filename={key.split('/')[-1] or 'recording.ogg'}"}
                 )
             except Exception as e:
+                # Check for 404 response from boto3 if not caught above
+                if "NoSuchKey" in str(e) or "404" in str(e):
+                     return jsonify({"error": "Audio file not found in S3"}), 404
+                     
                 logger.error(f"Error streaming from S3: {e}")
+                
+                # Fallback to redirect if streaming fails
+                if call.audio_url.startswith('http'):
+                     from flask import redirect
+                     return redirect(call.audio_url)
                 return jsonify({"error": f"Failed to stream from S3: {str(e)}"}), 500
         
-        # If it's a local file, serve it directly
-        elif os.path.exists(call.audio_url):
-            from flask import send_file
-            return send_file(call.audio_url, mimetype='audio/wav')
-        
-        # If it's already a full URL, redirect
+        # If it's a HTTP URL but not seemingly S3 (or S3 fallback failed above), redirect
         elif call.audio_url.startswith('http'):
             from flask import redirect
             return redirect(call.audio_url)
@@ -1167,6 +1202,39 @@ def reset_voicemail_rows():
     except Exception as e:
         logger.error(f"Error resetting voicemail rows: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/upload-background-sound', methods=['POST'])
+def upload_background_sound():
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "No file part"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "No selected file"}), 400
+        
+    if file and (file.filename.endswith('.mp3') or file.filename.endswith('.wav') or file.filename.endswith('.ogg')):
+        filename = secure_filename(file.filename)
+        # Ensure directory exists
+        sounds_dir = os.path.join(app.static_folder, 'sounds')
+        os.makedirs(sounds_dir, exist_ok=True)
+        
+        save_path = os.path.join(sounds_dir, filename)
+        
+        try:
+            file.save(save_path)
+            logger.info(f"Uploaded background sound: {filename}")
+            return jsonify({
+                "success": True, 
+                "filename": filename,
+                "path": f"static/sounds/{filename}",
+                "url": f"sounds/{filename}"
+            })
+        except Exception as e:
+            logger.error(f"Failed to save uploaded file: {e}")
+            return jsonify({"success": False, "error": f"Failed to save file: {e}"}), 500
+            
+    return jsonify({"success": False, "error": "Invalid file type. Allowed: mp3, wav, ogg"}), 400
 
 
 def run_server(host=HOST, port=PORT, debug=False):

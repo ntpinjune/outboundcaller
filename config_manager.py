@@ -67,6 +67,7 @@ CONFIG_SCHEMA = {
         "optimize_streaming_latency": 3, # 0-4
         "use_speaker_boost": True,
         "background_sound_url": "",
+        "background_sound_volume": 0.1,
         "input_min_characters": 30,
     },
     "call_behavior": {

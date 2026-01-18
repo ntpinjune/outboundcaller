@@ -293,7 +293,7 @@
 
                 <div class="form-group">
                     <label for="background-sound">Background Sound</label>
-                    <select id="background-sound">
+                    <select id="background-sound" onchange="toggleCustomSoundUpload()">
                         <option value="">Please Select</option>
                         <option value="none">None</option>
                         <option value="office">Office</option>
@@ -301,7 +301,27 @@
                         <option value="street">Street</option>
                         <option value="indoor">Indoor</option>
                         <option value="outdoor">Outdoor</option>
+                        <option value="custom">Custom (Upload)...</option>
                     </select>
+
+                    <div id="custom-sound-upload"
+                        style="display: none; margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 4px;">
+                        <span style="font-size: 0.9em; display: block; margin-bottom: 5px;">Upload MP3/WAV/OGG:</span>
+                        <div style="display: flex; gap: 10px;">
+                            <input type="file" id="sound-file-input" accept=".mp3,.wav,.ogg,.m4a" style="flex: 1;">
+                            <button type="button" class="btn btn-secondary" onclick="uploadBackgroundSound()"
+                                style="padding: 2px 10px; height: auto;">Upload</button>
+                        </div>
+                        <input type="hidden" id="custom-sound-path">
+                        <small id="upload-status" style="display: block; margin-top: 5px; color: #666;"></small>
+                    </div>
+
+                    <div style="margin-top: 10px;">
+                        <label for="background-sound-volume" style="font-size: 0.9em;">Background Volume</label>
+                        <input type="range" id="background-sound-volume" min="0" max="100" step="5" value="10">
+                        <span id="background-sound-volume-value" style="font-size: 0.9em;">10%</span>
+                    </div>
+
                     <small>Add ambient environment sound to make experience more realistic</small>
                 </div>
                 <div class="form-group">

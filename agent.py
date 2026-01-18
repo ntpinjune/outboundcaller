@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+# Import Background Audio Player
+from background_audio import BackgroundAudioPlayer
 from dotenv import load_dotenv
 import json
 import os
@@ -472,6 +474,7 @@ class OutboundCaller(Agent):
         )
         # keep reference to the participant for transfers
         self.participant: rtc.RemoteParticipant | None = None
+        self.background_audio: BackgroundAudioPlayer | None = None
 
         self.name = name
         self.appointment_time = appointment_time
@@ -948,8 +951,15 @@ class OutboundCaller(Agent):
         else:
             outcome_details = f"Failed ({failure_reason or 'Unknown error'})"
         
+        # Get phone number (fallback to dial_info if participant not yet set)
+        phone_number = ""
+        if self.participant:
+            phone_number = self.participant.identity
+        elif self.dial_info:
+            phone_number = self.dial_info.get("phone_number") or self.dial_info.get("phoneNumber") or ""
+            
         data = {
-            "phone_number": self.participant.identity if self.participant else "",
+            "phone_number": phone_number,
             "name": self.name,
             "call_status": call_status,
             "call_duration_seconds": int(duration),
@@ -1864,6 +1874,11 @@ Trigger endCall."""
         if isinstance(VOICE_SPEAKER_BOOST, str):
              VOICE_SPEAKER_BOOST = VOICE_SPEAKER_BOOST.lower() == "true"
         
+        # Background Sound Configuration
+        BACKGROUND_SOUND_URL = get_config_value("voice_settings.background_sound_url", "")
+        # Valid volume range 0.0 to 1.0
+        BACKGROUND_SOUND_VOLUME = float(get_config_value("voice_settings.background_sound_volume", "0.1"))
+        
         # Map response speed to endpointing delays (override if response speed preset is set)
         if RESPONSE_SPEED == "fast":
             MIN_ENDPOINTING_DELAY = 0.2
@@ -1895,6 +1910,10 @@ Trigger endCall."""
         VOICE_STYLE = float(os.getenv("STYLE_EXAGGERATION", "0.0"))
         VOICE_LATENCY = int(os.getenv("OPTIMIZE_STREAMING_LATENCY", "3"))
         VOICE_SPEAKER_BOOST = os.getenv("USE_SPEAKER_BOOST", "true").lower() == "true"
+        
+        # Background Sound defaults for env var mode
+        BACKGROUND_SOUND_URL = os.getenv("BACKGROUND_SOUND_URL", "")
+        BACKGROUND_SOUND_VOLUME = float(os.getenv("BACKGROUND_SOUND_VOLUME", "0.1"))
     
     # TTS Configuration - Support both ElevenLabs and Chatterbox TTS
     # Load TTS provider from config.json if available, otherwise use env vars
@@ -2193,7 +2212,12 @@ Trigger endCall."""
                     content = item.get('content')
                 
                 if not role or not content:
-                    return
+                    # For OpenAI Realtime, user content might be empty initially (audio)
+                    # We should check if it's a message with audio content that resolves later
+                    if role == "user" and not content:
+                         logger.debug(f"Received empty user message item: {item}")
+                    else:
+                        return
                 
                 # Convert content to string if needed
                 if isinstance(content, str):
@@ -2212,7 +2236,7 @@ Trigger endCall."""
                             text_parts.append(part.text)
                     text = ' '.join(text_parts)
                 else:
-                    text = str(content)
+                    text = str(content) if content is not None else ""
                 
                 if not text or not text.strip():
                     return
@@ -2527,7 +2551,6 @@ Trigger endCall."""
     session_started = asyncio.create_task(
         session.start(
             agent=agent,
-            record=True,
             room=ctx.room,
             room_input_options=RoomInputOptions(
                 # Configure noise cancellation based on settings
@@ -2660,6 +2683,48 @@ Trigger endCall."""
         # Store session reference for transcript extraction
         agent._agent_session = session
         
+        # Initialize and start background audio if configured
+        # Priority: 1. specific URL/path 2. preset name (mapped to local file)
+
+        # Initialize and start background audio if configured
+        # Priority: 1. specific URL/path 2. preset name (mapped to local file)
+        bg_file_path = None
+        
+        # Load from config or env
+        if CONFIG_MANAGER_AVAILABLE:
+            bg_sound_url = get_config_value("voice_settings.background_sound_url", "")
+            bg_sound_preset = get_config_value("agent.background_sound", "")
+            bg_volume = float(get_config_value("voice_settings.background_sound_volume", "0.1"))
+        else:
+            bg_sound_url = os.getenv("BACKGROUND_SOUND_URL", "")
+            bg_sound_preset = os.getenv("BACKGROUND_SOUND", "")
+            bg_volume = float(os.getenv("BACKGROUND_SOUND_VOLUME", "0.1"))
+
+        if bg_sound_url:
+            bg_file_path = bg_sound_url
+        elif bg_sound_preset and bg_sound_preset.lower() != "none" and bg_sound_preset.lower() != "":
+            # Map preset names to expected files in static/sounds/
+            sound_map = {
+                "office": "static/sounds/office.mp3",
+                "cafe": "static/sounds/cafe.mp3",
+                "street": "static/sounds/street.mp3",
+                "indoor": "static/sounds/indoor.mp3",
+                "outdoor": "static/sounds/outdoor.mp3"
+            }
+            # Use mapped path or assume it's a filename
+            bg_file_path = sound_map.get(bg_sound_preset.lower(), f"static/sounds/{bg_sound_preset}.mp3")
+            
+            # If preset name but file doesn't exist at default location, check if it's a raw filename
+            if not os.path.exists(bg_file_path) and not bg_file_path.startswith("http"):
+                 alt_path = f"static/sounds/{bg_sound_preset}"
+                 if os.path.exists(alt_path):
+                     bg_file_path = alt_path
+        
+        if bg_file_path:
+            logger.info(f"[AUDIO] Configuring background audio: {bg_file_path} (vol={bg_volume})")
+            agent.background_audio = BackgroundAudioPlayer(ctx.room, bg_file_path, bg_volume)
+            asyncio.create_task(agent.background_audio.start())
+
         # Store room info
         agent.room_name = ctx.room.name
         agent.session_id = ctx.job.id if ctx.job else ""
@@ -2852,6 +2917,14 @@ Trigger endCall."""
             except Exception as e:
                 logger.error(f"Error sending transcript during shutdown: {e}")
             
+            # Stop background audio
+            if agent.background_audio:
+                await agent.background_audio.stop()
+
+            # Stop background audio
+            if agent.background_audio:
+                await agent.background_audio.stop()
+
             # Cancel monitoring tasks
             if monitor_task and not monitor_task.done():
                 monitor_task.cancel()
