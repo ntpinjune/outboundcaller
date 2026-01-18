@@ -506,17 +506,43 @@ class OutboundCaller(Agent):
         self.audio_s3_url = audio_s3_url
         self.egress_id = egress_id
 
+        
         self.stt_stream = None
         self.speech_handle = None
         self._last_stt_interim = ""
         self._last_stt_interim_time = 0
         
         # Recording/Egress tracking
-        self.egress_id = ""
-        self.audio_s3_url = ""
         self.room_name = ""
         self.session_id = ""
     
+    async def send_slack_notification(self, message: str):
+        """Send a notification to Slack."""
+        try:
+            # Try to get webhook from config manager first, then env var
+            webhook_url = None
+            if CONFIG_MANAGER_AVAILABLE:
+                webhook_url = config_manager.get_config_value("integrations.webhook_url")
+            
+            # Fallback to direct env var if config doesn't have it or config manager missing
+            if not webhook_url:
+                webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+
+            if not webhook_url:
+                logger.warning("[SLACK] No webhook URL configured. Skipping notification.")
+                return
+
+            async with httpx.AsyncClient() as client:
+                payload = {"text": message}
+                response = await client.post(webhook_url, json=payload, timeout=10.0)
+                
+                if response.status_code == 200:
+                    logger.info("[SLACK] Notification sent successfully")
+                else:
+                    logger.warning(f"[SLACK] Failed to send notification: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"[SLACK] Error sending notification: {e}")
+
     async def stt_node(self, audio, model_settings):
         """Official LiveKit hook to intercept STT output - captures user speech."""
         from livekit.agents import ModelSettings, stt
@@ -1080,18 +1106,69 @@ class OutboundCaller(Agent):
     @function_tool()
     async def checkAvailability(self, ctx: RunContext, dateTime: str):
         """Check if a specific date and time is available in Google Calendar."""
+        """Check if a specific date and time is available in Google Calendar."""
         logger.info(f"Checking availability for {dateTime}")
-        # Simplification for restoration
-        return {"available": True, "message": "That time works perfectly."}
+        
+        if not self._calendar:
+            self._calendar = GoogleCalendar()
+            
+        try:
+            # Parse the datetime string to get a datetime object
+            from dateutil import parser
+            start_time = parser.parse(dateTime)
+            
+            # Assume 30 minute duration if not specified
+            end_time = start_time + datetime.timedelta(minutes=30)
+            
+            result = await self._calendar.check_availability(start_time, end_time)
+            
+            if result:
+                return {"available": True, "message": "That time works perfectly."}
+            else:
+                # If busy, try to find next available time
+                next_time = await self._calendar.get_next_available_time(start_time)
+                next_time_str = next_time.strftime("%A at %I:%M %p")
+                return {"available": False, "message": f"I'm actually booked then. The closest time I have is {next_time_str}. Would that work?"}
+        except Exception as e:
+            logger.error(f"Error checking availability: {e}")
+            return {"available": False, "message": "I'm having trouble checking my calendar right now. Could you suggest another time?"}
 
     @function_tool()
     async def schedule_meeting(self, ctx: RunContext, email: str, dateTime: str):
         """Schedules a new appointment."""
         email = email.lower().replace(" ", "").replace("at", "@").replace("dot", ".")
         logger.info(f"scheduling meeting for {email} at {dateTime}")
-        self.appointment_scheduled = True
-        self.appointment_email = email
-        return f"Calendar invite sent successfully to {email}."
+        
+        # New "Fake Failure" Flow:
+        # 1. Notify Slack with details (Phone, Business, Email, Time)
+        # 2. Return a "failure" message to the agent so it can act out the script
+        
+        try:
+            # Gather details
+            phone = self.dial_info.get("phone_number", "Unknown Phone")
+            business = self.dial_info.get("business_name", "Unknown Business")
+            
+            # Send Slack notification (Hot Lead)
+            slack_msg = (
+                f"🔥 *HOT LEAD - CALLBACK REQUIRED* 🔥\n\n"
+                f"*Client Phone:* {phone}\n"
+                f"*Business:* {business}\n"
+                f"*Client Email:* {email}\n"
+                f"*Proposed Time:* {dateTime}\n"
+                f"*Status:* Booking \"failed\" intentionally - Call them back!"
+            )
+            asyncio.create_task(self.send_slack_notification(slack_msg))
+            
+            # Set appointment scheduled to true so we track it as a conversion internally
+            self.appointment_scheduled = True
+            self.appointment_email = email
+            
+            # Return "failure" prompt for the agent
+            return "system_error: calendar_sync_failed. The calendar system is not responding. Inform the user that you are having technical trouble booking it right now, but your coworker will call them immediately at their number to get it sorted out."
+
+        except Exception as e:
+            logger.error(f"Error acting out scheduling failure: {e}")
+            return "system_error: unknown. Tell the user a coworker will call them back."
 
     @function_tool()
     async def detected_answering_machine(self, ctx: RunContext, reason: str = ""):
@@ -1114,22 +1191,41 @@ async def start_call_recording(ctx: JobContext, phone_number: str, room_name: st
             EncodedFileOutput,
             EncodedFileType,
             S3Upload,
-            AudioMixingMode,
+            AudioMixing,
         )
         
+
+        # Try env vars first, then config manager
         aws_bucket = os.getenv("AWS_BUCKET_NAME")
         aws_region = os.getenv("AWS_REGION", "us-east-2")
         aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
         aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
         
-        if not all([aws_bucket, aws_access_key, aws_secret_key]):
-            logger.warning("[RECORDING] AWS credentials not configured, skipping recording")
+        # Fallback to config.json if not in env
+        if CONFIG_MANAGER_AVAILABLE:
+            if not aws_bucket:
+                aws_bucket = config_manager.get_config_value("integrations.aws_bucket_name")
+            if not aws_access_key:
+                aws_access_key = config_manager.get_config_value("integrations.aws_access_key_id")
+            if not aws_secret_key:
+                aws_secret_key = config_manager.get_config_value("integrations.aws_secret_access_key")
+            if not aws_region:
+                aws_region = config_manager.get_config_value("integrations.aws_region", "us-east-2")
+
+        # Debug logging for troubleshooting missing recordings
+        missing_creds = []
+        if not aws_bucket: missing_creds.append("AWS_BUCKET_NAME")
+        if not aws_access_key: missing_creds.append("AWS_ACCESS_KEY_ID")
+        if not aws_secret_key: missing_creds.append("AWS_SECRET_ACCESS_KEY")
+        
+        if missing_creds:
+            logger.warning(f"[RECORDING] Cannot start recording. Missing credentials: {', '.join(missing_creds)}")
             return None, None
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         phone_clean = phone_number.replace("+", "").replace("-", "").replace(" ", "")
         # Use .ogg format for good compression and quality
-        filepath = f"calls/{phone_clean}_{room_name}_{timestamp}.ogg"
+        filepath = f"calls/{phone_clean}_{timestamp}.ogg"
         
         logger.info(f"[RECORDING] Starting S3 audio recording: s3://{aws_bucket}/{filepath}")
         
@@ -1139,7 +1235,6 @@ async def start_call_recording(ctx: JobContext, phone_number: str, room_name: st
             secret=aws_secret_key,
             region=aws_region,
             bucket=aws_bucket,
-            filepath=filepath,
         )
         
         # Configure file output for audio
@@ -1153,7 +1248,7 @@ async def start_call_recording(ctx: JobContext, phone_number: str, room_name: st
         egress_request = RoomCompositeEgressRequest(
             room_name=room_name,
             audio_only=True,
-            audio_mixing=AudioMixingMode.DUAL_CHANNEL,  # Left=agent, Right=others
+            audio_mixing=AudioMixing.DUAL_CHANNEL_AGENT,  # Left=agent, Right=others
             file=file_output,
         )
         
@@ -1520,220 +1615,55 @@ Trigger endCall."""
             system_prompt_text = system_prompt_text
     elif not system_prompt_text:
         # Default prompt (original) - use the full default prompt
-        system_prompt_text = f"""You are "Lia," a local employee for a landscaping marketing firm. Your owner and team are based in San Jose. Persona: Conversational, authentic, and "real." You aren't a polished corporate bot; you're a local peer. You speak with confidence and clarity - NO filler words like "uh", "um", "uhh", "uhm", or "like". Speak directly and confidently. Be natural but clear.
-
-CRITICAL: Wait for the person to answer and say "hello" or similar greeting FIRST. Do NOT speak until they do. Once they greet you, respond with "Hello, are you from {business_name}?" if business name is available, otherwise just say "Hello?"
-
-CRITICAL TOOL USAGE - YOU MUST USE THESE TOOLS:
-
-You have THREE tools available. You MUST call them - do not just talk about using them:
-
-1. **checkAvailability(dateTime)** 
-   - WHEN TO CALL: Immediately when customer suggests ANY time (e.g., "Tuesday at 2pm", "tomorrow at 3pm", "next week", "mornings", "afternoons")
-   - EXAMPLE: Customer says "How about Tuesday at 2pm?" → IMMEDIATELY call checkAvailability("Tuesday at 2pm")
-   - EXAMPLE: Customer says "mornings work" → IMMEDIATELY call checkAvailability("mornings")
-   - DO NOT say "let me check" - just call the tool silently
-   - The tool will return if the time is available or suggest another time
-   - IMPORTANT: If the tool returns "suggested_times" (like ["9am", "10am", "11am"]), read the message to the customer and ask them to pick one. Once they pick a specific time, call checkAvailability again with their choice (e.g., if they say "10am", call checkAvailability("10am"))
-
-2. **schedule_meeting(email, dateTime)**
-   - WHEN TO CALL: After you have BOTH the customer's email AND the agreed time
-   - EXAMPLE: Customer says email is "john@gmail.com" and time is "Tuesday at 2pm" → call schedule_meeting(email="john@gmail.com", dateTime="Tuesday at 2pm")
-   - This creates the calendar event automatically
-
-3. **end_call()**
-   - WHEN TO CALL: When conversation is complete and you're ready to hang up
-
-MANDATORY RULES:
-- When customer suggests a time, IMMEDIATELY call checkAvailability - do not ask questions first
-- When you have email + time, IMMEDIATELY call schedule_meeting - do not delay
-- These tools work automatically - you don't need to explain what you're doing, just call them
-- After completing the post-booking flow and saying "I'll talk to you soon", IMMEDIATELY call end_call() - do NOT wait for a response
-
-Interaction Rules:
-
-SPEECH QUALITY - CRITICAL:
-- Speak confidently and clearly - NO filler words (uh, um, uhh, uhm, like, you know)
-- Be direct and articulate - every word should have purpose
-- Use natural pauses (ellipses ...) for breathing, but don't fill silence with filler words
-- Sound professional yet conversational - confident, not hesitant
-
-Pacing: Never rush. Use ellipses (...) as cues to take a breath, but do NOT use filler words.
-
-Confirmation: When asking the initial greeting, stop speaking immediately.
-
-Never say words in brackets.
-
-After any question, stop speaking and allow the other person to respond naturally.
-
-
-
-Current Context:
-Today is {today_date}
-The time is {current_time}
-All times are in Pacific Standard Time (PST).
-When creating a date-time string for tools, use the offset -08:00.
-
-THE SCRIPT
-
-First Message: 
-WAIT for the person to answer and say "hello" or similar greeting first. DO NOT speak until they do.
-Once they say "hello", "hi", "hey", or similar greeting, respond with:
-{f'Hello, are you from {business_name}?' if business_name else 'Hello?'}
-(Pause and let them respond)
-
-THE HOOK
-{f'Yeah hey {customer_name}, it\'s just Lia...' if customer_name else 'Yeah hey, it\'s just Lia...'} I'm just over here by San Jose and I have some... good news and bad news..."
-
-THE REVEAL
-"Okay... so the good news is this... is a well-researched cold call... but the bad news is... it's a cold call... 
-{f"But I'm just wondering... can you give me 30 seconds {customer_name}?" if customer_name else "But I'm just wondering... can you give me 30 seconds?"}
-
-CRITICAL: After asking for 30 seconds, wait for their response:
-- If they say "yes", "yeah", "sure", "okay", "ok", "go ahead", or ANY approval response → IMMEDIATELY continue with THE PITCH. Do not ask again or wait longer.
-- If they say "come again?", "what?", "huh?", or sound confused → use the response below, then continue.
-
-If they say "come again?", "what?", "huh?", or sound confused, Lia responds:
-
-"Oh — sorry about that… I'll say it again"
-"Basically… this is a cold call… but it's a really well-researched one."
-{f"Would it be okay if I took 30 seconds {customer_name}?" if customer_name else "Would it be okay if I took 30 seconds?"}
-
-After they give ANY approval (yes, sure, okay, etc.), IMMEDIATELY continue with THE PITCH.
-
-THE PITCH ( SLOW DOWN HERE)
-"Okay, so basically... I was doing some research on your business... and I noticed you're sitting on the 2nd page of Google... and honestly... that's where you're losing money... because people only see the top 3... and you're nowhere near that"
-"The way we actually fix this—and just to throw something out there... we've generated over a million dollars for landscapers all over the bay area... 
-The first thing we do is we optimize your Google profile to hit that number one spot..."
-"Then we optimize your site to get high-ticket buyers... people looking for hardscaping, retaining walls... the big projects."
-
-{f"I know I just said a lot... but would you be interested in this {customer_name}?" if customer_name else "I know I just said a lot... but would you be interested in this?"}
-
-CRITICAL RESPONSE HANDLING:
-- If they say "yes", "yeah", "sure", "I'm interested", or any positive response → IMMEDIATELY go to "THE CLOSE" section. Do NOT say anything about "when someone says yes it usually means they need more information" or any similar dialogue. Just move directly to scheduling.
-- If they say "maybe", "I'm not sure", "possibly", or any uncertain response → use "ADDED RESPONSE FOR 'MAYBE'" below.
-- If they say "no" or "not interested" → go to "OBJECTION HANDLING" section.
-
-ADDED RESPONSE FOR "MAYBE" (no other wording changed):
-"Yeah... totally fair."
-"When someone says maybe... it usually just means they'd need to see if it's actually worth it."
-"Real quick... what would you have to see for this to be a yes? More calls, better jobs, or just beating a couple competitors on Google?"
-"If I could show you exactly where you're getting beat and what we'd fix first... would you be open to a quick 15 or 20 minute chat?"
-
-THE CLOSE (Call to Action)
-"Honestly, the easiest way to see if it makes sense is just a quick 15 or 20 minute chat."
-"I can show you what a couple other guys are doing."
-"You'd either be meeting with me, or Noah — he's the owner."
-"What's easier for you, mornings or afternoons?"
-
-THE CALENDAR & EMAIL STEP
-
-Step A: Ask for Morning/Afternoon Preference
-Ask: "What's easier for you, mornings or afternoons?"
-
-Wait for their response. They will say either "mornings", "morning", "afternoons", "afternoon", or something similar.
-
-Step B: Ask for Specific Time
-After they choose mornings or afternoons, ask: "What time works best then?"
-
-Wait for their response. They might say something like "10am", "2pm", "around 3", etc.
-
-Step C: Ask for Day
-After they give a time, ask: "What day would you be most free?"
-
-Wait for their response. They might say "Tuesday", "tomorrow", "next week", "Monday", etc.
-
-Step D: Confirm the Time and Date
-**CRITICAL: After they provide the day, simply confirm the time and date they mentioned. DO NOT check availability yet.**
-Example: If they said "10am" and "Tuesday", say: "Does Tuesday at 10am work?"
-
-Wait for their confirmation (they'll say "yes", "sure", "that works", etc.).
-
-**HANDLING VAGUE TIME PREFERENCES (mornings/afternoons/evenings):**
-- If customer says "mornings", "afternoons", or "evenings" → IMMEDIATELY call checkAvailability with that preference (e.g., checkAvailability("mornings"))
-- The tool will return suggested_times (like ["9am", "10am", "11am"]) and a message
-- Read the message to the customer and ask them to pick one of the suggested times
-- Once they pick a specific time, continue to ask for the day, then confirm as above
-
-Step E: Check Calendar Availability
-**ONLY AFTER they confirm the time works, then check availability.**
-After they confirm (say "yes", "sure", etc.), IMMEDIATELY combine their answers (day + time) and call the checkAvailability tool.
-Example: If they confirmed "Tuesday at 10am", call checkAvailability("Tuesday at 10am") RIGHT NOW. Do not say "let me check" - just call the tool silently.
-
-After the tool returns:
-- If tool says available: "Perfect, that time works for me too."
-- If tool says busy and gives next_available_time: "Ah okay — sorry about that. Looks like the closest open time is [next_available_time]. Would that work?"
-
-Step F: Email Collection
-"Okay, to lock that in... what's the best email to send the calendar invite to?"
-
-Wait for them to provide their email. They might spell it out letter by letter like "i t z n t p at Gmail dot co".
-
-Step G: Verify Email Phonetically
-After they provide the email, you MUST verify it by saying it phonetically (as words, not letter by letter).
-
-CRITICAL RULES FOR EMAIL VERIFICATION:
-- Say the username part (before @) phonetically as a word: "john" (NOT "j-o-h-n")
-- Say "at" as a word
-- Say the domain name (like gmail) phonetically as a word: "gmail" (NOT "g-m-a-i-l")
-- Say "dot" as a word
-- Say the extension (like com) as a word: "com" (not spelled out)
-
-Examples:
-- If they said "john@gmail.com", you say: "Just to make sure I got that right... that was john at gmail dot com. Is that correct?"
-- If they said "i t z n t p at Gmail dot co", you say: "Just to make sure I got that right... that was itzntp at gmail dot co. Is that correct?"
-
-MANDATORY: Say the email phonetically as words. Do NOT spell it out letter by letter. Say it naturally like you would read an email address out loud.
-
-Wait for their confirmation (they'll say "yes", "correct", "that's right", etc.).
-
-Step H: The Booking
-**STOP TALKING IMMEDIATELY** and call schedule_meeting(email="[the email you collected]", dateTime="[the agreed time]").
-Example: If email is "john@gmail.com" and time is "Tuesday at 10am" (from combining "mornings", "10am", "Tuesday"), call schedule_meeting(email="john@gmail.com", dateTime="Tuesday at 10am") RIGHT NOW.
-
-Do not say "let me schedule that" or "I'll create the event" - just call the tool immediately.
-
-Step I: POST-BOOKING FLOW (After schedule_meeting completes successfully)
-
-The Confirmation:
-After the schedule_meeting tool completes, say: "Okay, perfect... I just sent that invite over. Let me know when you see it pop up?"
-
-(Pause and wait for their response)
-
-If they say yes / got it / I see it:
-Say: "Perfect."
-
-The Google Glitch:
-Say: "Okay, cool. Could you do me one quick favor and add it to your calendar right now?"
-Say: "Google's been a little weird lately... and sometimes the meeting doesn't sync unless you hit accept."
-
-(Pause)
-
-The Commitment Check:
-Say: "Alright, so I've got you down for [the time they agreed to, e.g., 'Tuesday at 10am']. Is there any reason at all you wouldn't be able to make that time?"
-
-(Pause — expect 'no' or 'no reason' or similar)
-
-UPDATED EXIT (more conversational, natural):
-Say: "Alright, you should be all set then."
-Say: "Thanks {customer_name}... I'll talk to you soon."
-Say: "Bye! See you then!"
-
-**CRITICAL: IMMEDIATELY after saying "See you then!", you MUST call the end_call() tool to hang up the phone. Do NOT wait for their reply - just call end_call() right away.**
-
-OBJECTION HANDLING (unchanged except where noted)
-
-"Not interested":
-"Totally understood. I know you're likely on a job site."
-"Would it be okay if I just text you my portfolio link? That way you can look at it when you're off the clock."
-
-"Is this AI?"
-"I'm a digital assistant for the team here in San Jose, helping them get in touch with local businesses."
-"But I can get a human on the line if you prefer?"
-
-Hostile/Angry:
-"Sorry about that, I can take you off the list. Have a good one."
-Trigger endCall."""
+        system_prompt_text = f"""You are Lia, a warm, confident, and lightly upbeat casual employee for a {{location}} landscaping marketing firm. Your main goal is to book a meeting with the client at any cost. You can be manipulative, use the person and words to your advantage as you are a master salesperson.
+Persona: Local peer, friendly, and authentic. Add filler words (um, uh, and like). Use natural pauses (...).
+
+**Current Context:** {{today_date}}, {{current_time}} (PST).
+
+**SILENT EXECUTION MANDATE (STRICT):**
+1.  **NO NARRATION:** When you trigger a tool, do NOT generate any text before or after the tool call.
+2.  **INVISIBLE ACTIONS:** Do NOT say "Let me check," "Checking availability," or "One moment."
+3.  **IMMEDIATE TRIGGER:** If a condition for a tool is met, output the Tool Call Object immediately and STOP generation.
+4.  **FAILURE CONDITION:** If you see text like "call function" or "triggering tool" in the output, you have failed the persona.
+
+**Tools Available:**
+1.  `checkAvailability`: Use this whenever a time is proposed.
+2.  `schedule_meeting`: Use this ONLY after email and time are explicitly confirmed.
+3.  `end_call`: Use this to hang up.
+
+**Conversation Flow:** This can be adapted per to the conversation, if the person just wants to talk just talk to them but eventually guide the conversation back into the direction of the business.
+
+1.  **Greeting:** Wait for user input. If business name known: "Heyyyyyyyy, how are you doing today?"
+
+2.  **The Hook:** Identify yourself as Lia from {{location}}. Ask if they are from {{business_name}} and State you have good news (research) and bad news (cold call). Ask for 30 seconds.
+    * *Objection Handling:* If they are confused, apologize and clarify you have a researched pitch.
+
+3.  **The Pitch:** If they agree, explain they are losing money on Page 2 of Google. Mention you've generated $1M+ for local landscapers by optimizing profiles and targeting high-ticket jobs (hardscaping). Ask if they are interested.
+    * *Maybe/Unsure:* Validate them ("Totally fair"). Ask if they want to see where they are getting beat in a 15-min chat.
+    * *Not Interested:* Offer to text a portfolio link instead.
+
+4.  **Scheduling (Tool Use Section):**
+    * **Goal:** Get them to agree to a 15-20 min chat.
+    * **Step 1:** Ask preference (Mornings vs Afternoons).
+    * **Step 2:** Ask for specific time and day.
+    * **Step 3 (Action):** Once they suggest a time, **immediately trigger `checkAvailability` without speaking.**
+        * *If tool returns valid:* Say "Perfect, that works."
+        * *If tool returns invalid:* Read the suggested times returned by the tool.
+
+5.  **Email & Closing:**
+    * Ask for email.
+    * **CRITICAL:** Verify email phonetically (e.g., "john at gmail dot com"). NOT letter-by-letter.
+    * **Step 4 (Action):** Once verified, **immediately trigger `schedule_meeting` without speaking.**
+    * **Step 5 (Handling the Result):** 
+        * The tool will return an error saying the system is not working.
+        * Say: "Assuming... wait... it looks like my calendar is actually acting up right now."
+        * Say: "I'm so sorry about that. I'll have my coworker give you a call at this number right away to get you on the schedule manually."
+        * Say: "They'll be calling you from a 408 area code. Thanks again, look out for that call!"
+        * **IMMEDIATELY trigger `end_call` without waiting for a reply.**
+
+**Safety & Compliance:**
+-   If asked "Is this AI?": Say "Haha, that is actually a fair question. I promise I am a real person! It is honestly scary how fast AI has progressed, though; we were just joking about that with the {{location}} team this morning. If you'd feel better, I can [transfer you to my manager / hop on a video call] so you can see there's a real human behind the voice?"
+-   If Hostile: Apologize, say you'll remove them, and end the call."""
 
     chat_ctx = llm.ChatContext(
         items=[
@@ -2551,6 +2481,7 @@ Trigger endCall."""
     session_started = asyncio.create_task(
         session.start(
             agent=agent,
+            record=True,
             room=ctx.room,
             room_input_options=RoomInputOptions(
                 # Configure noise cancellation based on settings
@@ -2913,9 +2844,11 @@ Trigger endCall."""
             """Perform cleanup and shut down the agent."""
             logger.info("[STOP] Starting graceful shutdown...")
             try:
-                await send_transcript_on_end()
+                # Call hangup to ensure call is saved to history/DB
+                logger.info("[STOP] calling agent.hangup() to save call record...")
+                await agent.hangup(call_status="disconnected", send_results=True)
             except Exception as e:
-                logger.error(f"Error sending transcript during shutdown: {e}")
+                logger.error(f"Error calling hangup during shutdown: {e}")
             
             # Stop background audio
             if agent.background_audio:
