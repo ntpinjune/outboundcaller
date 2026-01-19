@@ -7,6 +7,13 @@ Provides a REST API and web interface for configuring the agent without code cha
 import os
 import json
 import logging
+import signal
+import psutil
+import database  # Local DB for leads
+
+# Initialize DB on startup
+database.init_db()
+
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 from typing import Dict, Any, Optional
@@ -75,16 +82,44 @@ _event_monitor_thread = None
 
 
 def kill_process_tree(pid):
-    """Kill a process tree (including children) on Windows."""
+    """Kill a process tree (including children) on Windows, macOS, and Linux."""
     try:
+        import signal
         import subprocess
-        # Suppress output, check=True will raise CalledProcessError on failure
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)], 
-            check=True, 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL
-        )
+        
+        if os.name == 'nt':
+            # Windows: use taskkill
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)], 
+                check=True, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+        else:
+            # macOS/Linux: kill process group
+            try:
+                # Try to kill the entire process group
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+                import time
+                time.sleep(0.5)  # Give it a moment
+                # Force kill if still alive
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already dead
+            except ProcessLookupError:
+                pass  # Process already dead
+            except PermissionError:
+                # Fall back to just killing the main process
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    import time
+                    time.sleep(0.3)
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        
+        logger.info(f"[OK] Killed process tree for PID {pid}")
         return True
     except subprocess.CalledProcessError:
         # Process likely already dead or not found, which is what we wanted
@@ -383,7 +418,7 @@ def generate_livekit_jwt() -> str:
     return f"{encoded_header}.{encoded_payload}.{encoded_signature}"
 
 
-def dispatch_to_livekit_http(phone_number: str, name: str = "Test Customer", appointment_time: str = "", business_name: str = "") -> Optional[str]:
+def dispatch_to_livekit_http(phone_number: str, name: str = "Test Customer", appointment_time: str = "", business_name: str = "", timezone_offset: int = 0) -> Optional[str]:
     """Dispatch a call to LiveKit using HTTP API."""
     try:
         config = load_config()
@@ -403,6 +438,7 @@ def dispatch_to_livekit_http(phone_number: str, name: str = "Test Customer", app
             "name": name,
             "appointment_time": appointment_time,
             "business_name": business_name,
+            "timezone_offset": str(timezone_offset),
             "row_id": "test_call"
         }
         
@@ -443,7 +479,7 @@ def dispatch_to_livekit_http(phone_number: str, name: str = "Test Customer", app
         return None
 
 
-def dispatch_to_livekit_cli(phone_number: str, name: str = "Test Customer", appointment_time: str = "", business_name: str = "") -> Optional[str]:
+def dispatch_to_livekit_cli(phone_number: str, name: str = "Test Customer", appointment_time: str = "", business_name: str = "", timezone_offset: int = 0) -> Optional[str]:
     """Dispatch a call to LiveKit using CLI."""
     try:
         agent_name = os.getenv("AGENT_NAME", "outbound-caller-dev")
@@ -455,6 +491,7 @@ def dispatch_to_livekit_cli(phone_number: str, name: str = "Test Customer", appo
             "name": name,
             "appointment_time": appointment_time,
             "business_name": business_name,
+            "timezone_offset": str(timezone_offset),
             "row_id": "test_call"
         }
         
@@ -498,6 +535,7 @@ def dispatch_call():
         name = data.get("name", "Test Customer").strip() or "Test Customer"
         appointment_time = data.get("appointment_time", "").strip()
         business_name = data.get("business_name", "").strip()
+        timezone_offset = data.get("timezone_offset", 0)
         
         if not phone_number:
             return jsonify({
@@ -506,10 +544,10 @@ def dispatch_call():
             }), 400
         
         # Try CLI first, fallback to HTTP
-        job_id = dispatch_to_livekit_cli(phone_number, name, appointment_time, business_name)
+        job_id = dispatch_to_livekit_cli(phone_number, name, appointment_time, business_name, timezone_offset)
         if not job_id:
             logger.info("CLI dispatch failed or not available, trying HTTP API...")
-            job_id = dispatch_to_livekit_http(phone_number, name, appointment_time, business_name)
+            job_id = dispatch_to_livekit_http(phone_number, name, appointment_time, business_name, timezone_offset)
         
         if job_id:
             return jsonify({
@@ -688,6 +726,7 @@ def dispatch_parallel_calls():
                 encoding="utf-8",
                 bufsize=1,  # Line buffered
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                start_new_session=True,  # Isolate process group so we can kill it without killing server
                 env=env
             )
             
@@ -742,9 +781,8 @@ def stop_parallel_calls():
             # Try gentle terminate first
             _dispatcher_process.terminate()
             
-            # Use taskkill for force if needed (on Windows)
-            if os.name == 'nt':
-                 kill_process_tree(pid)
+            # Force kill the process tree (works on Windows, macOS, Linux)
+            kill_process_tree(pid)
             
             _dispatcher_process = None
             
@@ -1267,5 +1305,137 @@ def run_server(host=HOST, port=PORT, debug=False):
     app.run(host=host, port=port, debug=debug)
 
 
-if __name__ == "__main__":
+
+# --- Local CSV Dispatcher Routes ---
+
+@app.route('/api/upload-csv', methods=['POST'])
+def upload_csv():
+    """Upload a CSV file of leads."""
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "No file part"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "No selected file"}), 400
+        
+    if file and file.filename.endswith('.csv'):
+        try:
+            # Clear existing leads before importing new ones for a fresh start
+            database.clear_leads()
+            
+            # Read and decode with BOM handling
+            raw_content = file.read()
+            content = raw_content.decode('utf-8-sig')
+            
+            logger.info(f"Uploading CSV: {file.filename} (Size: {len(raw_content)} bytes)")
+            
+            count = database.import_csv_content(content)
+            logger.info(f"Successfully imported {count} leads from {file.filename}")
+            
+            return jsonify({
+                "success": True, 
+                "message": f"Successfully imported {count} leads",
+                "count": count
+            })
+        except Exception as e:
+            logger.error(f"Error importing CSV: {e}")
+            return jsonify({"success": False, "error": f"Import failed: {str(e)}"}), 500
+            
+    return jsonify({"success": False, "error": "Invalid file type. Please upload a CSV file."}), 400
+
+@app.route('/api/leads/stats', methods=['GET'])
+def get_leads_stats():
+    """Get statistics for local leads."""
+    try:
+        stats = database.get_stats()
+        return jsonify({"success": True, "stats": stats})
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/leads', methods=['GET'])
+def get_leads():
+    try:
+        leads = database.get_all_leads()
+        return jsonify({"success": True, "leads": leads})
+    except Exception as e:
+        logger.error(f"Error getting leads: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/leads/clear', methods=['POST'])
+def clear_leads_endpoint():
+    """Clear all local leads."""
+    try:
+        database.clear_leads()
+        return jsonify({"success": True, "message": "All leads cleared"})
+    except Exception as e:
+        logger.error(f"Error clearing leads: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/calls/dispatch-local', methods=['POST'])
+def start_local_dispatch():
+    """Start the local dispatcher process."""
+    global _dispatcher_process
+    
+    try:
+        with _dispatcher_lock:
+            if _dispatcher_process and _dispatcher_process.poll() is None:
+                return jsonify({
+                    "success": False,
+                    "error": "Dispatcher is already running"
+                }), 409
+            
+            # Path to local dispatcher script
+            script_path = os.path.join(os.path.dirname(__file__), "dispatch_calls_local.py")
+            if not os.path.exists(script_path):
+                return jsonify({
+                    "success": False,
+                    "error": "dispatch_calls_local.py not found"
+                }), 404
+            
+            # Verify DB has leads
+            stats = database.get_stats()
+            if not stats.get("Pending", 0) and not stats.get("Pending ", 0): # Handle trailing space just in case
+                 pass # Warning but let it run? Or block? Let it run, it handles it.
+            
+            import sys
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
+            
+            # Start process
+            process = subprocess.Popen(
+                [sys.executable, script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                start_new_session=True, # Critical for clean kill
+                env=env
+            )
+            
+            _dispatcher_process = process
+            
+            # Start monitoring thread (reuse same monitor)
+            global _event_monitor_thread
+            _event_monitor_thread = threading.Thread(
+                target=_monitor_dispatcher_output,
+                args=(process,),
+                daemon=True
+            )
+            _event_monitor_thread.start()
+            
+            return jsonify({
+                "success": True,
+                "message": "Local dispatch started",
+                "pid": process.pid
+            })
+            
+    except Exception as e:
+        logger.error(f"Error starting local dispatch: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+if __name__ == '__main__':
     run_server(debug=True)

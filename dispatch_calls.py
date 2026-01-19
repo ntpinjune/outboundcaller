@@ -153,6 +153,23 @@ def get_column_index(headers: List[str], column_name: str) -> Optional[int]:
         return None
 
 
+
+def execute_with_retry(request, max_retries=5):
+    """Execute a Google API request with exponential backoff for rate limits."""
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except Exception as e:
+            error_str = str(e)
+            # Check for rate limit error (429) or other transient errors
+            if "429" in error_str or "quota" in error_str.lower() or "rate limit" in error_str.lower():
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + (attempt * 0.5)  # Exponential backoff
+                    logger.warning(f"⚠️ Rate limit hit (attempt {attempt+1}/{max_retries}). Retrying in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    continue
+            raise e
+
 def read_pending_rows(service) -> List[Dict[str, Any]]:
     """Read rows from Google Sheets with Status = 'Pending' or 'No Answer' (for retries).
     
@@ -161,11 +178,13 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
     """
     try:
         # Read all rows
-        range_name = f"{SHEET_NAME}!A1:Z1000"
-        result = service.spreadsheets().values().get(
+        # Quote sheet name if it contains spaces or special chars
+        range_name = f"'{SHEET_NAME}'!A1:Z1000"
+        request = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=range_name
-        ).execute()
+        )
+        result = execute_with_retry(request)
         
         values = result.get("values", [])
         
@@ -195,7 +214,9 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
             appointment_idx = get_column_index(headers, "AppointmentTime")
         
         # Find Business Name column (optional)
-        business_name_idx = get_column_index(headers, "Business Name")
+        business_name_idx = get_column_index(headers, "business_name")
+        if business_name_idx is None:
+            business_name_idx = get_column_index(headers, "Business Name")
         if business_name_idx is None:
             business_name_idx = get_column_index(headers, "BusinessName")
         if business_name_idx is None:
@@ -297,6 +318,20 @@ def read_pending_rows(service) -> List[Dict[str, Any]]:
     
     except Exception as error:
         logger.error(f"Error reading Google Sheets (ID: {SPREADSHEET_ID}, Sheet: {SHEET_NAME}): {error}")
+        if hasattr(error, 'content'):
+            logger.error(f"Error content: {error.content}")
+        
+        # Try to list available sheets to help debug
+        try:
+            sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+            sheets = sheet_metadata.get('sheets', [])
+            sheet_names = [s.get("properties", {}).get("title", "Unknown") for s in sheets]
+            logger.info(f"Available sheets in this spreadsheet: {json.dumps(sheet_names)}")
+            if SHEET_NAME not in sheet_names:
+                logger.error(f"❌ Configured sheet '{SHEET_NAME}' NOT found in validation list!")
+        except Exception as e:
+            logger.warning(f"Could not list sheets: {e}")
+
         import traceback
         logger.error(traceback.format_exc())
         return []
@@ -524,7 +559,7 @@ def update_sheet_cell(service, row_number: int, column_name: str, value: str):
     """Update a specific cell in Google Sheets."""
     try:
         # Get headers to find column index
-        range_name = f"{SHEET_NAME}!A1:Z1"
+        range_name = f"'{SHEET_NAME}'!A1:Z1"
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=range_name
@@ -541,7 +576,7 @@ def update_sheet_cell(service, row_number: int, column_name: str, value: str):
         status_col = chr(65 + col_idx) if col_idx < 26 else chr(64 + (col_idx // 26)) + chr(65 + (col_idx % 26))
         
         # Update the cell
-        range_to_update = f"{SHEET_NAME}!{status_col}{row_number}"
+        range_to_update = f"'{SHEET_NAME}'!{status_col}{row_number}"
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=range_to_update,
@@ -559,7 +594,7 @@ def update_sheet_multiple_cells(service, row_number: int, updates: Dict[str, str
     """Update multiple cells in a row at once."""
     try:
         # Get headers to find column indices
-        range_name = f"{SHEET_NAME}!A1:Z1"
+        range_name = f"'{SHEET_NAME}'!A1:Z1"
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=range_name
@@ -578,7 +613,7 @@ def update_sheet_multiple_cells(service, row_number: int, updates: Dict[str, str
                 else:
                     col_letter = chr(64 + (col_idx // 26)) + chr(65 + (col_idx % 26))
                 
-                range_to_update = f"{SHEET_NAME}!{col_letter}{row_number}"
+                range_to_update = f"'{SHEET_NAME}'!{col_letter}{row_number}"
                 update_data.append({
                     "range": range_to_update,
                     "values": [[value]]
@@ -609,7 +644,7 @@ def check_call_status(service, row_number: int) -> Optional[str]:
     """Check the current status of a call in Google Sheets."""
     try:
         # Get headers to find Status column
-        range_name = f"{SHEET_NAME}!A1:Z1"
+        range_name = f"'{SHEET_NAME}'!A1:Z1"
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=range_name
@@ -626,7 +661,7 @@ def check_call_status(service, row_number: int) -> Optional[str]:
             status_col = chr(65 + status_idx)
         else:
             status_col = chr(64 + (status_idx // 26)) + chr(65 + (status_idx % 26))
-        range_to_read = f"{SHEET_NAME}!{status_col}{row_number}"
+        range_to_read = f"'{SHEET_NAME}'!{status_col}{row_number}"
         
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -670,7 +705,7 @@ def wait_for_call_completion(service, row_number: int, phone_number: str) -> boo
         if status:
             status_lower = status.lower()
             # Call is complete if status changed from "Dispatched"
-            if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up"]:
+            if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up", "disconnected", "declined", "busy", "canceled"]:
                 logger.info(f"Call to {phone_number} completed with status: {status} (waited {int(elapsed)}s)")
                 if status_lower == "voicemail":
                     logger.info(f"Voicemail detected - moving to next call in list")

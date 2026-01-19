@@ -625,58 +625,158 @@
                     <label for="test-business-name">Business Name (optional)</label>
                     <input type="text" id="test-business-name" placeholder="Your Business">
                 </div>
+                <div class="form-group">
+                    <label for="timezone-offset">Timezone Offset (Hours)</label>
+                    <input type="range" id="timezone-offset" min="-12" max="14" step="1" value="0"
+                        oninput="document.getElementById('timezone-offset-value').textContent = (this.value > 0 ? '+' : '') + this.value + ' hours'">
+                    <div
+                        style="display: flex; justify-content: space-between; font-size: 0.8em; color: #666; margin-top: 5px;">
+                        <span>Current Setting: <span id="timezone-offset-value">0 hours</span></span>
+                        <span>(-12 to +14)</span>
+                    </div>
+                </div>
             </div>
             <button class="btn btn-primary btn-large" onclick="dispatchTestCall()">📞 Make Test Call</button>
             <div id="test-call-status" class="test-call-status"></div>
         </div>
 
         <div class="test-call-section" style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 20px;">
-            <h3>Batch Parallel Dialing</h3>
-            <p class="help-text">Start calling all pending contacts (Status = "Pending") from the Google Sheet in
-                parallel. This runs in the background.</p>
+            <div class="test-call-section" style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 20px;">
+                <h3>Batch Dispatcher</h3>
 
-            <div class="form-group" style="margin-top: 15px; display: flex; gap: 10px;">
-                <a href="/call_history.html" target="_blank" class="btn btn-secondary"
-                    style="background-color: #17a2b8; text-decoration: none; display: flex; align-items: center; justify-content: center;">
-                    📊 View Call History
-                </a>
-                <button class="btn btn-primary" onclick="startParallelDispatch()" style="background-color: #6f42c1;">🚀
-                    Start Parallel Dispatcher</button>
-                <button class="btn btn-primary" onclick="stopParallelDispatch()" style="background-color: #dc3545;">🛑
-                    Stop Dispatcher</button>
-            </div>
-
-            <!-- Reset Voicemail Rows Section -->
-            <div
-                style="margin-top: 25px; padding: 15px; background: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6;">
-                <h4 style="margin-bottom: 12px; color: #495057;">🔄 Reset Voicemail Rows</h4>
-                <p style="font-size: 0.85em; color: #666; margin-bottom: 12px;">
-                    Find all rows with Status="voicemail", clear their data (except Phone and Business name), and reset
-                    to "Pending".
-                </p>
-                <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                    <input type="text" id="reset-sheet-id" placeholder="Google Sheet ID (leave empty for default)"
-                        style="flex: 1; min-width: 250px; padding: 8px;">
-                    <button class="btn btn-primary" onclick="resetVoicemailRows()" style="background-color: #fd7e14;">
-                        🔄 Reset Voicemail Rows
-                    </button>
+                <div class="form-group"
+                    style="background: #f8f9fa; padding: 10px; border-radius: 4px; margin-bottom: 15px;">
+                    <label>Data Source:</label>
+                    <div style="display: flex; gap: 15px; margin-top: 5px;">
+                        <label style="font-weight: normal; display: flex; align-items: center; gap: 5px;">
+                            <input type="radio" name="dispatch-source" value="sheets" checked
+                                onchange="toggleDispatchSource()">
+                            Google Sheets
+                        </label>
+                        <label style="font-weight: normal; display: flex; align-items: center; gap: 5px;">
+                            <input type="radio" name="dispatch-source" value="local" onchange="toggleDispatchSource()">
+                            Local CSV List 🚀
+                        </label>
+                    </div>
                 </div>
-                <div id="reset-voicemail-status"
-                    style="margin-top: 10px; display: none; padding: 10px; border-radius: 4px;"></div>
-            </div>
 
-
-
-            <div id="live-log-container" style="display: none; margin-top: 20px;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                    <h4>🔴 Live Activity</h4>
-                    <label
-                        style="display: flex; align-items: center; cursor: pointer; user-select: none; font-size: 0.85em;">
-                        <input type="checkbox" id="auto-scroll-log" checked style="margin-right: 5px;">
-                        Auto-scroll
-                    </label>
+                <!-- Google Sheets Config -->
+                <div id="source-config-sheets">
+                    <p class="help-text">Start calling all pending contacts (Status = "Pending") from the configured
+                        Google Sheet in parallel.</p>
                 </div>
-                <div id="live-log" style="
+
+                <!-- Local CSV Config -->
+                <div id="source-config-local" style="display: none;">
+                    <p class="help-text">Upload a CSV file with columns: <code>phone_number</code>, <code>name</code>,
+                        <code>business_name</code>.
+                    </p>
+
+                    <div
+                        style="background: white; border: 1px dashed #ccc; padding: 15px; text-align: center; border-radius: 4px;">
+                        <input type="file" id="csv-upload-input" accept=".csv" style="display: none;"
+                            onchange="if(this.files[0]) document.getElementById('csv-file-name').textContent = this.files[0].name">
+                        <button class="btn btn-secondary btn-sm"
+                            onclick="document.getElementById('csv-upload-input').click()">📂 Select CSV File</button>
+                        <button class="btn btn-primary btn-sm" onclick="uploadCsvFile()"
+                            style="margin-left: 5px; background-color: #28a745;">🚀 Submit CSV</button>
+                        <span id="csv-file-name" style="margin-left: 10px; font-size: 0.9em; color: #666;"></span>
+                        <div id="upload-status" style="margin-top: 5px; font-size: 0.9em;"></div>
+                    </div>
+
+                    <div id="local-preview-container" style="margin-top: 15px; display: none;">
+                        <h4 style="font-size: 0.9em; color: #444; margin-bottom: 8px;">📋 Leads Preview</h4>
+                        <div
+                            style="max-height: 250px; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; background: white;">
+                            <table style="width: 100%; border-collapse: collapse; font-size: 0.85em; text-align: left;">
+                                <thead style="background: #f8f9fa; position: sticky; top: 0;">
+                                    <tr>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">ID</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Phone</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Name</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Business</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Status</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Appt Date</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Appt Time</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Outcome</th>
+                                        <th style="padding: 8px; border-bottom: 1px solid #ddd;">Last Called</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="local-preview-body">
+                                    <!-- Leads will be rendered here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div id="local-stats"
+                        style="display: flex; gap: 15px; margin-top: 10px; font-size: 0.9em; color: #555;">
+                        <span>Wait for stats...</span>
+                    </div>
+
+                    <div style="margin-top: 10px;">
+                        <button class="btn btn-sm btn-danger" onclick="clearLocalLeads()"
+                            style="font-size: 0.8em; padding: 2px 8px;">🗑️ Clear List</button>
+                    </div>
+                </div>
+
+                <div class="form-group" style="margin-top: 15px;">
+                    <label for="max-concurrent-calls">Max Concurrent Calls: <span
+                            id="max-concurrent-calls-value">3</span></label>
+                    <input type="range" id="max-concurrent-calls" min="1" max="10" value="3"
+                        oninput="document.getElementById('max-concurrent-calls-value').textContent = this.value"
+                        style="width: 100%;">
+                    <small>Number of calls to run simultaneously (1-10). Higher = faster but uses more
+                        resources.</small>
+                </div>
+
+                <div class="form-group" style="margin-top: 15px; display: flex; gap: 10px;">
+                    <a href="/call_history.html" target="_blank" class="btn btn-secondary"
+                        style="background-color: #17a2b8; text-decoration: none; display: flex; align-items: center; justify-content: center;">
+                        📊 View Call History
+                    </a>
+                    <button class="btn btn-primary" onclick="startParallelDispatch()"
+                        style="background-color: #6f42c1;">🚀
+                        Start Parallel Dispatcher</button>
+                    <button class="btn btn-primary" onclick="stopParallelDispatch()"
+                        style="background-color: #dc3545;">🛑
+                        Stop Dispatcher</button>
+                </div>
+
+                <!-- Reset Voicemail Rows Section -->
+                <div
+                    style="margin-top: 25px; padding: 15px; background: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6;">
+                    <h4 style="margin-bottom: 12px; color: #495057;">🔄 Reset Voicemail Rows</h4>
+                    <p style="font-size: 0.85em; color: #666; margin-bottom: 12px;">
+                        Find all rows with Status="voicemail", clear their data (except Phone and Business name), and
+                        reset
+                        to "Pending".
+                    </p>
+                    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                        <input type="text" id="reset-sheet-id" placeholder="Google Sheet ID (leave empty for default)"
+                            style="flex: 1; min-width: 250px; padding: 8px;">
+                        <button class="btn btn-primary" onclick="resetVoicemailRows()"
+                            style="background-color: #fd7e14;">
+                            🔄 Reset Voicemail Rows
+                        </button>
+                    </div>
+                    <div id="reset-voicemail-status"
+                        style="margin-top: 10px; display: none; padding: 10px; border-radius: 4px;"></div>
+                </div>
+
+
+
+                <div id="live-log-container" style="display: none; margin-top: 20px;">
+                    <div
+                        style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4>🔴 Live Activity</h4>
+                        <label
+                            style="display: flex; align-items: center; cursor: pointer; user-select: none; font-size: 0.85em;">
+                            <input type="checkbox" id="auto-scroll-log" checked style="margin-right: 5px;">
+                            Auto-scroll
+                        </label>
+                    </div>
+                    <div id="live-log" style="
                         background: #1e1e1e; 
                         color: #00ff00; 
                         font-family: 'Courier New', monospace; 
@@ -687,46 +787,46 @@
                         font-size: 0.85em;
                         white-space: pre-wrap;
                     "></div>
+                </div>
+
+                <div id="parallel-dispatch-status" class="test-call-status"></div>
+
+
             </div>
 
-            <div id="parallel-dispatch-status" class="test-call-status"></div>
+            <hr style="margin: 30px 0; border: 1px solid #e0e0e0;">
 
-
+            <h2>Call Dispatch Settings</h2>
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="call-delay-seconds">Call Delay (seconds)</label>
+                    <input type="number" id="call-delay-seconds" min="0" value="5">
+                </div>
+                <div class="form-group">
+                    <label for="max-retries">Max Retries</label>
+                    <input type="number" id="max-retries" min="0" value="3">
+                </div>
+                <div class="form-group">
+                    <label for="wait-for-completion">
+                        <input type="checkbox" id="wait-for-completion" checked>
+                        Wait for call completion before next call
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label for="retry-no-answer">
+                        <input type="checkbox" id="retry-no-answer" checked>
+                        Retry "No Answer" calls
+                    </label>
+                </div>
+            </div>
         </div>
 
-        <hr style="margin: 30px 0; border: 1px solid #e0e0e0;">
-
-        <h2>Call Dispatch Settings</h2>
-        <div class="form-grid">
-            <div class="form-group">
-                <label for="call-delay-seconds">Call Delay (seconds)</label>
-                <input type="number" id="call-delay-seconds" min="0" value="5">
-            </div>
-            <div class="form-group">
-                <label for="max-retries">Max Retries</label>
-                <input type="number" id="max-retries" min="0" value="3">
-            </div>
-            <div class="form-group">
-                <label for="wait-for-completion">
-                    <input type="checkbox" id="wait-for-completion" checked>
-                    Wait for call completion before next call
-                </label>
-            </div>
-            <div class="form-group">
-                <label for="retry-no-answer">
-                    <input type="checkbox" id="retry-no-answer" checked>
-                    Retry "No Answer" calls
-                </label>
-            </div>
+        <!-- Action Buttons -->
+        <div class="action-bar">
+            <button class="btn btn-primary" onclick="saveConfig()">💾 Save Configuration</button>
+            <button class="btn btn-secondary" onclick="loadConfig()">🔄 Reload</button>
+            <button class="btn btn-secondary" onclick="testConnection()">🔌 Test Connection</button>
         </div>
-    </div>
-
-    <!-- Action Buttons -->
-    <div class="action-bar">
-        <button class="btn btn-primary" onclick="saveConfig()">💾 Save Configuration</button>
-        <button class="btn btn-secondary" onclick="loadConfig()">🔄 Reload</button>
-        <button class="btn btn-secondary" onclick="testConnection()">🔌 Test Connection</button>
-    </div>
     </div>
 
     <script src="app.js"></script>

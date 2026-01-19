@@ -29,6 +29,8 @@ from dispatch_calls import (
     update_sheet_cell,
     check_call_status,
     normalize_phone_number,
+    get_column_index,
+    execute_with_retry,
     SPREADSHEET_ID,
     SHEET_NAME,
     AGENT_NAME,
@@ -39,8 +41,26 @@ from dispatch_calls import (
     MAX_WAIT_TIME,
 )
 
-# Parallel dialing configuration
-MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "3"))  # Default to 3 for simplicity
+# Global status cache for batch monitoring
+status_cache = {}
+
+# Parallel dialing configuration - read from config.json first, then env var, then default
+def _get_max_concurrent_calls():
+    """Get max concurrent calls from config.json or environment."""
+    try:
+        import json
+        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                value = config.get("call_dispatch", {}).get("max_concurrent_calls")
+                if value is not None:
+                    return max(1, min(10, int(value)))
+    except Exception:
+        pass
+    return int(os.getenv("MAX_CONCURRENT_CALLS", "3"))
+
+MAX_CONCURRENT_CALLS = _get_max_concurrent_calls()
 PARALLEL_DIALING_ENABLED = os.getenv("PARALLEL_DIALING_ENABLED", "true").lower() == "true"
 CALL_START_DELAY = float(os.getenv("CALL_START_DELAY", "1.0"))  # Increased delay to avoid overwhelming
 SKIP_SHEETS_UPDATES_DURING_DISPATCH = os.getenv("SKIP_SHEETS_UPDATES_DURING_DISPATCH", "false").lower() == "true"  # Enable updates by default now that we have safe locking
@@ -92,6 +112,16 @@ except Exception as e:
     logger.warning(f"[WARNING] Could not register signal handlers: {e}")
 
 
+def _ensure_api_tools():
+    """Ensure sheets_api_lock and sheets_api_semaphore are initialized."""
+    global sheets_api_lock, sheets_api_semaphore
+    if sheets_api_lock is None:
+        sheets_api_lock = asyncio.Lock()
+    if sheets_api_semaphore is None:
+        sheets_api_semaphore = asyncio.Semaphore(1)
+    return sheets_api_lock, sheets_api_semaphore
+
+
 # Track active calls and dispatch pacing
 active_calls: Dict[int, Dict[str, Any]] = {}
 _last_dispatch_time: float = 0
@@ -99,20 +129,11 @@ _dispatch_pacing_lock = asyncio.Lock()
 
 
 async def update_sheet_cell_safe(service, row_number: int, column: str, value: str, max_retries: int = 5):
-    """Update a Google Sheets cell with retry logic and rate limiting.
+    """Update a Google Sheets cell with retry logic and rate limiting."""
+    lock, sem = _ensure_api_tools()
     
-    Uses both a lock and semaphore to ensure thread-safety and prevent segfaults.
-    """
-    global sheets_api_lock, sheets_api_semaphore
-    
-    # Lazy initialization of lock and semaphore to ensure they are bound to the current event loop
-    if sheets_api_lock is None:
-        sheets_api_lock = asyncio.Lock()
-    if sheets_api_semaphore is None:
-        sheets_api_semaphore = asyncio.Semaphore(1)
-        
-    async with sheets_api_semaphore:  # Limit concurrent API calls
-        async with sheets_api_lock:  # Serialize access to prevent segfaults
+    async with sem:  # Limit concurrent API calls
+        async with lock:  # Serialize access to prevent segfaults
             # Ensure we have a valid service object (build is NOT thread-safe for creds refresh)
             # Rebuilding it here ensures we are within the lock
             current_service = service
@@ -313,32 +334,135 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
         }
 
 
+
+async def batch_status_monitor(service):
+    """Periodically fetch statuses for ALL active calls in one batch request."""
+    logger.info("📡 Starting centralized batch status monitor")
+    
+    status_col_letter = None
+    
+    while keep_running:
+        try:
+            # Wait for next check interval
+            await asyncio.sleep(CALL_COMPLETION_CHECK_INTERVAL)
+            
+            if not active_calls:
+                continue
+                
+            # Get list of active row numbers
+            active_rows = list(active_calls.keys())
+            if not active_rows:
+                continue
+                
+            min_row = min(active_rows)
+            max_row = max(active_rows)
+            
+            # Determine Status column if not yet known
+            if not status_col_letter:
+                _, sem = _ensure_api_tools()
+                async with sem:
+                    headers_result = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            executor,
+                            lambda: execute_with_retry(service.spreadsheets().values().get(
+                                spreadsheetId=SPREADSHEET_ID,
+                                range=f"'{SHEET_NAME}'!A1:Z1"
+                            ))
+                        ),
+                        timeout=30.0
+                    )
+                headers = headers_result.get("values", [])[0] if headers_result.get("values") else []
+                status_idx = get_column_index(headers, "Status")
+                
+                if status_idx is None:
+                    logger.error("❌ Could not find 'Status' column for batch monitoring")
+                    continue
+                    
+                # Convert to letter
+                if status_idx < 26:
+                    status_col_letter = chr(65 + status_idx)
+                else:
+                    status_col_letter = chr(64 + (status_idx // 26)) + chr(65 + (status_idx % 26))
+                logger.info(f"📡 Found 'Status' column at {status_col_letter}")
+
+            # Fetch range covering all active rows
+            # e.g. 'Sheet1'!C20:C50
+            read_range = f"'{SHEET_NAME}'!{status_col_letter}{min_row}:{status_col_letter}{max_row}"
+            
+            _, sem = _ensure_api_tools()
+            async with sem:
+                # Add timeout to batch status fetch
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        lambda: execute_with_retry(service.spreadsheets().values().get(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=read_range
+                        ))
+                    ),
+                    timeout=30.0
+                )
+            
+            values = result.get("values", [])
+            if not values:
+                logger.debug(f"📡 Batch monitor: No values returned for range {read_range}")
+                continue
+                
+            # Update cache
+            for i, row_val in enumerate(values):
+                current_row = min_row + i
+                if current_row in active_calls:
+                    val = row_val[0] if row_val else ""
+                    if val:
+                        status_cache[current_row] = val.strip()
+            
+            logger.debug(f"📡 Batch updated {len(values)} statuses for rows {min_row}-{max_row}")
+            
+        except Exception as e:
+            logger.error(f"Error in batch status monitor: {e}")
+            await asyncio.sleep(5)  # Backoff on error
+
+
 async def monitor_call_status(service, row_number: int, phone_number: str):
-    """Monitor a single call's status until completion."""
-    # Use MAX_WAIT_TIME and CALL_COMPLETION_CHECK_INTERVAL from dispatch_calls.py
-    max_checks = MAX_WAIT_TIME // CALL_COMPLETION_CHECK_INTERVAL
+    """Monitor a single call's status using the shared batch cache with direct fallback."""
+    max_checks = MAX_WAIT_TIME 
     check_count = 0
+    last_direct_fetch = 0
     
     logger.info(f"⏳ [{row_number}] Monitoring call to {phone_number} (max {MAX_WAIT_TIME}s)...")
     
     while check_count < max_checks:
-        await asyncio.sleep(CALL_COMPLETION_CHECK_INTERVAL)
+        await asyncio.sleep(1.0) # Check local cache every second
         check_count += 1
         
         try:
-            # Use semaphore for status checks too
-            async with sheets_api_semaphore:
-                status = await asyncio.get_event_loop().run_in_executor(
-                    executor,
-                    check_call_status,
-                    service,
-                    row_number
-                )
+            # 1. Check local cache populated by batch monitor
+            status = status_cache.get(row_number)
+            
+            # 2. Fallback: If no status in cache or every 30s, do a direct fetch to be safe
+            now = asyncio.get_event_loop().time()
+            if not status or (now - last_direct_fetch > 30.0):
+                last_direct_fetch = now
+                # We reuse check_call_status from dispatch_calls.py but wrap it for safety
+                lock, sem = _ensure_api_tools()
+                async with sem:
+                    async with lock:
+                        status = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                executor,
+                                check_call_status,
+                                service,
+                                row_number
+                            ),
+                            timeout=10.0
+                        )
+                if status:
+                    status_cache[row_number] = status.strip()
             
             if status:
                 status_lower = status.lower()
                 # Consider call finished if status is one of these terminal states
-                if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up"]:
+                if status_lower in ["completed", "voicemail", "failed", "no answer", "hung up", "disconnected", "declined", "busy", "canceled"]:
                     logger.info(f"[SUCCESS] [{row_number}] Call to {phone_number} completed with status: {status}")
                     emit_ui_event("call_completed", {
                         "row_number": row_number,
@@ -346,10 +470,12 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
                         "status": status
                     })
                     active_calls.pop(row_number, None)
+                    # Cleanup cache
+                    status_cache.pop(row_number, None)
                     return True
                 elif status_lower == "dispatched":
                     # Still in progress
-                    if check_count % 6 == 0: # Log every minute
+                    if check_count % 30 == 0: # Log every 30s
                         logger.debug(f"⏳ [{row_number}] Call to {phone_number} still in progress...")
                     continue
         except Exception as e:
@@ -358,6 +484,7 @@ async def monitor_call_status(service, row_number: int, phone_number: str):
     # Timeout
     logger.warning(f"[TIMEOUT] [{row_number}] Call to {phone_number} monitoring timed out after {MAX_WAIT_TIME}s")
     active_calls.pop(row_number, None)
+    status_cache.pop(row_number, None)
     return False
 
 
@@ -425,6 +552,9 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
     
     # Start status update loop
     status_task = asyncio.create_task(status_update_loop())
+    
+    # Start centralized batch status monitor
+    monitor_task = asyncio.create_task(batch_status_monitor(service))
     
     try:
         # Create a list of tasks for all rows

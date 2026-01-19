@@ -453,9 +453,8 @@ class OutboundCaller(Agent):
         today_date = today.strftime("%A, %B %d, %Y")
         
         # Get current time in PST (UTC-8)
-        # Using a more robust way to handle the offset
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        now_pst = now_utc - timedelta(hours=8)
+        # Get current time (Server is in PST per metadata)
+        now_pst = datetime.datetime.now()
         current_time = now_pst.strftime("%I:%M %p")
         
         # Brief instructions for the Agent framework
@@ -999,7 +998,8 @@ class OutboundCaller(Agent):
             "room_name": getattr(self, "room_name", ""),
             "session_id": getattr(self, "session_id", ""),
             "timestamp": datetime.datetime.now().isoformat(),
-            "row_id": self.dial_info.get("row_id")
+            "row_id": self.dial_info.get("row_id"),
+            "source": self.dial_info.get("source", "sheets")
         }
         
         try:
@@ -1098,7 +1098,7 @@ class OutboundCaller(Agent):
 
     @function_tool()
     async def end_call(self, ctx: RunContext, reason: str = ""):
-        """Called when the user wants to end the call."""
+        """Terminates the call. Call this IMMEDIATELY when the conversation is over or when the objective is met."""
         logger.info(f"ending the call for {self.participant.identity} (reason: {reason if reason else 'none provided'})")
         await ctx.wait_for_playout()
         await self.hangup()
@@ -1371,7 +1371,7 @@ async def entrypoint(ctx: JobContext):
     
     today = datetime.datetime.now()
     today_date = today.strftime("%A, %B %d, %Y")
-    now_pst = datetime.datetime.now() - timedelta(hours=8)
+    now_pst = datetime.datetime.now()
     current_time = now_pst.strftime("%I:%M %p")
 
     system_prompt_text = ""

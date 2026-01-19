@@ -97,6 +97,7 @@ CONFIG_SCHEMA = {
         "max_wait_time": 600,
         "max_retries": 3,
         "retry_no_answer": True,
+        "max_concurrent_calls": 3,  # Number of parallel calls (1-10)
         "openai_realtime_voice": "alum",
         "test_phone_number": "",
     },

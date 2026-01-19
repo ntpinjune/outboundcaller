@@ -45,6 +45,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     loadPrompt();
     loadPiperVoices();
+    toggleDispatchSource();
+    fetchLocalStats();
 
     // Refresh Piper button
     const refreshPiperBtn = document.getElementById('refresh-piper');
@@ -1070,6 +1072,7 @@ async function dispatchTestCall() {
     const phoneNumber = document.getElementById('test-phone-number').value.trim();
     const name = document.getElementById('test-name').value.trim() || 'Test Customer';
     const businessName = document.getElementById('test-business-name').value.trim();
+    const timezoneOffset = document.getElementById('timezone-offset').value;
     const statusEl = document.getElementById('test-call-status');
 
     if (!phoneNumber) {
@@ -1092,7 +1095,8 @@ async function dispatchTestCall() {
                 phone_number: phoneNumber,
                 name: name,
                 business_name: businessName,
-                appointment_time: ''
+                appointment_time: '',
+                timezone_offset: parseInt(timezoneOffset)
             }),
         });
 
@@ -1237,16 +1241,14 @@ async function startParallelDispatch() {
     const liveLog = document.getElementById('live-log');
 
     // Confirm first
-    if (!confirm('Are you sure you want to start parallel dialing for ALL pending rows in the sheet?')) {
+    if (!confirm('Are you sure you want to start the dispatcher? This will process all pending calls from the selected source.')) {
         return;
     }
 
-    // Show loading state and clear logs
-    statusEl.className = 'test-call-status info';
-    statusEl.textContent = '🚀 Starting parallel dispatcher...';
-    statusEl.style.display = 'block';
+    const statusElForStart = document.getElementById('test-call-status'); // Renamed to avoid conflict with parallel-dispatch-status
+    statusElForStart.textContent = '🚀 Starting dispatcher...';
+    statusElForStart.className = 'test-call-status';
 
-    // Clear logs for fresh run
     liveLog.textContent = ''; // Clear the live log content
     const appendLog = (message, type = 'info') => { // Define appendLog here for immediate use
         const div = document.createElement('div');
@@ -1260,11 +1262,32 @@ async function startParallelDispatch() {
         liveLog.appendChild(div);
         liveLog.scrollTop = liveLog.scrollHeight;
     };
-    appendLog('🚀 Initializing parallel dispatcher...', 'info');
+
+    // Determine source
+    const source = document.querySelector('input[name="dispatch-source"]:checked')?.value || 'sheets';
+    const isLocal = source === 'local';
+
+    appendLog(`🚀 Initializing ${isLocal ? 'Local' : 'Google Sheets'} dispatcher...`, 'info');
     liveLogContainer.style.display = 'block';
 
     try {
-        const response = await fetch(`${API_BASE}/api/calls/dispatch-parallel`, {
+        // First, save the concurrent calls setting to config
+        const maxConcurrentCalls = parseInt(document.getElementById('max-concurrent-calls')?.value || 3);
+        await fetch(`${API_BASE}/api/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                config: {
+                    call_dispatch: { max_concurrent_calls: maxConcurrentCalls }
+                }
+            }),
+        });
+        appendLog(`⚙️ Set max concurrent calls to ${maxConcurrentCalls}`, 'info');
+
+        // Endpoint depends on source
+        const endpoint = isLocal ? '/api/calls/dispatch-local' : '/api/calls/dispatch-parallel';
+
+        const response = await fetch(`${API_BASE}${endpoint}`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1277,8 +1300,12 @@ async function startParallelDispatch() {
             statusEl.className = 'test-call-status success';
             statusEl.textContent = `✅ ${data.message} (PID: ${data.pid})`;
 
-            // Start listening for events
+            // Start listening for events - reuse same endpoint as it captures stdout
             setupEventSource();
+
+            // If local, trigger stats refresh
+            if (isLocal) fetchLocalStats();
+
         } else {
             statusEl.className = 'test-call-status error';
             statusEl.textContent = `❌ ${data.error || 'Failed to start dispatcher'}`;
@@ -1688,3 +1715,193 @@ async function resetVoicemailRows() {
         statusDiv.innerHTML = `❌ <strong>Error:</strong> ${error.message}`;
     }
 }
+
+// --- Local CSV Dispatcher Functions ---
+
+function toggleDispatchSource() {
+    const source = document.querySelector('input[name="dispatch-source"]:checked')?.value || 'sheets';
+    const sheetsConfig = document.getElementById('source-config-sheets');
+    const localConfig = document.getElementById('source-config-local');
+
+    if (source === 'sheets') {
+        if (sheetsConfig) sheetsConfig.style.display = 'block';
+        if (localConfig) localConfig.style.display = 'none';
+    } else {
+        if (sheetsConfig) sheetsConfig.style.display = 'none';
+        if (localConfig) localConfig.style.display = 'block';
+        fetchLocalStats();
+        renderPreviewTable();
+    }
+}
+
+async function uploadCsvFile() {
+    const fileInput = document.getElementById('csv-upload-input');
+    const status = document.getElementById('upload-status');
+    const fileNameDisplay = document.getElementById('csv-file-name');
+
+    if (!fileInput || !fileInput.files || fileInput.files.length === 0) return;
+
+    const file = fileInput.files[0];
+    if (fileNameDisplay) fileNameDisplay.textContent = file.name;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    if (status) {
+        status.textContent = "⌛ Uploading and importing...";
+        status.style.color = "#17a2b8";
+        status.style.display = "block";
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/api/upload-csv`, {
+            method: 'POST',
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            if (status) {
+                if (result.count === 0) {
+                    status.textContent = `⚠️ Imported 0 leads. Check your CSV headers!`;
+                    status.style.color = "#ffc107";
+                } else {
+                    status.textContent = `✅ ${result.message}`;
+                    status.style.color = "#28a745";
+                }
+            }
+            fetchLocalStats();
+            renderPreviewTable();
+        } else {
+            if (status) {
+                status.textContent = `❌ Error: ${result.error}`;
+                status.style.color = "#dc3545";
+            }
+        }
+    } catch (e) {
+        console.error("CSV Upload error:", e);
+        if (status) {
+            status.textContent = `❌ Upload failed: ${e.message}`;
+            status.style.color = "#dc3545";
+        }
+    }
+}
+
+async function fetchLocalStats() {
+    const statsContainer = document.getElementById('local-stats');
+    if (!statsContainer) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/leads/stats`);
+        const data = await response.json();
+
+        if (data.success) {
+            const stats = data.stats;
+            let html = '';
+
+            // Define all possible statuses to show
+            const statuses = ['Pending', 'Dispatching', 'Dispatched', 'Completed', 'Failed', 'Voicemail'];
+
+            statuses.forEach(status => {
+                const count = stats[status] || stats[status + ' '] || 0;
+                const icon = status === 'Pending' ? '⏳' :
+                    status === 'Dispatched' ? '📞' :
+                        status === 'Completed' ? '✅' :
+                            status === 'Failed' ? '❌' :
+                                status === 'Voicemail' ? '📠' : '⚪';
+
+                html += `<div class="stat-item" style="display: flex; align-items: center; gap: 5px; background: white; padding: 4px 8px; border-radius: 4px; border: 1px solid #eee;">
+                    <span class="stat-icon">${icon}</span>
+                    <span class="stat-label" style="font-weight: 500;">${status}:</span>
+                    <span class="stat-value">${count}</span>
+                </div>`;
+            });
+
+            statsContainer.innerHTML = html;
+        }
+    } catch (e) {
+        console.error("Error fetching local stats:", e);
+    }
+}
+
+async function clearLocalLeads() {
+    if (!confirm('Are you sure you want to clear ALL local leads? This cannot be undone.')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/api/leads/clear`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            showStatus('Local leads cleared successfully', 'success');
+            fetchLocalStats();
+
+            // Clear file name display
+            const fileNameDisplay = document.getElementById('csv-file-name');
+            if (fileNameDisplay) fileNameDisplay.textContent = '';
+
+            // Clear upload status
+            const status = document.getElementById('upload-status');
+            if (status) status.style.display = 'none';
+        } else {
+            showStatus(`Error clearing leads: ${data.error}`, 'error');
+        }
+    } catch (e) {
+        showStatus(`Failed to clear leads: ${e.message}`, 'error');
+    }
+}
+
+async function renderPreviewTable() {
+    const previewContainer = document.getElementById('local-preview-container');
+    const tableBody = document.getElementById('local-preview-body');
+    const selectedSource = document.querySelector('input[name="dispatch-source"]:checked')?.value;
+
+    if (!previewContainer || !tableBody || selectedSource !== 'local') return;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/leads`);
+        const data = await response.json();
+
+        if (data.success && data.leads && data.leads.length > 0) {
+            previewContainer.style.display = 'block';
+            let html = '';
+
+            data.leads.forEach(lead => {
+                const statusColor = lead.status === 'Pending' ? '#666' :
+                    lead.status === 'Completed' ? '#28a745' :
+                        lead.status === 'Failed' ? '#dc3545' : '#007bff';
+
+                html += `<tr>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.id}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.phone_number}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.name || '-'}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.business_name || '-'}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold; color: ${statusColor};">${lead.status}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.appointment_scheduled || '-'}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.appointment_time_scheduled || '-'}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;" title="${lead.outcome_details || ''}">${lead.outcome_details ? (lead.outcome_details.substring(0, 20) + (lead.outcome_details.length > 20 ? '...' : '')) : '-'}</td>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">${lead.last_called || '-'}</td>
+                </tr>`;
+            });
+
+            tableBody.innerHTML = html;
+        } else {
+            previewContainer.style.display = 'none';
+        }
+    } catch (e) {
+        console.error("Error rendering preview table:", e);
+    }
+}
+
+// Start polling for preview table updates
+setInterval(() => {
+    const selectedSource = document.querySelector('input[name="dispatch-source"]:checked')?.value;
+    if (selectedSource === 'local') {
+        renderPreviewTable();
+        fetchLocalStats();
+    }
+}, 5000);

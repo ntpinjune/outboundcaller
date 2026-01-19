@@ -68,7 +68,35 @@ def get_column_index(headers: list, column_name: str) -> Optional[int]:
 
 
 def update_call_results(service, call_data: Dict[str, Any]):
-    """Update Google Sheets with call results."""
+    """Update Google Sheets or Local DB with call results."""
+    
+    # Handle Local DB updates
+    if call_data.get("source") == "local":
+        try:
+            import database
+            row_id = call_data.get("row_id")
+            call_status = call_data.get("call_status", "unknown")
+            
+            status_map = {
+                "completed": "Completed",
+                "voicemail": "Voicemail",
+                "failed": "Failed",
+                "no_answer": "No Answer",
+                "hung_up": "Hung Up",
+                "declined": "Declined",
+                "busy": "Busy"
+            }
+            final_status = status_map.get(call_status.lower(), call_status.capitalize())
+            
+            if row_id:
+                database.update_lead_status(int(row_id), final_status)
+                logger.info(f"✅ Updated LOCAL DB row {row_id} with status: {final_status}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error updating local DB: {e}")
+            return False
+
     try:
         # Get headers
         range_name = f"{SHEET_NAME}!A1:Z1"
@@ -268,12 +296,17 @@ def update_call_results(service, call_data: Dict[str, Any]):
 
 
 def update_from_webhook_data(webhook_data: Dict[str, Any]):
-    """Update Google Sheets from webhook data (for use as webhook receiver)."""
+    """Update Google Sheets or Local DB from webhook/agent data."""
     try:
+        # Check for local source FIRST and handle it without requiring Google Sheets auth
+        if webhook_data.get("source") == "local":
+            return update_call_results(None, webhook_data)
+            
+        # For remote sources, require service
         service = get_google_sheets_service()
         return update_call_results(service, webhook_data)
     except Exception as e:
-        logger.error(f"Failed to update from webhook: {e}")
+        logger.error(f"Failed to update results: {e}")
         return False
 
 
