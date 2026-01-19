@@ -716,6 +716,7 @@ def dispatch_parallel_calls():
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
+            env["FORCE_DISPATCH"] = "true"
 
             # Use Popen to run in background
             process = subprocess.Popen(

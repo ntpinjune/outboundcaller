@@ -4,7 +4,15 @@ import signal
 import time
 import os
 import threading
+import asyncio
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables BEFORE anything else
+load_dotenv(dotenv_path=".env.local", override=True)
+
+# Import queue cleaner
+from clear_queue import clear_queue
 
 # Global flag for shutting down log threads
 log_shutdown = False
@@ -54,6 +62,17 @@ def run_dev():
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"\n\n=== Application Started at {datetime.now()} ===\n")
     
+    # --- CRITICAL: Clear the queue on startup ---
+    # This prevents old jobs from previous runs from triggering calls
+    clean_start = os.getenv("CLEAN_START", "true").lower() == "true"
+    if clean_start:
+        print("🧹 CLEAN_START: Clearing any existing LiveKit jobs/rooms...")
+        try:
+            asyncio.run(clear_queue())
+            print("✅ Queue cleared. Agent will start with a clean slate.")
+        except Exception as e:
+            print(f"⚠️  Failed to clear queue: {e}")
+    
     def signal_handler(sig, frame):
         nonlocal shutdown_flag
         global log_shutdown
@@ -90,6 +109,7 @@ def run_dev():
     # Force UTF-8 encoding for child processes to prevent Windows cp1252 errors
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    env["OTEL_SDK_DISABLED"] = "true"  # Disable OpenTelemetry to prevent 429 console spam
 
     try:
         # Start Agent

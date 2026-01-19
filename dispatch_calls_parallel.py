@@ -41,6 +41,9 @@ from dispatch_calls import (
     MAX_WAIT_TIME,
 )
 
+# Import queue cleaner
+from clear_queue import clear_queue
+
 # Global status cache for batch monitoring
 status_cache = {}
 
@@ -557,24 +560,55 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
     monitor_task = asyncio.create_task(batch_status_monitor(service))
     
     try:
-        # Create a list of tasks for all rows
-        # They will naturally start in order, and the semaphore will limit concurrency
-        tasks = []
-        for idx, row_data in enumerate(pending_rows):
-            if not keep_running:
-                break
-            tasks.append(dispatch_with_limit(row_data, idx))
+        # CRITICAL FIX: Process in STRICT sequential batches
+        # Previously, asyncio.gather(*320 tasks) created all 320 coroutines upfront,
+        # which overwhelmed the system even with semaphores.
+        # Now we process in small batches, waiting for each batch to complete.
         
-        # Monitor all tasks
-        logger.debug(f"🔍 Waiting for {len(tasks)} tasks to complete...")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        # Flatten results if needed (already flat from gather)
-        logger.debug("🔍 All dispatch tasks finished")
+        batch_size = MAX_CONCURRENT_CALLS
+        total_dispatched = 0
+        results = []
+        
+        for i in range(0, len(pending_rows), batch_size):
+            if not keep_running:
+                logger.warning("🛑 Dispatcher stopped by user signal")
+                break
+            
+            batch = pending_rows[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(pending_rows) + batch_size - 1) // batch_size
+            
+            logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} calls)...")
+            
+            # Create tasks ONLY for this batch
+            batch_tasks = []
+            for idx, row_data in enumerate(batch):
+                if not keep_running:
+                    break
+                batch_tasks.append(dispatch_with_limit(row_data, i + idx))
+            
+            # Wait for THIS batch to complete before starting the next
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            results.extend(batch_results)
+            total_dispatched += len(batch)
+            
+            logger.info(f"✅ Batch {batch_num} complete. Total dispatched: {total_dispatched}/{len(pending_rows)}")
+            
+            # Short pause between batches to prevent overwhelming
+            if i + batch_size < len(pending_rows) and keep_running:
+                await asyncio.sleep(1.0)
+        
+        logger.debug("🔍 All dispatch batches finished")
     finally:
         # Cancel status update loop
         status_task.cancel()
+        monitor_task.cancel()
         try:
             await status_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await monitor_task
         except asyncio.CancelledError:
             pass
     
@@ -615,6 +649,17 @@ async def main_async():
         if not LIVEKIT_URL:
             logger.error("Missing LIVEKIT_URL in .env.local")
             return
+
+        # --- AUTO-CLEANUP ---
+        # Clear existing queue to prevent ghost jobs from previous runs
+        clean_start = os.getenv("CLEAN_START", "true").lower() == "true"
+        if clean_start:
+            logger.info("🧹 CLEAN_START enabled: Clearing any existing rooms/jobs...")
+            try:
+                await clear_queue()
+                logger.info("✅ Queue cleared successfully")
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to clear queue: {e}")
         
         # Get Google Sheets service
         try:
@@ -642,6 +687,34 @@ async def main_async():
         
         # CRITICAL: Sort rows by row_number to ensure we go strictly "down the rows"
         pending_rows.sort(key=lambda x: x.get("row_number", 0))
+        
+        # --- SAFETY CHECK ---
+        # Prevent accidental auto-dialing when running the script
+        force_dispatch = os.getenv("FORCE_DISPATCH", "false").lower() == "true"
+        
+        if not force_dispatch:
+            print(f"\n⚠️  SAFETY CHECK: Found {len(pending_rows)} pending calls ready to dispatch.")
+            if len(pending_rows) > 0:
+                 print(f"   First call: {pending_rows[0].get('phone_number')} (Row {pending_rows[0].get('row_number')})")
+            
+            # Check if running in an interactive terminal
+            import sys
+            if sys.stdin.isatty():
+                print(f"\nPress ENTER to start dispatching {len(pending_rows)} calls...")
+                print("Press Ctrl+C to cancel.")
+                try:
+                    input() 
+                    print("🚀 Starting dispatch...")
+                except KeyboardInterrupt:
+                    print("\n[STOP] Cancelled by user.")
+                    return
+            else:
+                # Non-interactive and not forced -> SAFETY ABORT
+                logger.warning("🛑 SAFETY STOP: Attempted to run dispatch in non-interactive mode without FORCE_DISPATCH flag.")
+                logger.warning("   To run automatically, set env var FORCE_DISPATCH=true")
+                logger.warning("   To run manually, run in an interactive terminal.")
+                return
+
         logger.info(f"Ordered {len(pending_rows)} rows for sequential-parallel dispatch")
         
         # Process calls in parallel

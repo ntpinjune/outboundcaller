@@ -553,7 +553,7 @@
                 <button class="btn" onclick="loadCalls()">Search</button>
             </div>
             <div class="filter-group" style="margin-left: auto;">
-                <button class="btn btn-secondary" onclick="refreshData()">Refresh Data</button>
+                <button class="btn btn-secondary" onclick="reloadAllData()">Refresh Data</button>
             </div>
         </div>
 
@@ -1004,14 +1004,24 @@
             loadCalls();
         }
 
-        function refreshData() {
+        function reloadAllData() {
             loadStats();
             loadCalls();
         }
 
+        function autoRefreshData() {
+            // Check if any call is expanded (user might be listening to audio)
+            if (document.querySelector('.call-item.expanded')) {
+                // Just update stats without reloading the list/DOM
+                loadStats();
+                return;
+            }
+            reloadAllData();
+        }
+
         // Init
-        refreshData();
-        setInterval(refreshData, 30000);
+        reloadAllData();
+        setInterval(autoRefreshData, 30000);
 
     </script>
 </body>

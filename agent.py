@@ -1164,7 +1164,7 @@ class OutboundCaller(Agent):
             return "system_error: unknown. Tell the user a coworker will call them back."
 
     @function_tool()
-    async def detected_answering_machine(self, ctx: RunContext, reason: str = ""):
+    async def detected_answering_machine(self, ctx: RunContext, reason: Optional[str] = None):
         """Called when the call reaches voicemail."""
         logger.info(f"[VOICEMAIL] Voicemail detected for {self.participant.identity} - hanging up immediately")
         self.call_end_time = datetime.datetime.now()
@@ -2484,11 +2484,11 @@ Persona: Local peer, friendly, and authentic. Add filler words (um, uh, and like
         tts=tts_instance,  # None for Realtime, TTS instance for regular models
         llm=llm_instance,
         # Configure endpointing delays (when to consider user finished speaking)
-        min_endpointing_delay=0.2, # Force low endpointing delay (override config)
+        min_endpointing_delay=MIN_ENDPOINTING_DELAY,  # Use configured delay
         max_endpointing_delay=MAX_ENDPOINTING_DELAY,  # Higher = wait longer for user to continue
         # Configure interruption sensitivity
         allow_interruptions=True,  # Always allow interruptions
-        min_interruption_duration=0.2,  # Force faster interruption detection (0.2s instead of 0.5s)
+        min_interruption_duration=min_interruption_duration,  # Use configured duration
         min_interruption_words=0,  # No minimum words required
         # Ultra-low latency optimizations
         preemptive_generation=True, # Start synthesis before user finish speaking
@@ -2548,6 +2548,16 @@ Persona: Local peer, friendly, and authentic. Add filler words (um, uh, and like
     # Check if we should dial via SIP
     should_dial_sip = phone_number and phone_number.lower() not in ["web-user", "test", "browser"]
     
+    # SAFETY GUARD: Prevent auto-dialing real numbers unless explicitly allowed
+    allow_outbound = os.getenv("ALLOW_OUTBOUND_CALLS", "false").lower() == "true"
+    force_dispatch = os.getenv("FORCE_DISPATCH", "false").lower() == "true"
+    
+    if should_dial_sip and not (allow_outbound or force_dispatch):
+        logger.warning(f"🛑 SAFETY BLOCK: Attempted to dial {phone_number} but outbound calls are NOT enabled.")
+        logger.warning("   To enable dialing, set ALLOW_OUTBOUND_CALLS=true or FORCE_DISPATCH=true")
+        logger.warning("   Aborting session immediately to prevent ghost activity.")
+        ctx.shutdown()
+        return
     if should_dial_sip:
         # Get latest SIP trunk ID from config
         outbound_trunk_id = config.get("integrations", {}).get("sip_outbound_trunk_id") or os.getenv("SIP_OUTBOUND_TRUNK_ID")
