@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Account 1",
+    "url": "https://project-1.livekit.cloud",
+    "api_key": "API_KEY_1",
+    "api_secret": "API_SECRET_1"
+  },
+  {
+    "name": "Account 2",
+    "url": "https://project-2.livekit.cloud",
+    "api_key": "API_KEY_2",
+    "api_secret": "API_SECRET_2"
+  }
+]

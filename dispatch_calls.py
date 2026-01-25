@@ -349,14 +349,21 @@ def normalize_phone_number(phone: str) -> str:
     return phone
 
 
-def generate_livekit_jwt() -> str:
+def generate_livekit_jwt(api_key: str = None, api_secret: str = None) -> str:
     """Generate a JWT token for LiveKit API authentication."""
     import time
+    
+    # Use provided credentials or fallback to global/env
+    key = api_key or LIVEKIT_API_KEY
+    secret = api_secret or LIVEKIT_API_SECRET
+    
+    if not key or not secret:
+        raise ValueError("LiveKit API key and secret are required")
     
     now = int(time.time())
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
-        "iss": LIVEKIT_API_KEY,
+        "iss": key,
         "exp": now + 3600,
         "nbf": now - 10,
         "video": {
@@ -381,7 +388,7 @@ def generate_livekit_jwt() -> str:
     # Create signature
     message = f"{encoded_header}.{encoded_payload}"
     signature = hmac.new(
-        LIVEKIT_API_SECRET.encode('utf-8'),
+        secret.encode('utf-8'),
         message.encode('utf-8'),
         hashlib.sha256
     ).digest()
@@ -390,11 +397,10 @@ def generate_livekit_jwt() -> str:
     return f"{encoded_header}.{encoded_payload}.{encoded_signature}"
 
 
-def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
-    """Dispatch a call to LiveKit using CLI (more reliable, matches working CLI command).
+def dispatch_to_livekit_cli(row_data: Dict[str, Any], api_url: str = None, api_key: str = None, api_secret: str = None) -> Optional[str]:
+    """Dispatch a call to LiveKit using CLI.
     
-    Returns:
-        Job ID if successful, None otherwise
+    Can accept optional credentials override.
     """
     try:
         # Normalize phone number
@@ -409,7 +415,7 @@ def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
             "row_id": str(row_data["row_number"])
         }
         
-        # Build CLI command (matches: lk dispatch create --new-room --agent-name outbound-caller-dev --metadata '...')
+        # Build CLI command
         cmd = [
             "lk", "dispatch", "create",
             "--new-room",
@@ -417,15 +423,28 @@ def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
             "--metadata", json.dumps(metadata)
         ]
         
+        # Add URL flag if provided
+        target_url = api_url or LIVEKIT_URL
+        if target_url:
+             cmd.extend(["--url", target_url])
+             
         # Add flag to prefer local agent if specified
         if USE_LOCAL_AGENT:
             logger.info(f"🚀 Dispatching to LOCAL agent (make sure 'python agent.py dev' is running)")
-            # The CLI will automatically route to local agent if it's registered
         else:
             logger.info(f"☁️  Dispatching to CLOUD agent")
         
         logger.info(f"🔍 Using LiveKit CLI to dispatch call to {phone_number}")
         
+        # Prepare environment with credentials
+        env = os.environ.copy()
+        if api_key:
+            env["LIVEKIT_API_KEY"] = api_key
+        if api_secret:
+            env["LIVEKIT_API_SECRET"] = api_secret
+        if api_url:
+            env["LIVEKIT_URL"] = api_url
+            
         # Run CLI command
         logger.info(f"🔍 Running subprocess: {' '.join(cmd)}")
         
@@ -439,7 +458,8 @@ def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=30,
-            creationflags=creationflags
+            creationflags=creationflags,
+            env=env
         )
         logger.info(f"🔍 Subprocess finished with code {result.returncode}")
         
@@ -459,20 +479,25 @@ def dispatch_to_livekit_cli(row_data: Dict[str, Any]) -> Optional[str]:
         return None
     except FileNotFoundError:
         logger.warning("⚠️  LiveKit CLI not found. Falling back to HTTP API...")
-        return dispatch_to_livekit_http(row_data)
+        return dispatch_to_livekit_http(row_data, api_url, api_key, api_secret)
     except Exception as e:
         logger.error(f"❌ Error running CLI: {e}")
         logger.warning("⚠️  Falling back to HTTP API...")
-        return dispatch_to_livekit_http(row_data)
+        return dispatch_to_livekit_http(row_data, api_url, api_key, api_secret)
 
 
-def dispatch_to_livekit_http(row_data: Dict[str, Any]) -> Optional[str]:
+def dispatch_to_livekit_http(row_data: Dict[str, Any], api_url: str = None, api_key: str = None, api_secret: str = None) -> Optional[str]:
     """Dispatch a call to LiveKit using HTTP API (fallback method).
     
     Returns:
         Job ID if successful, None otherwise
     """
     try:
+        # Use provided credentials or fallback
+        target_url = api_url or LIVEKIT_URL
+        if not target_url:
+            raise ValueError("LiveKit URL is required")
+            
         # Normalize phone number
         phone_number = normalize_phone_number(row_data["phone_number"])
         
@@ -486,10 +511,10 @@ def dispatch_to_livekit_http(row_data: Dict[str, Any]) -> Optional[str]:
         }
         
         # Generate JWT token
-        jwt_token = generate_livekit_jwt()
+        jwt_token = generate_livekit_jwt(api_key, api_secret)
         
         # Make API request
-        url = f"{LIVEKIT_URL}/twirp/livekit.AgentService/CreateJob"
+        url = f"{target_url}/twirp/livekit.AgentService/CreateJob"
         headers = {
             "Authorization": f"Bearer {jwt_token}",
             "Content-Type": "application/json"

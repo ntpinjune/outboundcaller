@@ -67,6 +67,21 @@ MAX_CONCURRENT_CALLS = _get_max_concurrent_calls()
 PARALLEL_DIALING_ENABLED = os.getenv("PARALLEL_DIALING_ENABLED", "true").lower() == "true"
 CALL_START_DELAY = float(os.getenv("CALL_START_DELAY", "1.0"))  # Increased delay to avoid overwhelming
 SKIP_SHEETS_UPDATES_DURING_DISPATCH = os.getenv("SKIP_SHEETS_UPDATES_DURING_DISPATCH", "false").lower() == "true"  # Enable updates by default now that we have safe locking
+MOUNTED_ACCOUNTS = []
+
+def load_livekit_accounts():
+    """Load multiple LiveKit accounts from JSON file."""
+    global MOUNTED_ACCOUNTS
+    try:
+        json_path = os.path.join(os.path.dirname(__file__), "livekit_accounts.json")
+        if os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                MOUNTED_ACCOUNTS = json.load(f)
+            logger.info(f"✅ Loaded {len(MOUNTED_ACCOUNTS)} LiveKit accounts from livekit_accounts.json")
+        else:
+            logger.info("ℹ️  No livekit_accounts.json found. Using default environment variables only.")
+    except Exception as e:
+        logger.error(f"❌ Error loading livekit_accounts.json: {e}")
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -198,7 +213,7 @@ async def update_sheet_cell_safe(service, row_number: int, column: str, value: s
             return False
 
 
-async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, Any]:
+async def dispatch_call_async(service, row_data: Dict[str, Any], account: Dict[str, str] = None) -> Dict[str, Any]:
     """Dispatch a single call asynchronously.
     
     Returns:
@@ -230,10 +245,19 @@ async def dispatch_call_async(service, row_data: Dict[str, Any]) -> Dict[str, An
 
         # Dispatch to LiveKit (synchronous operation)
         logger.info(f"🔍 [{row_number}] Calling dispatch_to_livekit_cli...")
+        
+        # Prepare arguments
+        api_url = account.get("url") if account else None
+        api_key = account.get("api_key") if account else None
+        api_secret = account.get("api_secret") if account else None
+        
         job_id = await asyncio.get_event_loop().run_in_executor(
             executor,
             dispatch_to_livekit_cli,
-            row_data
+            row_data,
+            api_url,
+            api_key,
+            api_secret
         )
         logger.info(f"🔍 [{row_number}] dispatch_to_livekit_cli returned job_id: {job_id}")
         
@@ -498,6 +522,13 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
     logger.info(f"[CONFIG] Max concurrent calls: {MAX_CONCURRENT_CALLS}")
     logger.info(f"[CONFIG] Call start delay: {CALL_START_DELAY}s")
     
+    # Load accounts
+    load_livekit_accounts()
+    if MOUNTED_ACCOUNTS:
+        logger.info(f"🔄 Using round-robin dispatch across {len(MOUNTED_ACCOUNTS)} accounts")
+    else:
+        logger.info(f"⚠️  Using single default account (env vars)")
+    
     if not PARALLEL_DIALING_ENABLED:
         logger.warning("[WARNING] Parallel dialing is disabled. Set PARALLEL_DIALING_ENABLED=true")
         return
@@ -541,10 +572,18 @@ async def process_calls_parallel(service, pending_rows: List[Dict[str, Any]]):
             row_number = row_data["row_number"]
             phone_number = row_data["phone_number"]
             active_slots = MAX_CONCURRENT_CALLS - semaphore._value
+            
+            # Select account (Round Robin)
+            account = None
+            if MOUNTED_ACCOUNTS:
+                account_idx = index % len(MOUNTED_ACCOUNTS)
+                account = MOUNTED_ACCOUNTS[account_idx]
+                logger.info(f"🔄 [{row_number}] Using account: {account.get('name')} ({account_idx + 1}/{len(MOUNTED_ACCOUNTS)})")
+            
             logger.info(f"🚀 [{row_number}] Dispatching to {phone_number} (Active slots: {active_slots}/{MAX_CONCURRENT_CALLS})")
             
             # Dispatch the call
-            result = await dispatch_call_async(service, row_data)
+            result = await dispatch_call_async(service, row_data, account)
             
             # CRITICAL: Wait for the call to actually finish before releasing the semaphore slot
             if result.get("success"):
